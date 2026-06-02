@@ -17,3 +17,5 @@ crossbeam-channel = { workspace = true }
 humansize = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
+jwalk = { workspace = true }
+dirs = { workspace = true }
