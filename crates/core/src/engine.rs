@@ -1,4 +1,5 @@
-use crate::models::ScanResult;
+use crate::cleaner::Cleaner;
+use crate::models::{CleanReport, DeleteMode, ScanItem, ScanResult};
 use crate::progress::ProgressReporter;
 use crate::scanner::Scanner;
 use std::path::Path;
@@ -17,5 +18,17 @@ impl Engine {
         Scanner::scan_purge(path, reporter)
     }
 
-    // analyze 和 clean 执行方法将在 U5/U8 中添加
+    /// 执行清理操作（实际删除文件）
+    pub fn clean(
+        items: &[&ScanItem],
+        mode: DeleteMode,
+        reporter: &dyn ProgressReporter,
+    ) -> anyhow::Result<CleanReport> {
+        Cleaner::execute(items, mode, reporter)
+    }
+
+    /// 试运行：返回清理报告但不删除任何文件
+    pub fn dry_run(items: &[&ScanItem]) -> CleanReport {
+        Cleaner::dry_run(items)
+    }
 }
