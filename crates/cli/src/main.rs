@@ -54,15 +54,9 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Clean => commands::clean::run(&cli)?,
-        Commands::Uninstall { .. } => {
-            println!("uninstall 命令暂未实现");
-        }
-        Commands::Analyze { .. } => {
-            println!("analyze 命令暂未实现");
-        }
-        Commands::Purge { .. } => {
-            println!("purge 命令暂未实现");
-        }
+        Commands::Uninstall { .. } => commands::uninstall::run(&cli)?,
+        Commands::Analyze { .. } => commands::analyze::run(&cli)?,
+        Commands::Purge { .. } => commands::purge::run(&cli)?,
     }
 
     Ok(())

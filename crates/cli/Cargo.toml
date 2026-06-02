@@ -16,5 +16,6 @@ humansize = { workspace = true }
 indicatif = { workspace = true }
 serde_json = { workspace = true }
 crossbeam-channel = { workspace = true }
+jwalk = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
