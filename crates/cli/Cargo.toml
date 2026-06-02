@@ -1,0 +1,20 @@
+[package]
+name = "mc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mc"
+path = "src/main.rs"
+
+[dependencies]
+mc-core = { path = "../core" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+humansize = { workspace = true }
+indicatif = { workspace = true }
+serde_json = { workspace = true }
+crossbeam-channel = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
