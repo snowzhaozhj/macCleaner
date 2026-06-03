@@ -63,6 +63,8 @@ pub struct App {
     pub expanded: Vec<bool>,
     // Purge 路径
     pub purge_path: PathBuf,
+    // Analyze 导航时暂存的面包屑
+    pub analyze_breadcrumb_stash: Option<(Vec<DirNode>, DirNode)>,
 }
 
 impl App {
@@ -78,6 +80,7 @@ impl App {
             result_cursor: 0,
             expanded: Vec::new(),
             purge_path: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
+            analyze_breadcrumb_stash: None,
         }
     }
 

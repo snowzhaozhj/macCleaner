@@ -58,13 +58,14 @@ impl Scanner {
                             });
                         });
 
+                    let mut batch_count: usize = 0;
+
                     for entry in walker {
                         let entry = match entry {
                             Ok(e) => e,
                             Err(_) => continue,
                         };
 
-                        // 只统计文件
                         if entry.file_type().is_dir() {
                             continue;
                         }
@@ -74,11 +75,13 @@ impl Scanner {
                             .map(|m| m.len())
                             .unwrap_or(0);
 
-                        reporter.on_event(ProgressEvent::Found {
-                            category: rule.category.clone(),
-                            path: path.clone(),
-                            size,
-                        });
+                        batch_count += 1;
+
+                        if batch_count % 200 == 0 {
+                            reporter.on_event(ProgressEvent::Scanning {
+                                path: path.clone(),
+                            });
+                        }
 
                         let item =
                             ScanItem::new(path, size, rule.safety, rule.category.clone());

@@ -19,7 +19,8 @@ use mc_core::models::{DeleteMode, DirNode};
 use mc_core::platform;
 use mc_core::progress::{ProgressEvent, ProgressReporter};
 use std::io::{self, stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 pub fn run() -> Result<()> {
@@ -50,27 +51,46 @@ pub fn run() -> Result<()> {
 fn run_app(terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::new();
     let events = EventHandler::new();
+    let pending_tree: Arc<Mutex<Option<DirNode>>> = Arc::new(Mutex::new(None));
 
     loop {
+        // 检查是否有后台完成的目录树
+        if matches!(app.state, AppState::Scanning { .. })
+            && app.active_command == Some(ActiveCommand::Analyze)
+        {
+            let mut lock = pending_tree.lock().unwrap();
+            if let Some(tree) = lock.take() {
+                // 恢复之前导航保存的面包屑（如果有）
+                let (breadcrumb, _old_node) = app
+                    .analyze_breadcrumb_stash
+                    .take()
+                    .map(|(mut bc, old)| { bc.push(old); (bc, None::<DirNode>) })
+                    .unwrap_or_else(|| (Vec::new(), None));
+                app.state = AppState::Analyzing {
+                    node: tree,
+                    breadcrumb,
+                    cursor: 0,
+                    marked_for_delete: Vec::new(),
+                };
+            }
+        }
+
         // 渲染
         terminal.draw(|f| ui::draw(f, &app))?;
 
         // 等待事件
         match events.next()? {
             AppEvent::Key(key) => {
-                // Ctrl+C 总是退出
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')
                 {
                     break;
                 }
-                handle_key(&mut app, key.code, &events);
+                handle_key(&mut app, key.code, &events, &pending_tree);
             }
             AppEvent::Progress(evt) => {
                 handle_progress(&mut app, evt);
             }
-            AppEvent::Tick => {
-                // Tick 仅触发重绘（spinner 动画使用系统时间）
-            }
+            AppEvent::Tick => {}
         }
 
         if app.should_quit {
@@ -82,9 +102,9 @@ fn run_app(terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<i
 }
 
 /// 处理键盘输入
-fn handle_key(app: &mut App, key: KeyCode, events: &EventHandler) {
+fn handle_key(app: &mut App, key: KeyCode, events: &EventHandler, pending_tree: &Arc<Mutex<Option<DirNode>>>) {
     match &app.state {
-        AppState::Menu => handle_menu_key(app, key, events),
+        AppState::Menu => handle_menu_key(app, key, events, pending_tree),
         AppState::Scanning { .. } => {
             // 扫描中不响应按键（除了 Ctrl+C 已在外层处理）
         }
@@ -94,12 +114,12 @@ fn handle_key(app: &mut App, key: KeyCode, events: &EventHandler) {
             // 清理中不响应按键
         }
         AppState::Done { .. } => handle_done_key(app, key),
-        AppState::Analyzing { .. } => handle_analyzer_key(app, key),
+        AppState::Analyzing { .. } => handle_analyzer_key(app, key, pending_tree),
     }
 }
 
 /// 菜单页键盘处理
-fn handle_menu_key(app: &mut App, key: KeyCode, events: &EventHandler) {
+fn handle_menu_key(app: &mut App, key: KeyCode, events: &EventHandler, pending_tree: &Arc<Mutex<Option<DirNode>>>) {
     match key {
         KeyCode::Char('q') | KeyCode::Esc => {
             app.should_quit = true;
@@ -123,14 +143,14 @@ fn handle_menu_key(app: &mut App, key: KeyCode, events: &EventHandler) {
                 _ => return,
             };
             app.active_command = Some(cmd);
-            start_command(app, cmd, events);
+            start_command(app, cmd, events, pending_tree);
         }
         _ => {}
     }
 }
 
 /// 启动命令执行
-fn start_command(app: &mut App, cmd: ActiveCommand, events: &EventHandler) {
+fn start_command(app: &mut App, cmd: ActiveCommand, events: &EventHandler, pending_tree: &Arc<Mutex<Option<DirNode>>>) {
     match cmd {
         ActiveCommand::Clean => {
             app.state = AppState::Scanning {
@@ -170,60 +190,23 @@ fn start_command(app: &mut App, cmd: ActiveCommand, events: &EventHandler) {
             });
         }
         ActiveCommand::Analyze => {
-            // 磁盘分析器：构建目录树
             app.state = AppState::Scanning {
-                progress_text: "正在分析磁盘...".into(),
+                progress_text: "正在分析磁盘（单次并行遍历）...".into(),
                 found_count: 0,
                 found_size: 0,
             };
-            let tx = events.progress_sender();
+            let tree_slot = pending_tree.clone();
             let home = platform::get_home_dir();
             thread::spawn(move || {
-                let reporter = TuiReporter::new(tx);
-                reporter.on_event(ProgressEvent::Scanning {
-                    path: home.clone(),
-                });
-                // 构建目录树，深度 1 层即可（TUI 中交互式展开）
                 match build_dir_tree(&home, 1) {
                     Ok(tree) => {
-                        // 通过一个特殊的 CategoryDone 事件把树传回
-                        // 我们复用 Found 事件记录总大小
-                        reporter.on_event(ProgressEvent::Found {
-                            category: "__analyze_tree__".into(),
-                            path: home,
-                            size: tree.size,
-                        });
-                        // Complete 表示分析完成
-                        // 将序列化的树通过 Error 事件的特殊前缀传回
-                        // 更好的方案：直接用 Arc
-                        // 我们改用共享状态
-                        reporter.on_event(ProgressEvent::Complete);
+                        if let Ok(mut slot) = tree_slot.lock() {
+                            *slot = Some(tree);
+                        }
                     }
-                    Err(e) => {
-                        reporter.on_event(ProgressEvent::Error(e.to_string()));
-                    }
+                    Err(_) => {}
                 }
             });
-            // 因为 DirNode 不能通过 ProgressEvent 传递，
-            // 我们改为同步构建（analyze 通常很快）
-            // 回退方案：同步执行
-            // 重置状态
-            let home = platform::get_home_dir();
-            match build_dir_tree(&home, 1) {
-                Ok(tree) => {
-                    app.state = AppState::Analyzing {
-                        node: tree,
-                        breadcrumb: Vec::new(),
-                        cursor: 0,
-                        marked_for_delete: Vec::new(),
-                    };
-                }
-                Err(e) => {
-                    app.state = AppState::Done {
-                        message: format!("分析失败: {}", e),
-                    };
-                }
-            }
         }
         ActiveCommand::Uninstall => {
             // Uninstall 使用同步扫描应用列表，然后跳转到结果页
@@ -493,154 +476,177 @@ fn handle_done_key(app: &mut App, key: KeyCode) {
 }
 
 /// 磁盘分析器键盘处理
-fn handle_analyzer_key(app: &mut App, key: KeyCode) {
-    // 需要临时取出状态来操作
-    let (node, breadcrumb, cursor, marked) = match &mut app.state {
+fn handle_analyzer_key(app: &mut App, key: KeyCode, pending_tree: &Arc<Mutex<Option<DirNode>>>) {
+    // 先提取需要的信息，避免借用冲突
+    let action = match &mut app.state {
         AppState::Analyzing {
             node,
             breadcrumb,
             cursor,
             marked_for_delete,
-        } => (node, breadcrumb, cursor, marked_for_delete),
-        _ => return,
-    };
-
-    match key {
-        KeyCode::Char('q') => {
-            app.back_to_menu();
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if *cursor > 0 {
-                *cursor -= 1;
-            }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if !node.children.is_empty() && *cursor < node.children.len() - 1 {
-                *cursor += 1;
-            }
-        }
-        KeyCode::Enter => {
-            // 进入子目录
-            if let Some(child) = node.children.get(*cursor) {
-                if !child.is_file {
-                    let child_path = child.path.clone();
-                    // 需要构建子节点的完整树
-                    match build_dir_tree(&child_path, 1) {
-                        Ok(new_node) => {
-                            // 保存当前节点到面包屑
-                            let current = std::mem::replace(node, new_node);
-                            breadcrumb.push(current);
-                            *cursor = 0;
+        } => {
+            match key {
+                KeyCode::Char('q') => Some(AnalyzerAction::Quit),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if *cursor > 0 {
+                        *cursor -= 1;
+                    }
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if !node.children.is_empty() && *cursor < node.children.len() - 1 {
+                        *cursor += 1;
+                    }
+                    None
+                }
+                KeyCode::Enter => {
+                    if let Some(child) = node.children.get(*cursor) {
+                        if !child.is_file {
+                            Some(AnalyzerAction::Enter(child.path.clone()))
+                        } else {
+                            None
                         }
-                        Err(_) => {
-                            // 无法读取，忽略
-                        }
+                    } else {
+                        None
                     }
                 }
-            }
-        }
-        KeyCode::Backspace | KeyCode::Esc => {
-            // 返回上级目录
-            if let Some(parent) = breadcrumb.pop() {
-                *node = parent;
-                *cursor = 0;
-            } else {
-                // 已在根目录，返回菜单
-                app.back_to_menu();
-            }
-        }
-        KeyCode::Char('d') => {
-            // 标记/取消标记删除
-            if let Some(child) = node.children.get(*cursor) {
-                let path = child.path.clone();
-                if let Some(pos) = marked.iter().position(|p| *p == path) {
-                    marked.remove(pos);
-                } else {
-                    marked.push(path);
+                KeyCode::Backspace | KeyCode::Esc => {
+                    if let Some(parent) = breadcrumb.pop() {
+                        *node = parent;
+                        *cursor = 0;
+                        None
+                    } else {
+                        Some(AnalyzerAction::Quit)
+                    }
                 }
+                KeyCode::Char('d') => {
+                    if let Some(child) = node.children.get(*cursor) {
+                        let path = child.path.clone();
+                        if let Some(pos) = marked_for_delete.iter().position(|p| *p == path) {
+                            marked_for_delete.remove(pos);
+                        } else {
+                            marked_for_delete.push(path);
+                        }
+                    }
+                    None
+                }
+                _ => None,
             }
         }
-        _ => {}
+        _ => None,
+    };
+
+    match action {
+        Some(AnalyzerAction::Quit) => {
+            app.back_to_menu();
+        }
+        Some(AnalyzerAction::Enter(child_path)) => {
+            // 保存当前状态到面包屑，切换到扫描状态
+            if let AppState::Analyzing { node, breadcrumb, .. } = std::mem::replace(
+                &mut app.state,
+                AppState::Scanning {
+                    progress_text: format!("正在分析 {} ...", child_path.display()),
+                    found_count: 0,
+                    found_size: 0,
+                },
+            ) {
+                app.analyze_breadcrumb_stash = Some((breadcrumb, node));
+            }
+            app.active_command = Some(ActiveCommand::Analyze);
+            let tree_slot = pending_tree.clone();
+            thread::spawn(move || {
+                if let Ok(new_node) = build_dir_tree(&child_path, 1) {
+                    if let Ok(mut slot) = tree_slot.lock() {
+                        *slot = Some(new_node);
+                    }
+                }
+            });
+        }
+        None => {}
     }
 }
 
-/// 构建目录树（用于磁盘分析器）
-fn build_dir_tree(path: &Path, max_depth: usize) -> Result<DirNode> {
-    build_dir_tree_recursive(path, 0, max_depth)
+enum AnalyzerAction {
+    Quit,
+    Enter(std::path::PathBuf),
 }
 
-fn build_dir_tree_recursive(path: &Path, depth: usize, max_depth: usize) -> Result<DirNode> {
-    let name = path
+/// 构建目录树：单次 jwalk 遍历，边走边累加大小（类似 dua-cli 的方式）
+fn build_dir_tree(path: &Path, _max_depth: usize) -> Result<DirNode> {
+    use std::collections::HashMap;
+
+    let root_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
 
-    let mut node = DirNode::new_dir(path.to_path_buf(), name);
+    let root_len = path.components().count();
 
-    let entries = match std::fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(e) => {
-            log::debug!("无法读取目录 {:?}: {}", path, e);
-            return Ok(node);
-        }
-    };
+    let mut child_sizes: HashMap<PathBuf, u64> = HashMap::new();
+    let mut child_is_file: HashMap<PathBuf, bool> = HashMap::new();
 
-    let mut children: Vec<DirNode> = Vec::new();
+    let walker = jwalk::WalkDir::new(path)
+        .skip_hidden(true)
+        .follow_links(false);
 
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+    for entry in walker.into_iter().filter_map(|e| e.ok()) {
+        let entry_path = entry.path();
+        let components: Vec<_> = entry_path.components().collect();
+        let depth = components.len() - root_len;
 
-        let meta = match std::fs::symlink_metadata(entry.path()) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        let child_path = entry.path();
-        let child_name = entry.file_name().to_string_lossy().to_string();
-
-        // 跳过隐藏文件/目录（以 . 开头）
-        if child_name.starts_with('.') {
+        if depth == 0 {
             continue;
         }
 
-        if meta.is_dir() {
-            if depth < max_depth {
-                match build_dir_tree_recursive(&child_path, depth + 1, max_depth) {
-                    Ok(child) => children.push(child),
-                    Err(_) => continue,
+        // 获取直接子项的路径（根目录下的第一层）
+        let child_path: PathBuf = components[..root_len + 1].iter().collect();
+
+        if entry.file_type().is_file() {
+            if let Ok(meta) = std::fs::symlink_metadata(&entry_path) {
+                let size = meta.len();
+                if depth == 1 {
+                    // 直接子文件
+                    child_is_file.insert(child_path.clone(), true);
+                    *child_sizes.entry(child_path).or_insert(0) += size;
+                } else {
+                    // 子目录内的文件 → 累加到对应的直接子目录
+                    child_is_file.entry(child_path.clone()).or_insert(false);
+                    *child_sizes.entry(child_path).or_insert(0) += size;
                 }
-            } else {
-                let size = dir_size_fast(&child_path);
-                let mut child = DirNode::new_dir(child_path, child_name);
-                child.size = size;
-                children.push(child);
             }
-        } else if meta.is_file() {
-            let size = meta.len();
-            children.push(DirNode::new_file(child_path, child_name, size));
+        } else if depth == 1 && entry.file_type().is_dir() {
+            // 确保空目录也出现
+            child_is_file.entry(child_path.clone()).or_insert(false);
+            child_sizes.entry(child_path).or_insert(0);
         }
     }
 
-    // 按大小降序排列
+    // 构建子节点
+    let mut children: Vec<DirNode> = Vec::new();
+
+    for (child_path, size) in &child_sizes {
+        let name = child_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let is_file = child_is_file.get(child_path).copied().unwrap_or(false);
+
+        if is_file {
+            children.push(DirNode::new_file(child_path.clone(), name, *size));
+        } else {
+            let mut node = DirNode::new_dir(child_path.clone(), name);
+            node.size = *size;
+            children.push(node);
+        }
+    }
+
     children.sort_by(|a, b| b.size.cmp(&a.size));
-    node.size = children.iter().map(|c| c.size).sum();
-    node.children = children;
 
-    Ok(node)
-}
+    let total_size: u64 = children.iter().map(|c| c.size).sum();
+    let mut root = DirNode::new_dir(path.to_path_buf(), root_name);
+    root.size = total_size;
+    root.children = children;
 
-/// 快速计算目录大小
-fn dir_size_fast(path: &Path) -> u64 {
-    jwalk::WalkDir::new(path)
-        .skip_hidden(false)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.path().symlink_metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
-        .sum()
+    Ok(root)
 }
