@@ -1,0 +1,21 @@
+[package]
+name = "mc-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "mc_tui"
+path = "src/lib.rs"
+
+[dependencies]
+mc-core = { path = "../core" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+anyhow = { workspace = true }
+crossbeam-channel = { workspace = true }
+humansize = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+jwalk = { workspace = true }
+dirs = { workspace = true }
