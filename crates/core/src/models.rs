@@ -82,9 +82,6 @@ impl ScanResult {
             .collect()
     }
 
-    pub fn selected_size(&self) -> u64 {
-        self.selected_items().iter().map(|i| i.size).sum()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,10 +152,3 @@ impl DirNode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Command {
-    Clean,
-    Uninstall,
-    Analyze,
-    Purge,
-}

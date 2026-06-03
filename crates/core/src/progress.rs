@@ -1,8 +1,9 @@
+use crate::models::SafetyLevel;
 use std::path::PathBuf;
 
 pub enum ProgressEvent {
     Scanning { path: PathBuf },
-    Found { category: String, path: PathBuf, size: u64 },
+    Found { category: String, path: PathBuf, size: u64, safety: SafetyLevel },
     CategoryDone { category: String, total_size: u64, count: usize },
     Complete,
     Error(String),

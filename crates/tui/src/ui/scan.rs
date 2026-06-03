@@ -150,11 +150,12 @@ pub fn draw_cleaning(f: &mut Frame, app: &App) {
     f.render_widget(hint, chunks[2]);
 }
 
-/// 截断过长的路径显示
 fn truncate_path(path: &str, max_len: usize) -> String {
-    if path.len() <= max_len || max_len < 10 {
+    let char_count = path.chars().count();
+    if char_count <= max_len || max_len < 10 {
         return path.to_string();
     }
     let keep = max_len - 3;
-    format!("...{}", &path[path.len() - keep..])
+    let suffix: String = path.chars().skip(char_count - keep).collect();
+    format!("...{}", suffix)
 }

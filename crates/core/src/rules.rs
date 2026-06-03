@@ -20,9 +20,8 @@ pub struct CleanRule {
     pub category: String,
 }
 
-/// 获取 home 目录，如果获取失败则 panic
 fn home() -> PathBuf {
-    dirs::home_dir().expect("无法获取用户 home 目录")
+    crate::platform::get_home_dir()
 }
 
 /// 系统缓存清理规则（全部为 Safe）
@@ -48,7 +47,6 @@ pub fn clean_rules() -> Vec<CleanRule> {
             description: "系统临时文件".into(),
             patterns: vec![
                 PathPattern::Exact(PathBuf::from("/tmp")),
-                PathPattern::Exact(PathBuf::from("/private/var/folders")),
             ],
             safety: SafetyLevel::Safe,
             category: "系统缓存".into(),

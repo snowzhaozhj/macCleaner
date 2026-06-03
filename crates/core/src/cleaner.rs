@@ -74,7 +74,8 @@ impl Cleaner {
     }
 
     fn permanent_delete(path: &Path) -> anyhow::Result<()> {
-        if path.is_dir() {
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.is_dir() {
             std::fs::remove_dir_all(path)?;
         } else {
             std::fs::remove_file(path)?;

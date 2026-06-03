@@ -59,6 +59,7 @@ impl Scanner {
                         });
 
                     let mut batch_count: usize = 0;
+                    let mut rule_total_size: u64 = 0;
 
                     for entry in walker {
                         let entry = match entry {
@@ -76,6 +77,7 @@ impl Scanner {
                             .unwrap_or(0);
 
                         batch_count += 1;
+                        rule_total_size += size;
 
                         if batch_count % 200 == 0 {
                             reporter.on_event(ProgressEvent::Scanning {
@@ -90,6 +92,15 @@ impl Scanner {
                             .entry(rule.category.clone())
                             .or_default()
                             .push(item);
+                    }
+
+                    if batch_count > 0 {
+                        reporter.on_event(ProgressEvent::Found {
+                            category: rule.category.clone(),
+                            path: base.clone(),
+                            size: rule_total_size,
+                            safety: rule.safety,
+                        });
                     }
                 }
             }
@@ -141,6 +152,7 @@ impl Scanner {
                             category: rule.category.to_string(),
                             path: exact_path.clone(),
                             size,
+                            safety: rule.safety,
                         });
 
                         let item = ScanItem::new(
@@ -230,6 +242,7 @@ impl Scanner {
                 category: category.clone(),
                 path: path.clone(),
                 size,
+                safety,
             });
 
             let item = ScanItem::new(path, size, safety, category.clone());
@@ -317,7 +330,7 @@ mod tests {
         fn on_event(&self, event: ProgressEvent) {
             let tag = match &event {
                 ProgressEvent::Scanning { .. } => "Scanning".to_string(),
-                ProgressEvent::Found { category, .. } => format!("Found:{}", category),
+                ProgressEvent::Found { ref category, .. } => format!("Found:{}", category),
                 ProgressEvent::CategoryDone { category, .. } => {
                     format!("CategoryDone:{}", category)
                 }

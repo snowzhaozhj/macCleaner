@@ -17,7 +17,7 @@ impl ProgressReporter for CliReporter {
             ProgressEvent::Scanning { path } => {
                 eprint!("\r扫描中: {} ", path.display());
             }
-            ProgressEvent::Found { category, path, size } => {
+            ProgressEvent::Found { category, path, size, .. } => {
                 eprintln!("\r  发现 {} — {} ({})", category, path.display(), format_size(size, DECIMAL));
             }
             ProgressEvent::Complete => {

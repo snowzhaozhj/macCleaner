@@ -259,9 +259,9 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
             category,
             path,
             size,
+            safety,
         } => {
             if category == "__analyze_tree__" {
-                // analyze 特殊标记，忽略
                 return;
             }
             if let AppState::Scanning {
@@ -274,9 +274,8 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
                 *found_size += size;
             }
 
-            // 增量地将找到的项目添加到 scan_result
-            use mc_core::models::{CategoryGroup, SafetyLevel, ScanItem, ScanResult};
-            let item = ScanItem::new(path, size, SafetyLevel::Safe, category.clone());
+            use mc_core::models::{CategoryGroup, ScanItem, ScanResult};
+            let item = ScanItem::new(path, size, safety, category.clone());
 
             if app.scan_result.is_none() {
                 app.scan_result = Some(ScanResult::default());

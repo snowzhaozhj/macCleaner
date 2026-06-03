@@ -173,13 +173,14 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_widget(hint, chunks[3]);
 }
 
-/// 截断过长的名称
 fn truncate_name(name: &str, max_len: usize) -> String {
-    if name.len() <= max_len {
+    let char_count = name.chars().count();
+    if char_count <= max_len {
         name.to_string()
     } else if max_len > 3 {
-        format!("{}...", &name[..max_len - 3])
+        let prefix: String = name.chars().take(max_len - 3).collect();
+        format!("{}...", prefix)
     } else {
-        name[..max_len].to_string()
+        name.chars().take(max_len).collect()
     }
 }

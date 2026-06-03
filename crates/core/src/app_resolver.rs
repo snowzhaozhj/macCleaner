@@ -184,8 +184,12 @@ impl AppResolver {
                     Err(_) => continue,
                 };
                 let entry_name = entry.file_name().to_string_lossy().to_string();
-                // 匹配：条目名包含 bundle ID（不区分大小写）
-                if entry_name.to_lowercase().contains(&bundle_id.to_lowercase()) {
+                let entry_lower = entry_name.to_lowercase();
+                let bid_lower = bundle_id.to_lowercase();
+                if entry_lower == bid_lower
+                    || entry_lower.starts_with(&format!("{}.", bid_lower))
+                    || entry_lower.starts_with(&format!("{}-", bid_lower))
+                {
                     let path = entry.path();
                     let size = match fs::symlink_metadata(&path) {
                         Ok(m) => {
