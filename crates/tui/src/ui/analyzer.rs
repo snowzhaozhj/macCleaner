@@ -1,24 +1,45 @@
 use crate::app::{App, AppState};
 use humansize::{format_size, DECIMAL};
+use mc_core::models::DirNode;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
-
-/// 大文件阈值（100MB）
 const LARGE_FILE_THRESHOLD: u64 = 100 * 1024 * 1024;
 
+fn resolve_node<'a>(root: &'a DirNode, nav_path: &[usize]) -> &'a DirNode {
+    let mut node = root;
+    for &idx in nav_path {
+        node = &node.children[idx];
+    }
+    node
+}
+
+fn build_breadcrumb_names(root: &DirNode, nav_path: &[usize]) -> Vec<String> {
+    let mut names = vec![root.name.clone()];
+    let mut node = root;
+    for &idx in nav_path {
+        node = &node.children[idx];
+        names.push(node.name.clone());
+    }
+    names
+}
+
 pub fn draw(f: &mut Frame, app: &App) {
-    let (node, breadcrumb, cursor, marked) = match &app.state {
+    let (tree_root, nav_path, cursor, marked) = match &app.state {
         AppState::Analyzing {
-            node,
-            breadcrumb,
+            tree_root,
+            nav_path,
             cursor,
             marked_for_delete,
-        } => (node, breadcrumb, *cursor, marked_for_delete),
+            ..
+        } => (tree_root, nav_path, *cursor, marked_for_delete),
         _ => return,
     };
+
+    let node = resolve_node(tree_root, nav_path);
+    let breadcrumb_names = build_breadcrumb_names(tree_root, nav_path);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -31,26 +52,24 @@ pub fn draw(f: &mut Frame, app: &App) {
         .split(f.area());
 
     // 面包屑导航
-    let mut breadcrumb_parts: Vec<Span> = vec![Span::styled(
-        " / ",
-        Style::default().fg(Color::Cyan),
-    )];
-    for bc in breadcrumb {
-        breadcrumb_parts.push(Span::styled(
-            format!("{}", bc.name),
-            Style::default().fg(Color::Cyan),
-        ));
-        breadcrumb_parts.push(Span::styled(
-            " / ",
-            Style::default().fg(Color::DarkGray),
-        ));
+    let mut breadcrumb_parts: Vec<Span> = Vec::new();
+    for (i, name) in breadcrumb_names.iter().enumerate() {
+        if i > 0 {
+            breadcrumb_parts.push(Span::styled(
+                " / ",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        let is_last = i == breadcrumb_names.len() - 1;
+        let style = if is_last {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        breadcrumb_parts.push(Span::styled(name.clone(), style));
     }
-    breadcrumb_parts.push(Span::styled(
-        node.name.clone(),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    ));
 
     let breadcrumb_line = Paragraph::new(Line::from(breadcrumb_parts))
         .block(
@@ -86,7 +105,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(dir_info, chunks[1]);
 
-    // 子项列表（按大小降序排列，children 已排序）
+    // 子项列表
     let parent_size = if node.size > 0 { node.size } else { 1 };
     let bar_width = (chunks[2].width as usize).saturating_sub(50).max(10);
 
@@ -106,7 +125,6 @@ pub fn draw(f: &mut Frame, app: &App) {
                 0
             };
 
-            // 百分比条
             let filled = (bar_width as f64 * child.size as f64 / parent_size as f64) as usize;
             let bar: String = format!(
                 "{}{}",
@@ -165,9 +183,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     state.select(Some(cursor));
     f.render_stateful_widget(list, chunks[2], &mut state);
 
-    // 底部提示
     let hint = Paragraph::new(
-        " ↑↓ 移动 | Enter 进入目录 | Backspace/Esc 返回上级 | d 标记删除 | q 返回菜单",
+        " ↑↓/jk 移动 | Enter/l 进入目录 | Backspace/h 返回上级 | d 标记删除 | q 返回菜单",
     )
     .style(Style::default().fg(Color::DarkGray));
     f.render_widget(hint, chunks[3]);
