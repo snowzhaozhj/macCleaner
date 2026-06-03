@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 #[command(name = "mc", about = "macCleaner — 快速、安全的 Mac 清理工具", version)]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 
     /// 不实际删除，只展示将要清理的内容
     #[arg(long, global = true, alias = "preview")]
@@ -53,10 +53,11 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Clean => commands::clean::run(&cli)?,
-        Commands::Uninstall { .. } => commands::uninstall::run(&cli)?,
-        Commands::Analyze { .. } => commands::analyze::run(&cli)?,
-        Commands::Purge { .. } => commands::purge::run(&cli)?,
+        None => mc_tui::run()?,
+        Some(Commands::Clean) => commands::clean::run(&cli)?,
+        Some(Commands::Uninstall { .. }) => commands::uninstall::run(&cli)?,
+        Some(Commands::Analyze { .. }) => commands::analyze::run(&cli)?,
+        Some(Commands::Purge { .. }) => commands::purge::run(&cli)?,
     }
 
     Ok(())

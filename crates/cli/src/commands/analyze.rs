@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 pub fn run(cli: &Cli) -> Result<()> {
     let (path, threshold_mb) = match &cli.command {
-        Commands::Analyze { path, threshold } => {
+        Some(Commands::Analyze { path, threshold }) => {
             let p = path
                 .as_ref()
                 .map(PathBuf::from)

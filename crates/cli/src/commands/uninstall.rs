@@ -26,7 +26,7 @@ impl ProgressReporter for CliReporter {
 
 pub fn run(cli: &Cli) -> Result<()> {
     let search = match &cli.command {
-        Commands::Uninstall { search } => search.clone(),
+        Some(Commands::Uninstall { search }) => search.clone(),
         _ => None,
     };
 

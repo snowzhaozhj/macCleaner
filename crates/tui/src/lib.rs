@@ -22,9 +22,7 @@ use std::io::{self, stdout};
 use std::path::Path;
 use std::thread;
 
-fn main() -> Result<()> {
-    env_logger::init();
-
+pub fn run() -> Result<()> {
     // 设置 panic hook：确保终端在 panic 时恢复
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

@@ -4,9 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "mc-tui"
-path = "src/main.rs"
+[lib]
+name = "mc_tui"
+path = "src/lib.rs"
 
 [dependencies]
 mc-core = { path = "../core" }
