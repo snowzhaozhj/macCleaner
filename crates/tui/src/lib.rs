@@ -212,52 +212,7 @@ fn run_app(
 
         if needs_animation(&app) {
             // ---- 动画状态分支 ----
-
-            // 阶段 A：批量消费 analyze_rx（如果存在）
-            let mut had_analyze_events = false;
-            let mut finished = false;
-            let mut disconnected = false;
-            if let Some(ref rx) = analyze_rx {
-                for _ in 0..5000 {
-                    match rx.try_recv() {
-                        Ok(AnalyzeEvent::Finished) => {
-                            finished = true;
-                            had_analyze_events = true;
-                            break;
-                        }
-                        Ok(evt) => {
-                            if let Some(ref mut builder) = tree_builder {
-                                handle_analyze_entry(&mut app, evt, builder);
-                            }
-                            had_analyze_events = true;
-                        }
-                        Err(crossbeam_channel::TryRecvError::Empty) => break,
-                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                            // 发送方已 drop 但未发送 Finished，合成 Finished 避免卡死
-                            disconnected = true;
-                            had_analyze_events = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            // Finished/Disconnected 处理（此处 rx 的不可变借用已结束）
-            if finished || disconnected {
-                handle_analyze_finished(&mut app, &mut tree_builder, &mut analyze_rx);
-            }
-
-            // 消费到 analyze events 时立即 continue，不进入 select 等待
-            if had_analyze_events {
-                if throttle.as_ref().is_none_or(|t| t.can_update()) {
-                    terminal.draw(|f| ui::draw(f, &app))?;
-                }
-                if app.should_quit {
-                    break;
-                }
-                continue;
-            }
-
-            // 阶段 B：无 analyze 事件可消费，进入 select 等待
+            // 每次 select 处理一个事件（与 dua-cli 相同），channel 背压自然限速
             // 两阶段处理：先 select+recv（不可变借用），再 handle（可变借用）
             enum SelectResult {
                 Key(crossterm::event::KeyEvent),
@@ -285,7 +240,7 @@ fn run_app(
                         if let Some(ref rx) = analyze_rx {
                             oper.recv(rx)
                                 .map(SelectResult::Analyze)
-                                .unwrap_or(SelectResult::Timeout)
+                                .unwrap_or(SelectResult::Analyze(AnalyzeEvent::Finished))
                         } else {
                             SelectResult::Timeout
                         }
@@ -323,10 +278,14 @@ fn run_app(
                             &mut tree_builder,
                             &mut analyze_rx,
                         );
+                        terminal.draw(|f| ui::draw(f, &app))?;
                     }
                     other => {
                         if let Some(ref mut builder) = tree_builder {
                             handle_analyze_entry(&mut app, other, builder);
+                        }
+                        if throttle.as_ref().is_none_or(|t| t.can_update()) {
+                            terminal.draw(|f| ui::draw(f, &app))?;
                         }
                     }
                 },
