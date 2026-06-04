@@ -271,13 +271,18 @@ impl Scanner {
             })
             .collect();
 
-        let exact_results: Vec<(PathBuf, u64, SafetyLevel, String)> = exact_entries
-            .par_iter()
-            .map(|(path, safety, category)| {
-                let size = dir_size(path);
-                (path.clone(), size, *safety, category.clone())
-            })
-            .collect();
+        let dir_size_pool = build_dir_size_pool();
+
+        let exact_results: Vec<(PathBuf, u64, SafetyLevel, String)> =
+            dir_size_pool.install(|| {
+                exact_entries
+                    .par_iter()
+                    .map(|(path, safety, category)| {
+                        let size = dir_size(path);
+                        (path.clone(), size, *safety, category.clone())
+                    })
+                    .collect()
+            });
 
         for (path, size, safety, category) in exact_results {
             reporter.on_event(ProgressEvent::Found {
@@ -350,13 +355,15 @@ impl Scanner {
             .map(|mutex| mutex.into_inner().unwrap_or_default())
             .unwrap_or_else(|arc| arc.lock().unwrap().clone());
 
-        let dir_sizes: Vec<(PathBuf, u64, SafetyLevel, String)> = dirs
-            .par_iter()
-            .map(|(path, safety, category)| {
-                let size = dir_size(path);
-                (path.clone(), size, *safety, category.clone())
-            })
-            .collect();
+        let dir_sizes: Vec<(PathBuf, u64, SafetyLevel, String)> =
+            dir_size_pool.install(|| {
+                dirs.par_iter()
+                    .map(|(path, safety, category)| {
+                        let size = dir_size(path);
+                        (path.clone(), size, *safety, category.clone())
+                    })
+                    .collect()
+            });
 
         for (path, size, safety, category) in dir_sizes {
             reporter.on_event(ProgressEvent::Found {
@@ -419,6 +426,27 @@ fn dir_size(path: &Path) -> u64 {
     }
 
     total
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+}
+
+/// 构建 dir_size 专用线程池：4 线程 + macOS I/O 优先级降级
+fn build_dir_size_pool() -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .thread_name(|i| format!("mc-dir-size-{i}"))
+        .start_handler(|_| {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                // IOPOL_TYPE_DISK=0, IOPOL_SCOPE_THREAD=1, IOPOL_UTILITY=4
+                setiopolicy_np(0, 1, 4);
+            }
+        })
+        .build()
+        .expect("failed to build dir_size thread pool")
 }
 
 #[cfg(test)]
