@@ -1,4 +1,5 @@
 use crate::models::SafetyLevel;
+use serde::Deserialize;
 use std::path::PathBuf;
 
 /// 路径匹配模式
@@ -20,8 +21,56 @@ pub struct CleanRule {
     pub category: String,
 }
 
+// --- TOML 反序列化中间结构 ---
+
+#[derive(Deserialize)]
+struct RuleFile {
+    rules: Vec<RuleEntry>,
+}
+
+#[derive(Deserialize)]
+struct RuleEntry {
+    name: String,
+    description: String,
+    category: String,
+    safety: SafetyLevel,
+    patterns: Vec<PatternEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PatternEntry {
+    Exact { exact: String },
+    DirName { dir_name: String },
+}
+
 fn home() -> PathBuf {
     crate::platform::get_home_dir()
+}
+
+fn parse_rules_toml(toml_str: &str) -> Vec<CleanRule> {
+    let home = home();
+    let file: RuleFile = toml::from_str(toml_str).expect("purge_rules.toml 解析失败");
+    file.rules
+        .into_iter()
+        .map(|entry| {
+            let patterns = entry
+                .patterns
+                .into_iter()
+                .map(|p| match p {
+                    PatternEntry::Exact { exact } => PathPattern::Exact(home.join(exact)),
+                    PatternEntry::DirName { dir_name } => PathPattern::DirName(dir_name),
+                })
+                .collect();
+            CleanRule {
+                name: entry.name,
+                description: entry.description,
+                patterns,
+                safety: entry.safety,
+                category: entry.category,
+            }
+        })
+        .collect()
 }
 
 /// 系统缓存清理规则（全部为 Safe）
@@ -79,76 +128,10 @@ pub fn clean_rules() -> Vec<CleanRule> {
     ]
 }
 
-/// 开发产物清理规则
+/// 开发产物清理规则（从 purge_rules.toml 加载）
 pub fn purge_rules() -> Vec<CleanRule> {
-    let home = home();
-    vec![
-        CleanRule {
-            name: "node_modules".into(),
-            description: "Node.js 依赖目录".into(),
-            patterns: vec![PathPattern::DirName("node_modules".into())],
-            safety: SafetyLevel::Safe,
-            category: "Node.js".into(),
-        },
-        // 注意：Rust target 目录需要在扫描阶段额外验证父目录是否包含 Cargo.toml
-        CleanRule {
-            name: "Rust target".into(),
-            description: "Rust 编译产物目录（仅匹配含 Cargo.toml 的项目）".into(),
-            patterns: vec![PathPattern::DirName("target".into())],
-            safety: SafetyLevel::Safe,
-            category: "Rust".into(),
-        },
-        CleanRule {
-            name: "Python venv".into(),
-            description: "Python 虚拟环境目录".into(),
-            patterns: vec![
-                PathPattern::DirName(".venv".into()),
-                PathPattern::DirName("venv".into()),
-            ],
-            safety: SafetyLevel::Safe,
-            category: "Python".into(),
-        },
-        CleanRule {
-            name: "__pycache__".into(),
-            description: "Python 字节码缓存目录".into(),
-            patterns: vec![PathPattern::DirName("__pycache__".into())],
-            safety: SafetyLevel::Safe,
-            category: "Python".into(),
-        },
-        CleanRule {
-            name: "dist/build".into(),
-            description: "前端构建产物目录".into(),
-            patterns: vec![
-                PathPattern::DirName("dist".into()),
-                PathPattern::DirName("build".into()),
-            ],
-            safety: SafetyLevel::Moderate,
-            category: "Build Output".into(),
-        },
-        CleanRule {
-            name: ".gradle".into(),
-            description: "Gradle 构建缓存目录".into(),
-            patterns: vec![PathPattern::DirName(".gradle".into())],
-            safety: SafetyLevel::Safe,
-            category: "Gradle".into(),
-        },
-        CleanRule {
-            name: "DerivedData".into(),
-            description: "Xcode 构建缓存".into(),
-            patterns: vec![PathPattern::Exact(
-                home.join("Library/Developer/Xcode/DerivedData"),
-            )],
-            safety: SafetyLevel::Safe,
-            category: "Xcode".into(),
-        },
-        CleanRule {
-            name: "Pods".into(),
-            description: "CocoaPods 依赖目录".into(),
-            patterns: vec![PathPattern::DirName("Pods".into())],
-            safety: SafetyLevel::Safe,
-            category: "CocoaPods".into(),
-        },
-    ]
+    static TOML: &str = include_str!("purge_rules.toml");
+    parse_rules_toml(TOML)
 }
 
 /// 返回所有规则（系统缓存 + 开发产物）
@@ -190,19 +173,69 @@ mod tests {
     #[test]
     fn purge_rules_safety_levels() {
         let rules = purge_rules();
+        let moderate_rules = [
+            "dist/build",
+            "Docker Desktop Data",
+            "Maven Repository",
+            "Xcode Archives",
+            "Android AVD/SDK",
+        ];
         for rule in &rules {
-            match rule.name.as_str() {
-                "dist/build" => assert_eq!(
+            if moderate_rules.contains(&rule.name.as_str()) {
+                assert_eq!(
                     rule.safety,
                     SafetyLevel::Moderate,
-                    "dist/build 应为 Moderate"
-                ),
-                _ => assert_eq!(
+                    "'{}' 应为 Moderate",
+                    rule.name
+                );
+            } else {
+                assert_eq!(
                     rule.safety,
                     SafetyLevel::Safe,
-                    "清理规则 '{}' 应为 Safe",
+                    "'{}' 应为 Safe",
                     rule.name
-                ),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn purge_rules_new_dev_rules_exist() {
+        let rules = purge_rules();
+        let names: Vec<&str> = rules.iter().map(|r| r.name.as_str()).collect();
+        let expected = [
+            "Docker Desktop Data",
+            "Maven Repository",
+            "Homebrew Cache",
+            "Go Module Cache",
+            "Cargo Cache",
+            "npm/pnpm/yarn Cache",
+            "pip Cache",
+            "Xcode Archives",
+            "Android AVD/SDK",
+            "JetBrains Cache",
+        ];
+        for name in &expected {
+            assert!(names.contains(name), "缺少规则: {}", name);
+        }
+    }
+
+    #[test]
+    fn purge_rules_categories_correct() {
+        let rules = purge_rules();
+        for rule in &rules {
+            match rule.name.as_str() {
+                "Docker Desktop Data" => assert_eq!(rule.category, "Docker"),
+                "Maven Repository" => assert_eq!(rule.category, "Java"),
+                "Homebrew Cache" => assert_eq!(rule.category, "Homebrew"),
+                "Go Module Cache" => assert_eq!(rule.category, "Go"),
+                "Cargo Cache" => assert_eq!(rule.category, "Rust"),
+                "npm/pnpm/yarn Cache" => assert_eq!(rule.category, "Node.js"),
+                "pip Cache" => assert_eq!(rule.category, "Python"),
+                "Xcode Archives" => assert_eq!(rule.category, "Xcode"),
+                "Android AVD/SDK" => assert_eq!(rule.category, "Android"),
+                "JetBrains Cache" => assert_eq!(rule.category, "JetBrains"),
+                _ => {}
             }
         }
     }

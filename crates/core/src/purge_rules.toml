@@ -1,0 +1,139 @@
+# 开发产物清理规则
+# safety: "Safe" | "Moderate" | "Risky"
+# pattern 类型: { dir_name = "xxx" } 或 { exact = "相对于 $HOME 的路径" }
+
+[[rules]]
+name = "node_modules"
+description = "Node.js 依赖目录"
+category = "Node.js"
+safety = "Safe"
+patterns = [{ dir_name = "node_modules" }]
+
+[[rules]]
+name = "Rust target"
+description = "Rust 编译产物目录（仅匹配含 Cargo.toml 的项目）"
+category = "Rust"
+safety = "Safe"
+patterns = [{ dir_name = "target" }]
+
+[[rules]]
+name = "Python venv"
+description = "Python 虚拟环境目录"
+category = "Python"
+safety = "Safe"
+patterns = [{ dir_name = ".venv" }, { dir_name = "venv" }]
+
+[[rules]]
+name = "__pycache__"
+description = "Python 字节码缓存目录"
+category = "Python"
+safety = "Safe"
+patterns = [{ dir_name = "__pycache__" }]
+
+[[rules]]
+name = "dist/build"
+description = "前端构建产物目录"
+category = "Build Output"
+safety = "Moderate"
+patterns = [{ dir_name = "dist" }, { dir_name = "build" }]
+
+[[rules]]
+name = ".gradle"
+description = "Gradle 构建缓存目录"
+category = "Gradle"
+safety = "Safe"
+patterns = [{ dir_name = ".gradle" }]
+
+[[rules]]
+name = "DerivedData"
+description = "Xcode 构建缓存"
+category = "Xcode"
+safety = "Safe"
+patterns = [{ exact = "Library/Developer/Xcode/DerivedData" }]
+
+[[rules]]
+name = "Pods"
+description = "CocoaPods 依赖目录"
+category = "CocoaPods"
+safety = "Safe"
+patterns = [{ dir_name = "Pods" }]
+
+[[rules]]
+name = "Docker Desktop Data"
+description = "Docker Desktop 虚拟机磁盘和 buildx 缓存"
+category = "Docker"
+safety = "Moderate"
+patterns = [
+    { exact = "Library/Containers/com.docker.docker/Data/vms" },
+    { exact = ".docker/buildx" },
+]
+
+[[rules]]
+name = "Maven Repository"
+description = "Maven 本地仓库缓存（~/.m2/repository）"
+category = "Java"
+safety = "Moderate"
+patterns = [{ exact = ".m2/repository" }]
+
+[[rules]]
+name = "Homebrew Cache"
+description = "Homebrew 下载缓存"
+category = "Homebrew"
+safety = "Safe"
+patterns = [{ exact = "Library/Caches/Homebrew" }]
+
+[[rules]]
+name = "Go Module Cache"
+description = "Go 模块下载缓存（~/go/pkg/mod）"
+category = "Go"
+safety = "Safe"
+patterns = [{ exact = "go/pkg/mod" }]
+
+[[rules]]
+name = "Cargo Cache"
+description = "Cargo registry 和 git 缓存（与 target 互补）"
+category = "Rust"
+safety = "Safe"
+patterns = [{ exact = ".cargo/registry" }, { exact = ".cargo/git" }]
+
+[[rules]]
+name = "npm/pnpm/yarn Cache"
+description = "Node 包管理器全局缓存"
+category = "Node.js"
+safety = "Safe"
+patterns = [
+    { exact = ".npm/_cacache" },
+    { exact = "Library/pnpm/store" },
+    { exact = ".yarn/cache" },
+]
+
+[[rules]]
+name = "pip Cache"
+description = "pip 下载缓存"
+category = "Python"
+safety = "Safe"
+patterns = [{ exact = "Library/Caches/pip" }]
+
+[[rules]]
+name = "Xcode Archives"
+description = "Xcode 旧归档文件"
+category = "Xcode"
+safety = "Moderate"
+patterns = [{ exact = "Library/Developer/Xcode/Archives" }]
+
+[[rules]]
+name = "Android AVD/SDK"
+description = "Android 模拟器镜像和 SDK 临时文件"
+category = "Android"
+safety = "Moderate"
+patterns = [
+    { exact = ".android/avd" },
+    { exact = "Library/Android/sdk/.temp" },
+]
+
+[[rules]]
+name = "JetBrains Cache"
+description = "JetBrains IDE 缓存（各版本累积）"
+category = "JetBrains"
+safety = "Safe"
+patterns = [{ exact = "Library/Caches/JetBrains" }]
