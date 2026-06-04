@@ -14,7 +14,7 @@ fn spinner_char(tick: u64) -> &'static str {
     SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
 }
 
-fn resolve_node<'a>(root: &'a DirNode, nav_path: &[usize]) -> &'a DirNode {
+pub(crate) fn resolve_node<'a>(root: &'a DirNode, nav_path: &[usize]) -> &'a DirNode {
     let mut node = root;
     for &idx in nav_path {
         if let Some(child) = node.children.get(idx) {

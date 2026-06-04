@@ -187,6 +187,13 @@ fn needs_animation(app: &App) -> bool {
     )
 }
 
+enum SelectResult {
+    Key(crossterm::event::KeyEvent),
+    Progress(ProgressEvent),
+    Analyze(AnalyzeEvent),
+    Timeout,
+}
+
 fn run_app(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<BufWriter<io::Stdout>>>,
 ) -> Result<()> {
@@ -203,23 +210,15 @@ fn run_app(
         // Throttle 生命周期管理：进入动画状态时创建，离开时 drop
         if needs_animation(&app) {
             if throttle.is_none() {
-                // 200ms 与 spinner 帧率对齐（scan.rs 中 SystemTime / 200ms）
                 throttle = Some(throttle::Throttle::new(Duration::from_millis(200)));
             }
         } else {
-            throttle = None; // drop -> 后台线程自动退出
+            throttle = None;
         }
 
         if needs_animation(&app) {
             // ---- 动画状态分支 ----
             // 每次 select 处理一个事件（与 dua-cli 相同），channel 背压自然限速
-            // 两阶段处理：先 select+recv（不可变借用），再 handle（可变借用）
-            enum SelectResult {
-                Key(crossterm::event::KeyEvent),
-                Progress(ProgressEvent),
-                Analyze(AnalyzeEvent),
-                Timeout,
-            }
 
             let select_result = {
                 let mut sel = crossbeam_channel::Select::new();
@@ -545,12 +544,12 @@ fn start_command(
                             if is_file {
                                 count += 1;
                                 total += size;
-                            }
-                            if count.is_multiple_of(500) {
-                                let _ = tx_clone.send(AnalyzeEvent::Progress {
-                                    file_count: count,
-                                    total_size: total,
-                                });
+                                if count.is_multiple_of(500) {
+                                    let _ = tx_clone.send(AnalyzeEvent::Progress {
+                                        file_count: count,
+                                        total_size: total,
+                                    });
+                                }
                             }
                         }
                     }));
@@ -739,9 +738,11 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
             };
         }
         ProgressEvent::Error(msg) => {
-            app.state = AppState::Done {
-                message: format!("错误: {}", msg),
-            };
+            if matches!(app.state, AppState::Scanning { .. } | AppState::Cleaning { .. }) {
+                app.state = AppState::Done {
+                    message: format!("错误: {}", msg),
+                };
+            }
         }
     }
 }
@@ -810,6 +811,7 @@ fn handle_analyze_finished(
             };
         }
     }
+    app.active_command = None;
     *analyze_rx = None;
     *tree_builder = None;
 }
@@ -930,15 +932,7 @@ fn handle_done_key(app: &mut App, key: KeyCode) {
 
 /// 获取 nav_path 指向的当前节点
 fn resolve_nav_node<'a>(root: &'a DirNode, nav_path: &[usize]) -> &'a DirNode {
-    let mut node = root;
-    for &idx in nav_path {
-        if let Some(child) = node.children.get(idx) {
-            node = child;
-        } else {
-            break;
-        }
-    }
-    node
+    ui::analyzer::resolve_node(root, nav_path)
 }
 
 /// 磁盘分析器键盘处理（Analyzing 状态，完成后的纯内存导航）
