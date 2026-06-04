@@ -307,7 +307,7 @@ fn run_app(
                 SelectResult::SortDone(result) => {
                     match result {
                         Ok(sorted_tree) => {
-                            if let AppState::Sorting { marked_for_delete, cursor_stack } =
+                            if let AppState::Sorting { marked_for_delete, cursor_stack, partial } =
                                 std::mem::replace(&mut app.state, AppState::Menu)
                             {
                                 app.state = AppState::Analyzing {
@@ -316,6 +316,7 @@ fn run_app(
                                     cursor: 0,
                                     marked_for_delete,
                                     cursor_stack,
+                                    partial,
                                 };
                             }
                         }
@@ -424,7 +425,7 @@ fn handle_key(
         AppState::Done { .. } => handle_done_key(app, key),
         AppState::Analyzing { .. } => handle_analyzer_key(app, key),
         AppState::AnalyzingLive { .. } => {
-            handle_analyzer_live_key(app, key, analyze_rx, tree_builder);
+            handle_analyzer_live_key(app, key, analyze_rx, tree_builder, sort_rx);
         }
         AppState::Sorting { .. } => {
             match key {
@@ -557,6 +558,7 @@ fn start_command(
                 cursor_stack: Vec::new(),
                 file_count: 0,
                 total_size: 0,
+                user_navigated: false,
             };
 
             thread::spawn(move || {
@@ -855,10 +857,10 @@ fn handle_analyze_finished(
             ..
         } = old
         {
-            // 切换到 Sorting 过渡状态
             app.state = AppState::Sorting {
                 marked_for_delete,
                 cursor_stack,
+                partial: false,
             };
 
             // 在后台线程执行 finalize 排序
@@ -878,16 +880,41 @@ fn handle_analyze_finished(
     *tree_builder = None;
 }
 
-/// 原子性中止 Analyze：清理三个资源
+/// 中止 Analyze：保留已构建的部分树，经 Sorting 排序后进入 Analyzing { partial: true }
 fn abort_analyze(
     app: &mut App,
     analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
     tree_builder: &mut Option<IncrementalTreeBuilder>,
+    sort_rx: &mut Option<Receiver<DirNode>>,
 ) {
-    app.state = AppState::Menu;
-    app.active_command = None; // 必须重置，否则残留 Some(Analyze) 污染后续流程
-    *analyze_rx = None; // drop Receiver -> 后台线程 send 失败退出
-    *tree_builder = None; // drop IncrementalTreeBuilder
+    if let AppState::AnalyzingLive { .. } = &app.state {
+        let old = std::mem::replace(&mut app.state, AppState::Menu);
+        if let AppState::AnalyzingLive {
+            tree_root,
+            marked_for_delete,
+            cursor_stack,
+            ..
+        } = old
+        {
+            app.state = AppState::Sorting {
+                marked_for_delete,
+                cursor_stack,
+                partial: true,
+            };
+
+            let (tx, rx) = crossbeam_channel::bounded::<DirNode>(1);
+            *sort_rx = Some(rx);
+
+            std::thread::spawn(move || {
+                let mut tree = tree_root;
+                IncrementalTreeBuilder::finalize(&mut tree);
+                let _ = tx.send(tree);
+            });
+        }
+    }
+    app.active_command = None;
+    *analyze_rx = None;
+    *tree_builder = None;
 }
 
 // ===== 各状态键盘处理 =====
@@ -1005,6 +1032,7 @@ fn handle_analyzer_key(app: &mut App, key: KeyCode) {
         cursor,
         marked_for_delete,
         cursor_stack,
+        ..
     } = &mut app.state
     {
         let current_node = resolve_nav_node(tree_root, nav_path);
@@ -1056,6 +1084,7 @@ fn handle_analyzer_live_key(
     key: KeyCode,
     analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
     tree_builder: &mut Option<IncrementalTreeBuilder>,
+    sort_rx: &mut Option<Receiver<DirNode>>,
 ) {
     // 先提取需要的字段进行操作
     if let AppState::AnalyzingLive {
@@ -1064,6 +1093,7 @@ fn handle_analyzer_live_key(
         cursor,
         marked_for_delete,
         cursor_stack,
+        user_navigated,
         ..
     } = &mut app.state
     {
@@ -1072,16 +1102,17 @@ fn handle_analyzer_live_key(
             KeyCode::Up | KeyCode::Char('k')
                 if *cursor > 0 => {
                     *cursor -= 1;
+                    *user_navigated = true;
                 }
             KeyCode::Down | KeyCode::Char('j')
                 if !current_node.children.is_empty() && *cursor < current_node.children.len() - 1 => {
                     *cursor += 1;
+                    *user_navigated = true;
                 }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if let Some(child) = current_node.children.get(*cursor) {
-                    // AnalyzingLive 允许进入 children 为空的非文件节点
-                    // live 模式下内容会渐进式出现，不需要等 children 非空
                     if !child.is_file {
+                        *user_navigated = true;
                         cursor_stack.push(*cursor);
                         nav_path.push(*cursor);
                         *cursor = 0;
@@ -1090,15 +1121,15 @@ fn handle_analyzer_live_key(
             }
             KeyCode::Backspace | KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
                 if nav_path.is_empty() {
-                    // 根层：取消 Analyze，原子性清理三个资源
-                    abort_analyze(app, analyze_rx, tree_builder);
+                    abort_analyze(app, analyze_rx, tree_builder, sort_rx);
                 } else {
+                    *user_navigated = true;
                     nav_path.pop();
                     *cursor = cursor_stack.pop().unwrap_or(0);
                 }
             }
             KeyCode::Char('q') => {
-                abort_analyze(app, analyze_rx, tree_builder);
+                abort_analyze(app, analyze_rx, tree_builder, sort_rx);
             }
             KeyCode::Char('d') => {
                 if let Some(child) = current_node.children.get(*cursor) {

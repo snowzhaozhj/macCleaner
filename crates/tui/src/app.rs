@@ -42,6 +42,8 @@ pub enum AppState {
         marked_for_delete: HashSet<PathBuf>,
         /// 每层的 cursor 位置缓存（用于 Backspace 恢复）
         cursor_stack: Vec<usize>,
+        /// 是否为部分扫描结果（用户取消扫描后保留的不完整树）
+        partial: bool,
     },
     /// 磁盘分析进行中（增量构建 + 可导航）
     AnalyzingLive {
@@ -52,11 +54,13 @@ pub enum AppState {
         cursor_stack: Vec<usize>,
         file_count: u64,              // 已发现的文件总数
         total_size: u64,              // 已累计的字节总量
+        user_navigated: bool,         // 用户是否已手动导航（true 后 cursor 不再自动跟随）
     },
     /// 正在排序（finalize 在后台线程执行）
     Sorting {
         marked_for_delete: HashSet<PathBuf>,
         cursor_stack: Vec<usize>,
+        partial: bool,
     },
 }
 
