@@ -152,58 +152,6 @@ impl IncrementalTreeBuilder {
 
 // ===== 导航辅助函数 =====
 
-/// 在 finalize 排序前调用：将 nav_path 中的索引序列解析为 PathBuf 序列
-fn resolve_nav_paths(root: &DirNode, nav_path: &[usize]) -> Vec<PathBuf> {
-    let mut paths = Vec::with_capacity(nav_path.len());
-    let mut node = root;
-    for &idx in nav_path {
-        if let Some(child) = node.children.get(idx) {
-            paths.push(child.path.clone());
-            node = child;
-        } else {
-            break;
-        }
-    }
-    paths
-}
-
-/// 在 finalize 排序前调用：记录 cursor 指向的子节点的 PathBuf
-fn resolve_cursor_target(root: &DirNode, nav_path: &[usize], cursor: usize) -> Option<PathBuf> {
-    let node = resolve_nav_node(root, nav_path);
-    node.children.get(cursor).map(|c| c.path.clone())
-}
-
-/// 在 finalize 排序后调用：用 PathBuf 在排序后的树中查找新索引
-fn remap_nav_after_sort(
-    root: &DirNode,
-    paths: &[PathBuf],
-    cursor_target: Option<PathBuf>,
-) -> (Vec<usize>, usize) {
-    let mut nav_path = Vec::with_capacity(paths.len());
-    let mut node = root;
-    for path in paths {
-        if let Some(idx) = node.children.iter().position(|c| c.path == *path) {
-            nav_path.push(idx);
-            node = &node.children[idx];
-        } else {
-            // 路径在排序后找不到（不应发生），截断导航
-            break;
-        }
-    }
-    // 重映射 cursor
-    let new_cursor = if let Some(ref target) = cursor_target {
-        let current_node = resolve_nav_node(root, &nav_path);
-        current_node
-            .children
-            .iter()
-            .position(|c| c.path == *target)
-            .unwrap_or(0)
-    } else {
-        0
-    };
-    (nav_path, new_cursor)
-}
-
 // ===== 核心运行逻辑 =====
 
 pub fn run() -> Result<()> {
@@ -886,28 +834,20 @@ fn handle_analyze_finished(
         let old = std::mem::replace(&mut app.state, AppState::Menu);
         if let AppState::AnalyzingLive {
             mut tree_root,
-            nav_path,
-            cursor,
+            nav_path: _,
+            cursor: _,
             marked_for_delete,
             ..
         } = old
         {
-            // 排序前捕获路径快照，避免索引失效
-            let resolved_paths = resolve_nav_paths(&tree_root, &nav_path);
-            let cursor_target = resolve_cursor_target(&tree_root, &nav_path, cursor);
-
             IncrementalTreeBuilder::finalize(&mut tree_root);
-
-            // 排序后用 PathBuf 重映射索引和 cursor
-            let (new_nav, new_cursor) =
-                remap_nav_after_sort(&tree_root, &resolved_paths, cursor_target);
 
             app.state = AppState::Analyzing {
                 tree_root: Arc::new(tree_root),
-                nav_path: new_nav,
-                cursor: new_cursor,
+                nav_path: Vec::new(),
+                cursor: 0,
                 marked_for_delete,
-                cursor_stack: Vec::new(), // 清空 cursor_stack 以避免排序后的索引失效
+                cursor_stack: Vec::new(),
             };
         }
     }
