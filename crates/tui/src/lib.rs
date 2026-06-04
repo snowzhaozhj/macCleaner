@@ -824,6 +824,9 @@ fn handle_analyze_entry(
                 tree_root,
                 file_count,
                 total_size,
+                user_navigated,
+                cursor,
+                nav_path,
                 ..
             } = &mut app.state
             {
@@ -831,6 +834,13 @@ fn handle_analyze_entry(
                 if is_file {
                     *file_count += 1;
                     *total_size += size;
+                }
+                if !*user_navigated {
+                    let current = resolve_nav_node(tree_root, nav_path);
+                    let len = current.children.len();
+                    if *cursor >= len && len > 0 {
+                        *cursor = len - 1;
+                    }
                 }
             }
         }
@@ -841,11 +851,12 @@ fn handle_analyze_entry(
     }
 }
 
-/// 处理 Finished 事件：将排序卸载到后台线程，切换到 Sorting 状态
-fn handle_analyze_finished(
+/// 从 AnalyzingLive 过渡到 Sorting：提取树、启动后台排序线程、清理 analyze 资源
+fn transition_to_sorting(
     app: &mut App,
-    tree_builder: &mut Option<IncrementalTreeBuilder>,
+    partial: bool,
     analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
+    tree_builder: &mut Option<IncrementalTreeBuilder>,
     sort_rx: &mut Option<Receiver<DirNode>>,
 ) {
     if let AppState::AnalyzingLive { .. } = &app.state {
@@ -860,52 +871,13 @@ fn handle_analyze_finished(
             app.state = AppState::Sorting {
                 marked_for_delete,
                 cursor_stack,
-                partial: false,
+                partial,
             };
 
-            // 在后台线程执行 finalize 排序
             let (tx, rx) = crossbeam_channel::bounded::<DirNode>(1);
             *sort_rx = Some(rx);
 
             thread::spawn(move || {
-                let mut tree = tree_root;
-                IncrementalTreeBuilder::finalize(&mut tree);
-                let _ = tx.send(tree); // Receiver 可能已 drop（用户取消）
-            });
-        }
-    }
-    // 立即清理 analyze 相关资源
-    app.active_command = None;
-    *analyze_rx = None;
-    *tree_builder = None;
-}
-
-/// 中止 Analyze：保留已构建的部分树，经 Sorting 排序后进入 Analyzing { partial: true }
-fn abort_analyze(
-    app: &mut App,
-    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
-    tree_builder: &mut Option<IncrementalTreeBuilder>,
-    sort_rx: &mut Option<Receiver<DirNode>>,
-) {
-    if let AppState::AnalyzingLive { .. } = &app.state {
-        let old = std::mem::replace(&mut app.state, AppState::Menu);
-        if let AppState::AnalyzingLive {
-            tree_root,
-            marked_for_delete,
-            cursor_stack,
-            ..
-        } = old
-        {
-            app.state = AppState::Sorting {
-                marked_for_delete,
-                cursor_stack,
-                partial: true,
-            };
-
-            let (tx, rx) = crossbeam_channel::bounded::<DirNode>(1);
-            *sort_rx = Some(rx);
-
-            std::thread::spawn(move || {
                 let mut tree = tree_root;
                 IncrementalTreeBuilder::finalize(&mut tree);
                 let _ = tx.send(tree);
@@ -915,6 +887,24 @@ fn abort_analyze(
     app.active_command = None;
     *analyze_rx = None;
     *tree_builder = None;
+}
+
+fn handle_analyze_finished(
+    app: &mut App,
+    tree_builder: &mut Option<IncrementalTreeBuilder>,
+    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
+    sort_rx: &mut Option<Receiver<DirNode>>,
+) {
+    transition_to_sorting(app, false, analyze_rx, tree_builder, sort_rx);
+}
+
+fn abort_analyze(
+    app: &mut App,
+    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
+    tree_builder: &mut Option<IncrementalTreeBuilder>,
+    sort_rx: &mut Option<Receiver<DirNode>>,
+) {
+    transition_to_sorting(app, true, analyze_rx, tree_builder, sort_rx);
 }
 
 // ===== 各状态键盘处理 =====
