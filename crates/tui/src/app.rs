@@ -1,4 +1,5 @@
 use mc_core::models::{CleanReport, DirNode, ScanResult};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -38,7 +39,7 @@ pub enum AppState {
         /// 当前选中行
         cursor: usize,
         /// 标记为删除的路径
-        marked_for_delete: Vec<PathBuf>,
+        marked_for_delete: HashSet<PathBuf>,
         /// 每层的 cursor 位置缓存（用于 Backspace 恢复）
         cursor_stack: Vec<usize>,
     },
@@ -47,10 +48,15 @@ pub enum AppState {
         tree_root: DirNode,           // owned，非 Arc，正在增量构建
         nav_path: Vec<usize>,
         cursor: usize,
-        marked_for_delete: Vec<PathBuf>,
+        marked_for_delete: HashSet<PathBuf>,
         cursor_stack: Vec<usize>,
         file_count: u64,              // 已发现的文件总数
         total_size: u64,              // 已累计的字节总量
+    },
+    /// 正在排序（finalize 在后台线程执行）
+    Sorting {
+        marked_for_delete: HashSet<PathBuf>,
+        cursor_stack: Vec<usize>,
     },
 }
 

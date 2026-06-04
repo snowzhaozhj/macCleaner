@@ -1,6 +1,8 @@
 use crate::app::{App, AppState};
 use humansize::{format_size, DECIMAL};
 use mc_core::models::DirNode;
+use std::collections::HashSet;
+use std::path::PathBuf;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -41,23 +43,58 @@ fn build_breadcrumb_names(root: &DirNode, nav_path: &[usize]) -> Vec<String> {
 }
 
 /// 共享的子项列表渲染函数，供 draw() 和 draw_live() 复用
+///
+/// 视口优化：只为可见行构建 ListItem，从 O(n) 降到 O(visible)。
+/// 滚动逻辑复刻 ratatui ListState(offset=0) 的默认行为，无用户可感知变化。
 fn render_children_list(
     f: &mut Frame,
     node: &DirNode,
     cursor: usize,
-    marked: &[std::path::PathBuf],
+    marked: &HashSet<PathBuf>,
     area: Rect,
     title: &str,
 ) {
+    let total = node.children.len();
+    if total == 0 {
+        // 空列表：渲染带标题的空 block
+        let empty = List::new(Vec::<ListItem>::new()).block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Blue)),
+        );
+        f.render_widget(empty, area);
+        return;
+    }
+
     let parent_size = if node.size > 0 { node.size } else { 1 };
     let bar_width = (area.width as usize).saturating_sub(50).max(10);
 
-    let items: Vec<ListItem> = node
-        .children
+    // Block 边框占 2 行（上下各 1）
+    let visible_height = (area.height as usize).saturating_sub(2);
+    if visible_height == 0 {
+        return;
+    }
+
+    // 防御性 clamp
+    let cursor = cursor.min(total.saturating_sub(1));
+
+    // 复刻 ratatui ListState(offset=0) 的滚动行为：
+    // cursor 在第一屏时 window_start=0，超出时 cursor 置于窗口末行
+    let window_start = if cursor >= visible_height {
+        cursor + 1 - visible_height
+    } else {
+        0
+    };
+    let window_end = (window_start + visible_height).min(total);
+
+    // 仅为可见区间构建 ListItem
+    let items: Vec<ListItem> = node.children[window_start..window_end]
         .iter()
         .enumerate()
-        .map(|(idx, child)| {
-            let is_cursor = idx == cursor;
+        .map(|(i, child)| {
+            let abs_idx = window_start + i;
+            let is_cursor = abs_idx == cursor;
             let is_marked = marked.contains(&child.path);
             let is_large = child.size >= LARGE_FILE_THRESHOLD;
 
@@ -126,8 +163,9 @@ fn render_children_list(
             .border_style(Style::default().fg(Color::Blue)),
     );
 
+    // 使用相对索引：cursor 在窗口切片中的位置
     let mut state = ListState::default();
-    state.select(Some(cursor));
+    state.select(Some(cursor - window_start));
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -315,6 +353,44 @@ pub fn draw_live(f: &mut Frame, app: &App) {
     )
     .style(Style::default().fg(Color::DarkGray));
     f.render_widget(hint, chunks[3]);
+}
+
+/// Sorting 过渡状态渲染：居中显示 spinner + "正在排序..."
+pub fn draw_sorting(f: &mut Frame, _app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
+        .split(f.area());
+
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+        / 200;
+    let spinner = spinner_char(tick);
+
+    let text = format!("{} 正在排序...", spinner);
+    let para = Paragraph::new(text)
+        .block(
+            Block::default()
+                .title(" 磁盘分析 ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(para, chunks[0]);
+
+    let hint = Paragraph::new(" 按 q/Esc 取消")
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(hint, chunks[1]);
 }
 
 /// 渲染面包屑导航栏

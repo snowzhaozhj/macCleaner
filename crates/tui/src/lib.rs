@@ -4,6 +4,8 @@ mod reporter;
 mod throttle;
 mod ui;
 
+use std::collections::HashSet;
+
 use app::{ActiveCommand, App, AppState, FlatRow};
 use event::EventHandler;
 use reporter::TuiReporter;
@@ -183,7 +185,8 @@ pub fn run() -> Result<()> {
 fn needs_animation(app: &App) -> bool {
     matches!(
         app.state,
-        AppState::Scanning { .. } | AppState::Cleaning { .. } | AppState::AnalyzingLive { .. }
+        AppState::Scanning { .. } | AppState::Cleaning { .. }
+        | AppState::AnalyzingLive { .. } | AppState::Sorting { .. }
     )
 }
 
@@ -191,6 +194,7 @@ enum SelectResult {
     Key(crossterm::event::KeyEvent),
     Progress(ProgressEvent),
     Analyze(AnalyzeEvent),
+    SortDone(std::result::Result<DirNode, crossbeam_channel::RecvError>),
     Timeout,
 }
 
@@ -205,6 +209,8 @@ fn run_app(
     // Analyze 专用 channel 和树构建器
     let mut analyze_rx: Option<Receiver<AnalyzeEvent>> = None;
     let mut tree_builder: Option<IncrementalTreeBuilder> = None;
+    // Sort 完成 channel（finalize 在后台线程执行）
+    let mut sort_rx: Option<Receiver<DirNode>> = None;
 
     loop {
         // Throttle 生命周期管理：进入动画状态时创建，离开时 drop
@@ -225,6 +231,7 @@ fn run_app(
                 let key_idx = sel.recv(&events.key_rx);
                 let progress_idx = sel.recv(&events.progress_rx);
                 let analyze_idx = analyze_rx.as_ref().map(|rx| sel.recv(rx));
+                let sort_idx = sort_rx.as_ref().map(|rx| sel.recv(rx));
 
                 match sel.select_timeout(Duration::from_millis(100)) {
                     Ok(oper) if oper.index() == key_idx => oper
@@ -240,6 +247,13 @@ fn run_app(
                             oper.recv(rx)
                                 .map(SelectResult::Analyze)
                                 .unwrap_or(SelectResult::Analyze(AnalyzeEvent::Finished))
+                        } else {
+                            SelectResult::Timeout
+                        }
+                    }
+                    Ok(oper) if Some(oper.index()) == sort_idx => {
+                        if let Some(ref rx) = sort_rx {
+                            SelectResult::SortDone(oper.recv(rx))
                         } else {
                             SelectResult::Timeout
                         }
@@ -261,6 +275,7 @@ fn run_app(
                         &events,
                         &mut analyze_rx,
                         &mut tree_builder,
+                        &mut sort_rx,
                     );
                     terminal.draw(|f| ui::draw(f, &app))?;
                 }
@@ -276,6 +291,7 @@ fn run_app(
                             &mut app,
                             &mut tree_builder,
                             &mut analyze_rx,
+                            &mut sort_rx,
                         );
                         terminal.draw(|f| ui::draw(f, &app))?;
                     }
@@ -288,6 +304,29 @@ fn run_app(
                         }
                     }
                 },
+                SelectResult::SortDone(result) => {
+                    match result {
+                        Ok(sorted_tree) => {
+                            if let AppState::Sorting { marked_for_delete, cursor_stack } =
+                                std::mem::replace(&mut app.state, AppState::Menu)
+                            {
+                                app.state = AppState::Analyzing {
+                                    tree_root: Arc::new(sorted_tree),
+                                    nav_path: Vec::new(),
+                                    cursor: 0,
+                                    marked_for_delete,
+                                    cursor_stack,
+                                };
+                            }
+                        }
+                        Err(_) => {
+                            // 排序线程 panic — 回退到 Menu
+                            app.state = AppState::Menu;
+                        }
+                    }
+                    sort_rx = None;
+                    terminal.draw(|f| ui::draw(f, &app))?;
+                }
                 SelectResult::Timeout => {
                     if throttle.as_ref().is_none_or(|t| t.can_update()) {
                         terminal.draw(|f| ui::draw(f, &app))?;
@@ -304,7 +343,7 @@ fn run_app(
                         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                             break;
                         }
-                        handle_key(&mut app, key.code, &events, &mut analyze_rx, &mut tree_builder);
+                        handle_key(&mut app, key.code, &events, &mut analyze_rx, &mut tree_builder, &mut sort_rx);
                     }
                 }
                 recv(events.progress_rx) -> evt => {
@@ -332,6 +371,7 @@ fn handle_key(
     events: &EventHandler,
     analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
     tree_builder: &mut Option<IncrementalTreeBuilder>,
+    sort_rx: &mut Option<Receiver<DirNode>>,
 ) {
     match &app.state {
         AppState::Menu => handle_menu_key(app, key, events, analyze_rx, tree_builder),
@@ -385,6 +425,16 @@ fn handle_key(
         AppState::Analyzing { .. } => handle_analyzer_key(app, key),
         AppState::AnalyzingLive { .. } => {
             handle_analyzer_live_key(app, key, analyze_rx, tree_builder);
+        }
+        AppState::Sorting { .. } => {
+            match key {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    app.state = AppState::Menu;
+                    app.active_command = None;
+                    *sort_rx = None; // drop Receiver 让排序线程 send 失败
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -503,7 +553,7 @@ fn start_command(
                 tree_root: DirNode::new_dir(home.clone(), root_name),
                 nav_path: Vec::new(),
                 cursor: 0,
-                marked_for_delete: Vec::new(),
+                marked_for_delete: HashSet::new(),
                 cursor_stack: Vec::new(),
                 file_count: 0,
                 total_size: 0,
@@ -515,26 +565,24 @@ fn start_command(
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                         let root_len = home.components().count();
-                        let walker = jwalk::WalkDir::new(&home)
-                            .skip_hidden(false)
-                            .follow_links(false)
-                            .parallelism(jwalk::Parallelism::RayonNewPool(3));
+                        let walker = mc_core::create_walker(std::path::Path::new(&home))
+                            .process_read_dir(|_depth, _path, _state, children| {
+                                mc_core::prefetch_metadata(children);
+                            });
                         let mut count = 0u64;
                         let mut total = 0u64;
                         for entry in walker.into_iter().filter_map(|e| e.ok()) {
+                            let is_file = !entry.file_type().is_dir();
+                            let size = if is_file {
+                                entry.client_state.unwrap_or(0)
+                            } else {
+                                0
+                            };
                             let entry_path = entry.path();
                             let depth = entry_path.components().count() - root_len;
                             if depth == 0 {
                                 continue;
                             }
-                            let is_file = !entry.file_type().is_dir();
-                            let size = if is_file {
-                                std::fs::symlink_metadata(&entry_path)
-                                    .map(|m| m.len())
-                                    .unwrap_or(0)
-                            } else {
-                                0
-                            };
                             let name = entry
                                 .file_name()
                                 .to_string_lossy()
@@ -791,33 +839,40 @@ fn handle_analyze_entry(
     }
 }
 
-/// 处理 Finished 事件：完成树构建，切换到 Analyzing 状态
+/// 处理 Finished 事件：将排序卸载到后台线程，切换到 Sorting 状态
 fn handle_analyze_finished(
     app: &mut App,
     tree_builder: &mut Option<IncrementalTreeBuilder>,
     analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
+    sort_rx: &mut Option<Receiver<DirNode>>,
 ) {
     if let AppState::AnalyzingLive { .. } = &app.state {
         let old = std::mem::replace(&mut app.state, AppState::Menu);
         if let AppState::AnalyzingLive {
-            mut tree_root,
-            nav_path: _,
-            cursor: _,
+            tree_root,
             marked_for_delete,
+            cursor_stack,
             ..
         } = old
         {
-            IncrementalTreeBuilder::finalize(&mut tree_root);
-
-            app.state = AppState::Analyzing {
-                tree_root: Arc::new(tree_root),
-                nav_path: Vec::new(),
-                cursor: 0,
+            // 切换到 Sorting 过渡状态
+            app.state = AppState::Sorting {
                 marked_for_delete,
-                cursor_stack: Vec::new(),
+                cursor_stack,
             };
+
+            // 在后台线程执行 finalize 排序
+            let (tx, rx) = crossbeam_channel::bounded::<DirNode>(1);
+            *sort_rx = Some(rx);
+
+            thread::spawn(move || {
+                let mut tree = tree_root;
+                IncrementalTreeBuilder::finalize(&mut tree);
+                let _ = tx.send(tree); // Receiver 可能已 drop（用户取消）
+            });
         }
     }
+    // 立即清理 analyze 相关资源
     app.active_command = None;
     *analyze_rx = None;
     *tree_builder = None;
@@ -985,10 +1040,8 @@ fn handle_analyzer_key(app: &mut App, key: KeyCode) {
             KeyCode::Char('d') => {
                 if let Some(child) = current_node.children.get(*cursor) {
                     let path = child.path.clone();
-                    if let Some(pos) = marked_for_delete.iter().position(|p| *p == path) {
-                        marked_for_delete.remove(pos);
-                    } else {
-                        marked_for_delete.push(path);
+                    if !marked_for_delete.remove(&path) {
+                        marked_for_delete.insert(path);
                     }
                 }
             }
@@ -1050,10 +1103,8 @@ fn handle_analyzer_live_key(
             KeyCode::Char('d') => {
                 if let Some(child) = current_node.children.get(*cursor) {
                     let path = child.path.clone();
-                    if let Some(pos) = marked_for_delete.iter().position(|p| *p == path) {
-                        marked_for_delete.remove(pos);
-                    } else {
-                        marked_for_delete.push(path);
+                    if !marked_for_delete.remove(&path) {
+                        marked_for_delete.insert(path);
                     }
                 }
             }
