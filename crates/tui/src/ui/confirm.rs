@@ -30,7 +30,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Line::from(vec![
             Span::styled("  项目数量: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{}", count),
+                format!("{count}"),
                 Style::default().fg(Color::Cyan),
             ),
         ]),

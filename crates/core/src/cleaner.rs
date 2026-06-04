@@ -92,7 +92,7 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    /// 辅助函数：创建测试用 ScanItem
+    /// 辅助函数：创建测试用 `ScanItem`
     fn make_item(path: std::path::PathBuf, size: u64) -> ScanItem {
         ScanItem::new(path, size, SafetyLevel::Safe, "test".to_string())
     }

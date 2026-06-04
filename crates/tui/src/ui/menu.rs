@@ -55,9 +55,9 @@ pub fn draw(f: &mut Frame, app: &App) {
                 Style::default().fg(Color::White)
             };
             ListItem::new(vec![
-                Line::from(Span::styled(format!("{}{}", marker, name), style)),
+                Line::from(Span::styled(format!("{marker}{name}"), style)),
                 Line::from(Span::styled(
-                    format!("    {}", desc),
+                    format!("    {desc}"),
                     Style::default().fg(Color::DarkGray),
                 )),
             ])

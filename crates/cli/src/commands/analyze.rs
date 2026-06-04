@@ -10,9 +10,7 @@ pub fn run(cli: &Cli) -> Result<()> {
     let (path, threshold_mb) = match &cli.command {
         Some(Commands::Analyze { path, threshold }) => {
             let p = path
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(platform::get_home_dir);
+                .as_ref().map_or_else(platform::get_home_dir, PathBuf::from);
             (p, *threshold)
         }
         _ => (platform::get_home_dir(), 100),
@@ -57,16 +55,14 @@ fn build_dir_tree(path: &Path, max_depth: usize) -> Result<DirNode> {
 
 fn build_dir_tree_recursive(path: &Path, depth: usize, max_depth: usize) -> Result<DirNode> {
     let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.display().to_string());
+        .file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().to_string());
 
     let mut node = DirNode::new_dir(path.to_path_buf(), name);
 
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
         Err(e) => {
-            log::debug!("无法读取目录 {:?}: {}", path, e);
+            log::debug!("无法读取目录 {path:?}: {e}");
             return Ok(node);
         }
     };
@@ -120,7 +116,7 @@ fn dir_size_fast(path: &Path) -> u64 {
             mc_core::prefetch_metadata(children);
         })
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| !e.file_type().is_dir())
         .map(|e| e.client_state.unwrap_or(0))
         .sum()

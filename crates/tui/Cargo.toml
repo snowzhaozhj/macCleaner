@@ -19,3 +19,6 @@ log = { workspace = true }
 env_logger = { workspace = true }
 jwalk = { workspace = true }
 dirs = { workspace = true }
+
+[lints]
+workspace = true

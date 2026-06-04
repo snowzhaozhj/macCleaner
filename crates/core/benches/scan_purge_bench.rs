@@ -2,7 +2,6 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use mc_core::engine::Engine;
 use mc_core::progress::{ProgressEvent, ProgressReporter};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 struct NullReporter;
 
@@ -18,7 +17,7 @@ fn bench_scan_purge(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("scan_purge");
     group.sample_size(10);
-    group.measurement_time(std::time::Duration::from_secs(60));
+    group.measurement_time(std::time::Duration::from_mins(1));
 
     group.bench_function("home_dir", |b| {
         b.iter(|| {

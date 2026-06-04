@@ -32,7 +32,7 @@ use std::time::Duration;
 // ===== IncrementalTreeBuilder =====
 
 struct IncrementalTreeBuilder {
-    /// 深度栈：depth_stack[d] = 深度 d 的当前节点在其父 children 中的索引
+    /// `深度栈：depth_stack`[d] = 深度 d 的当前节点在其父 children 中的索引
     depth_stack: Vec<usize>,
     previous_depth: usize,
 }
@@ -45,8 +45,8 @@ impl IncrementalTreeBuilder {
         }
     }
 
-    /// 将一个 AnalyzeEvent::Entry 集成到 tree_root。
-    /// jwalk 保证 DFS 序，depth 相对于 previous_depth 的关系决定导航方向。
+    /// 将一个 `AnalyzeEvent::Entry` 集成到 `tree_root`。
+    /// jwalk 保证 DFS 序，depth 相对于 `previous_depth` 的关系决定导航方向。
     /// 返回 Option：异常 depth 时返回 None 并跳过，不 panic。
     fn integrate_entry(
         &mut self,
@@ -236,17 +236,14 @@ fn run_app(
                 match sel.select_timeout(Duration::from_millis(100)) {
                     Ok(oper) if oper.index() == key_idx => oper
                         .recv(&events.key_rx)
-                        .map(SelectResult::Key)
-                        .unwrap_or(SelectResult::Timeout),
+                        .map_or(SelectResult::Timeout, SelectResult::Key),
                     Ok(oper) if oper.index() == progress_idx => oper
                         .recv(&events.progress_rx)
-                        .map(SelectResult::Progress)
-                        .unwrap_or(SelectResult::Timeout),
+                        .map_or(SelectResult::Timeout, SelectResult::Progress),
                     Ok(oper) if Some(oper.index()) == analyze_idx => {
                         if let Some(ref rx) = analyze_rx {
                             oper.recv(rx)
-                                .map(SelectResult::Analyze)
-                                .unwrap_or(SelectResult::Analyze(AnalyzeEvent::Finished))
+                                .map_or(SelectResult::Analyze(AnalyzeEvent::Finished), SelectResult::Analyze)
                         } else {
                             SelectResult::Timeout
                         }
@@ -281,7 +278,7 @@ fn run_app(
                 }
                 SelectResult::Progress(evt) => {
                     handle_progress(&mut app, evt);
-                    if throttle.as_ref().is_none_or(|t| t.can_update()) {
+                    if throttle.as_ref().is_none_or(throttle::Throttle::can_update) {
                         terminal.draw(|f| ui::draw(f, &app))?;
                     }
                 }
@@ -299,7 +296,7 @@ fn run_app(
                         if let Some(ref mut builder) = tree_builder {
                             handle_analyze_entry(&mut app, other, builder);
                         }
-                        if throttle.as_ref().is_none_or(|t| t.can_update()) {
+                        if throttle.as_ref().is_none_or(throttle::Throttle::can_update) {
                             terminal.draw(|f| ui::draw(f, &app))?;
                         }
                     }
@@ -329,7 +326,7 @@ fn run_app(
                     terminal.draw(|f| ui::draw(f, &app))?;
                 }
                 SelectResult::Timeout => {
-                    if throttle.as_ref().is_none_or(|t| t.can_update()) {
+                    if throttle.as_ref().is_none_or(throttle::Throttle::can_update) {
                         terminal.draw(|f| ui::draw(f, &app))?;
                     }
                 }
@@ -503,7 +500,7 @@ fn start_command(
                     }
                 }));
                 if let Err(e) = result {
-                    reporter.on_event(ProgressEvent::Error(format!("内部错误: {:?}", e)));
+                    reporter.on_event(ProgressEvent::Error(format!("内部错误: {e:?}")));
                 }
             });
         }
@@ -531,7 +528,7 @@ fn start_command(
                     }
                 }));
                 if let Err(e) = result {
-                    reporter.on_event(ProgressEvent::Error(format!("内部错误: {:?}", e)));
+                    reporter.on_event(ProgressEvent::Error(format!("内部错误: {e:?}")));
                 }
             });
         }
@@ -543,9 +540,7 @@ fn start_command(
 
             let home = platform::get_home_dir();
             let root_name = home
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_else(|| "~".into());
+                .file_name().map_or_else(|| "~".into(), |f| f.to_string_lossy().to_string());
             app.state = AppState::AnalyzingLive {
                 tree_root: DirNode::new_dir(home.clone(), root_name),
                 nav_path: Vec::new(),
@@ -569,7 +564,7 @@ fn start_command(
                             });
                         let mut count = 0u64;
                         let mut total = 0u64;
-                        for entry in walker.into_iter().filter_map(|e| e.ok()) {
+                        for entry in walker.into_iter().filter_map(std::result::Result::ok) {
                             let is_file = !entry.file_type().is_dir();
                             let size = if is_file {
                                 entry.client_state.unwrap_or(0)
@@ -612,7 +607,7 @@ fn start_command(
                 // 无论正常完成还是 panic，都发送 Finished
                 let _ = tx.send(AnalyzeEvent::Finished);
                 if let Err(e) = result {
-                    eprintln!("Analyze 遍历线程 panic: {:?}", e);
+                    eprintln!("Analyze 遍历线程 panic: {e:?}");
                 }
             });
         }
@@ -669,7 +664,7 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
                     .nth(home_depth)
                     .map(|c| c.as_os_str().to_string_lossy().to_string())
                     .unwrap_or_default();
-                let new_text = format!("当前: {}", toplevel);
+                let new_text = format!("当前: {toplevel}");
                 if *progress_text != new_text {
                     *progress_text = new_text;
                 }
@@ -793,7 +788,7 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
         ProgressEvent::Error(msg) => {
             if matches!(app.state, AppState::Scanning { .. } | AppState::Cleaning { .. }) {
                 app.state = AppState::Done {
-                    message: format!("错误: {}", msg),
+                    message: format!("错误: {msg}"),
                 };
             }
         }
@@ -802,7 +797,7 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
 
 // ===== Analyze 事件处理（拆分为 entry 和 finished 解决借用冲突）=====
 
-/// 处理 AnalyzeEvent::Entry 和 Progress（不修改 analyze_rx）
+/// 处理 `AnalyzeEvent::Entry` 和 Progress（不修改 `analyze_rx`）
 fn handle_analyze_entry(
     app: &mut App,
     evt: AnalyzeEvent,
@@ -847,7 +842,7 @@ fn handle_analyze_entry(
     }
 }
 
-/// 从 AnalyzingLive 过渡到 Sorting：提取树、启动后台排序线程、清理 analyze 资源
+/// 从 `AnalyzingLive` 过渡到 Sorting：提取树、启动后台排序线程、清理 analyze 资源
 fn transition_to_sorting(
     app: &mut App,
     partial: bool,
@@ -969,7 +964,7 @@ fn handle_confirm_key(app: &mut App, key: KeyCode, events: &EventHandler) {
                 let scan_items: Vec<ScanItem> = items
                     .iter()
                     .map(|(path, size)| {
-                        ScanItem::new(path.clone(), *size, SafetyLevel::Safe, "".into())
+                        ScanItem::new(path.clone(), *size, SafetyLevel::Safe, String::new())
                     })
                     .collect();
                 let refs: Vec<&ScanItem> = scan_items.iter().collect();
@@ -1002,7 +997,7 @@ fn handle_done_key(app: &mut App, key: KeyCode) {
     }
 }
 
-/// 获取 nav_path 指向的当前节点
+/// 获取 `nav_path` 指向的当前节点
 fn resolve_nav_node<'a>(root: &'a DirNode, nav_path: &[usize]) -> &'a DirNode {
     ui::analyzer::resolve_node(root, nav_path)
 }
@@ -1061,7 +1056,7 @@ fn handle_analyzer_key(app: &mut App, key: KeyCode) {
     }
 }
 
-/// AnalyzingLive 状态键盘处理（增量构建中的可导航界面）
+/// `AnalyzingLive` 状态键盘处理（增量构建中的可导航界面）
 fn handle_analyzer_live_key(
     app: &mut App,
     key: KeyCode,

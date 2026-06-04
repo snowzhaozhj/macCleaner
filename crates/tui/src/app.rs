@@ -114,7 +114,7 @@ impl App {
 
     /// 构建扁平化的行列表，用于结果页渲染和交互
     ///
-    /// 按 SafetyLevel 分区（Safe → Moderate → Risky），组内按 total_size 降序排列。
+    /// 按 `SafetyLevel` 分区（Safe → Moderate → Risky），组内按 `total_size` 降序排列。
     /// 每个非空分区前插入一个 Separator 标题行。
     pub fn build_flat_rows(&self) -> Vec<FlatRow> {
         let result = match &self.scan_result {

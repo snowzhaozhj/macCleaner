@@ -27,8 +27,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let has_results = app
         .scan_result
         .as_ref()
-        .map(|r| !r.categories.is_empty())
-        .unwrap_or(false);
+        .is_some_and(|r| !r.categories.is_empty());
 
     if has_results {
         draw_with_results(f, app);
@@ -86,7 +85,7 @@ fn render_title(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         None => "扫描",
     };
 
-    let title = Paragraph::new(format!(" {} 中...", cmd_name))
+    let title = Paragraph::new(format!(" {cmd_name} 中..."))
         .style(
             Style::default()
                 .fg(Color::Yellow)
@@ -127,7 +126,7 @@ fn render_progress(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     // 显示稳定的统计数字 + 顶层目录名（低频变化），不再显示快速闪烁的文件路径
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            format!("  {} ", spinner),
+            format!("  {spinner} "),
             Style::default().fg(Color::Yellow),
         ),
         Span::styled(
@@ -144,7 +143,7 @@ fn render_progress(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mut info_spans = vec![
         Span::styled("  已发现: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("{} 个项目", found_count),
+            format!("{found_count} 个项目"),
             Style::default().fg(Color::Cyan),
         ),
         Span::styled("  |  大小: ", Style::default().fg(Color::DarkGray)),
@@ -156,7 +155,7 @@ fn render_progress(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     if rule_total > 0 {
         info_spans.push(Span::styled(
-            format!("  |  [{}/{}] {}", rule_current, rule_total, rule_name),
+            format!("  |  [{rule_current}/{rule_total}] {rule_name}"),
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -202,7 +201,7 @@ fn render_result_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                         SafetyLevel::Risky => ("危险 (请谨慎操作)", Color::Red),
                     };
                     ListItem::new(Line::from(Span::styled(
-                        format!(" ────── {} ──────", label),
+                        format!(" ────── {label} ──────"),
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
                     )))
                 }
@@ -234,7 +233,7 @@ fn render_result_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     }
 
                     ListItem::new(Line::from(vec![
-                        Span::styled(format!(" {} {} ", expand_icon, check), style),
+                        Span::styled(format!(" {expand_icon} {check} "), style),
                         Span::styled(cat.name.clone(), style.add_modifier(Modifier::BOLD)),
                         Span::styled(
                             format!(
@@ -258,12 +257,10 @@ fn render_result_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
                     let path_str = item
                         .path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| item.path.display().to_string());
+                        .file_name().map_or_else(|| item.path.display().to_string(), |n| n.to_string_lossy().to_string());
 
                     ListItem::new(Line::from(vec![
-                        Span::styled(format!("     {} ", check), style),
+                        Span::styled(format!("     {check} "), style),
                         Span::styled(path_str, style),
                         Span::styled(
                             format!("  ({})", format_size(item.size, DECIMAL)),
@@ -323,7 +320,7 @@ pub fn draw_cleaning(f: &mut Frame, app: &App) {
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                format!("  {} ", spinner),
+                format!("  {spinner} "),
                 Style::default().fg(Color::Yellow),
             ),
             Span::styled(
@@ -353,5 +350,5 @@ fn truncate_path(path: &str, max_len: usize) -> String {
     }
     let keep = max_len - 3;
     let suffix: String = path.chars().skip(char_count - keep).collect();
-    format!("...{}", suffix)
+    format!("...{suffix}")
 }

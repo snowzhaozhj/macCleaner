@@ -42,7 +42,7 @@ fn build_breadcrumb_names(root: &DirNode, nav_path: &[usize]) -> Vec<String> {
     names
 }
 
-/// 共享的子项列表渲染函数，供 draw() 和 draw_live() 复用
+/// 共享的子项列表渲染函数，供 `draw()` 和 `draw_live()` 复用
 ///
 /// 视口优化：只为可见行构建 ListItem，从 O(n) 降到 O(visible)。
 /// 滚动逻辑复刻 ratatui ListState(offset=0) 的默认行为，无用户可感知变化。
@@ -147,7 +147,7 @@ fn render_children_list(
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::styled(
-                    format!("{:>3}% ", percent),
+                    format!("{percent:>3}% "),
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::styled(bar, bar_style),
@@ -212,13 +212,13 @@ pub fn draw(f: &mut Frame, app: &App) {
             format!("  |  {} 个子项", node.children.len()),
             Style::default().fg(Color::DarkGray),
         ),
-        if !marked.is_empty() {
+        if marked.is_empty() {
+            Span::raw("")
+        } else {
             Span::styled(
                 format!("  |  已标记删除: {} 个", marked.len()),
                 Style::default().fg(Color::Red),
             )
-        } else {
-            Span::raw("")
         },
     ])])
     .block(Block::default().borders(Borders::ALL));
@@ -238,7 +238,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_widget(hint, chunks[3]);
 }
 
-/// AnalyzingLive 状态渲染：增量构建中的可导航界面
+/// `AnalyzingLive` 状态渲染：增量构建中的可导航界面
 pub fn draw_live(f: &mut Frame, app: &App) {
     let (tree_root, nav_path, cursor, marked, file_count, total_size) = match &app.state {
         AppState::AnalyzingLive {
@@ -288,7 +288,7 @@ pub fn draw_live(f: &mut Frame, app: &App) {
             format_size(total_size, DECIMAL),
         )
     } else {
-        format!(" {} 扫描中...", spinner)
+        format!(" {spinner} 扫描中...")
     };
     render_breadcrumb(f, &breadcrumb_names, chunks[0], Some(&stats_text));
 
@@ -306,13 +306,13 @@ pub fn draw_live(f: &mut Frame, app: &App) {
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled("  (扫描中)", Style::default().fg(Color::Yellow)),
-        if !marked.is_empty() {
+        if marked.is_empty() {
+            Span::raw("")
+        } else {
             Span::styled(
                 format!("  |  已标记删除: {} 个", marked.len()),
                 Style::default().fg(Color::Red),
             )
-        } else {
-            Span::raw("")
         },
     ])])
     .block(Block::default().borders(Borders::ALL));
@@ -370,7 +370,7 @@ pub fn draw_sorting(f: &mut Frame, _app: &App) {
         / 200;
     let spinner = spinner_char(tick);
 
-    let text = format!("{} 正在排序...", spinner);
+    let text = format!("{spinner} 正在排序...");
     let para = Paragraph::new(text)
         .block(
             Block::default()
@@ -419,7 +419,7 @@ fn render_breadcrumb(
 
     if let Some(info) = extra_info {
         breadcrumb_parts.push(Span::styled(
-            format!("  {}", info),
+            format!("  {info}"),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -441,7 +441,7 @@ fn truncate_name(name: &str, max_len: usize) -> String {
         name.to_string()
     } else if max_len > 3 {
         let prefix: String = name.chars().take(max_len - 3).collect();
-        format!("{}...", prefix)
+        format!("{prefix}...")
     } else {
         name.chars().take(max_len).collect()
     }

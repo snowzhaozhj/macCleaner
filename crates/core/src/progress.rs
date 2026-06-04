@@ -25,7 +25,7 @@ impl ProgressReporter for NoopReporter {
     fn on_event(&self, _event: ProgressEvent) {}
 }
 
-/// 磁盘分析增量遍历事件，通过独立 channel 传输，不经过 ProgressReporter。
+/// 磁盘分析增量遍历事件，通过独立 channel 传输，不经过 `ProgressReporter`。
 pub enum AnalyzeEvent {
     /// 发现一个文件或目录 entry（每个 entry 一条）
     Entry {

@@ -41,7 +41,7 @@ pub enum Commands {
         #[arg(long, default_value = "100")]
         threshold: u64,
     },
-    /// 清理开发产物（node_modules, target 等）
+    /// `清理开发产物（node_modules`, target 等）
     Purge {
         /// 扫描路径（默认 ~/）
         path: Option<String>,

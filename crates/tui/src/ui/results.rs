@@ -39,8 +39,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     // 标题行：显示总计信息
     let (selected_count, selected_size) = app.selected_summary();
     let result = app.scan_result.as_ref();
-    let total_count = result.map(|r| r.file_count).unwrap_or(0);
-    let total_size = result.map(|r| r.total_size).unwrap_or(0);
+    let total_count = result.map_or(0, |r| r.file_count);
+    let total_size = result.map_or(0, |r| r.total_size);
 
     let title = Paragraph::new(vec![Line::from(vec![
         Span::styled(
@@ -89,7 +89,7 @@ pub fn draw(f: &mut Frame, app: &App) {
                         SafetyLevel::Risky => ("危险 (请谨慎操作)", Color::Red),
                     };
                     ListItem::new(Line::from(Span::styled(
-                        format!(" ────── {} ──────", label),
+                        format!(" ────── {label} ──────"),
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
                     )))
                 }
@@ -124,7 +124,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
                     ListItem::new(Line::from(vec![
                         Span::styled(
-                            format!(" {} {} ", expand_icon, check),
+                            format!(" {expand_icon} {check} "),
                             style,
                         ),
                         Span::styled(
@@ -154,12 +154,10 @@ pub fn draw(f: &mut Frame, app: &App) {
 
                     let path_str = item
                         .path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| item.path.display().to_string());
+                        .file_name().map_or_else(|| item.path.display().to_string(), |n| n.to_string_lossy().to_string());
 
                     ListItem::new(Line::from(vec![
-                        Span::styled(format!("     {} ", check), style),
+                        Span::styled(format!("     {check} "), style),
                         Span::styled(path_str, style),
                         Span::styled(
                             format!("  ({})", format_size(item.size, DECIMAL)),

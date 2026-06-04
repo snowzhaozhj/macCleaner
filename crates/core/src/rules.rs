@@ -7,7 +7,7 @@ use std::path::PathBuf;
 pub enum PathPattern {
     /// 匹配一个精确的绝对路径（如 ~/Library/Caches）
     Exact(PathBuf),
-    /// 匹配目录树中任意位置具有此名称的目录（如 "node_modules"）
+    /// 匹配目录树中任意位置具有此名称的目录（如 "`node_modules`"）
     DirName(String),
 }
 
@@ -78,13 +78,13 @@ fn parse_rules_toml(toml_str: &str, source: &str) -> Vec<CleanRule> {
         .collect()
 }
 
-/// 系统缓存清理规则（从 clean_rules.toml 加载）
+/// 系统缓存清理规则（从 `clean_rules.toml` 加载）
 pub fn clean_rules() -> Vec<CleanRule> {
     static TOML: &str = include_str!("clean_rules.toml");
     parse_rules_toml(TOML, "clean_rules.toml")
 }
 
-/// 开发产物清理规则（从 purge_rules.toml 加载）
+/// 开发产物清理规则（从 `purge_rules.toml` 加载）
 pub fn purge_rules() -> Vec<CleanRule> {
     static TOML: &str = include_str!("purge_rules.toml");
     parse_rules_toml(TOML, "purge_rules.toml")
@@ -104,8 +104,7 @@ pub fn matches_pattern(pattern: &PathPattern, path: &std::path::Path) -> bool {
         PathPattern::DirName(name) => path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n == name)
-            .unwrap_or(false),
+            .is_some_and(|n| n == name),
     }
 }
 
@@ -172,7 +171,7 @@ mod tests {
             "JetBrains Cache",
         ];
         for name in &expected {
-            assert!(names.contains(name), "缺少规则: {}", name);
+            assert!(names.contains(name), "缺少规则: {name}");
         }
     }
 

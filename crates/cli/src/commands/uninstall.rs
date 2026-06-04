@@ -43,8 +43,7 @@ pub fn run(cli: &Cli) -> Result<()> {
                 || app
                     .bundle_id
                     .as_ref()
-                    .map(|b| b.to_lowercase().contains(&query.to_lowercase()))
-                    .unwrap_or(false)
+                    .is_some_and(|b| b.to_lowercase().contains(&query.to_lowercase()))
         });
     }
 

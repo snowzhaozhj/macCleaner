@@ -33,13 +33,13 @@ impl AppResolver {
 
         for dir in &app_dirs {
             if !dir.exists() {
-                debug!("应用目录不存在，跳过: {:?}", dir);
+                debug!("应用目录不存在，跳过: {dir:?}");
                 continue;
             }
             let entries = match fs::read_dir(dir) {
                 Ok(entries) => entries,
                 Err(e) => {
-                    warn!("无法读取应用目录 {:?}: {:?}", dir, e);
+                    warn!("无法读取应用目录 {dir:?}: {e:?}");
                     continue;
                 }
             };
@@ -47,7 +47,7 @@ impl AppResolver {
                 let entry = match entry {
                     Ok(e) => e,
                     Err(e) => {
-                        warn!("读取目录条目失败: {:?}", e);
+                        warn!("读取目录条目失败: {e:?}");
                         continue;
                     }
                 };
@@ -58,7 +58,7 @@ impl AppResolver {
                 match Self::read_app_info(&path) {
                     Ok(info) => apps.push(info),
                     Err(e) => {
-                        debug!("解析应用信息失败 {:?}: {:?}", path, e);
+                        debug!("解析应用信息失败 {path:?}: {e:?}");
                     }
                 }
             }
@@ -74,14 +74,12 @@ impl AppResolver {
 
         // 应用名：优先从 plist 读取，否则用目录名
         let fallback_name = app_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
+            .file_stem().map_or_else(|| "Unknown".to_string(), |s| s.to_string_lossy().to_string());
 
         let (bundle_id, name, version) = if plist_path.exists() {
             Self::parse_info_plist(&plist_path, &fallback_name)?
         } else {
-            debug!("Info.plist 不存在: {:?}", plist_path);
+            debug!("Info.plist 不存在: {plist_path:?}");
             (None, fallback_name, None)
         };
 
@@ -103,23 +101,21 @@ impl AppResolver {
         fallback_name: &str,
     ) -> Result<(Option<String>, String, Option<String>)> {
         let value: plist::Value = plist::from_file(plist_path)
-            .with_context(|| format!("解析 Info.plist 失败: {:?}", plist_path))?;
+            .with_context(|| format!("解析 Info.plist 失败: {plist_path:?}"))?;
 
         let dict = value.as_dictionary();
 
         let bundle_id = dict
             .and_then(|d| d.get("CFBundleIdentifier"))
             .and_then(|v| v.as_string())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
 
         let name = dict
             .and_then(|d| {
                 d.get("CFBundleDisplayName")
                     .or_else(|| d.get("CFBundleName"))
             })
-            .and_then(|v| v.as_string())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| fallback_name.to_string());
+            .and_then(|v| v.as_string()).map_or_else(|| fallback_name.to_string(), std::string::ToString::to_string);
 
         let version = dict
             .and_then(|d| {
@@ -127,12 +123,12 @@ impl AppResolver {
                     .or_else(|| d.get("CFBundleVersion"))
             })
             .and_then(|v| v.as_string())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
 
         Ok((bundle_id, name, version))
     }
 
-    /// 计算 .app 目录的大小，使用 symlink_metadata 避免跟随符号链接
+    /// 计算 .app 目录的大小，使用 `symlink_metadata` 避免跟随符号链接
     fn calc_app_size(path: &PathBuf) -> u64 {
         let mut total: u64 = 0;
         let entries = match fs::read_dir(path) {
@@ -159,8 +155,8 @@ impl AppResolver {
 
     /// 根据 bundle ID 在 ~/Library 标准路径下查找应用残留
     ///
-    /// 搜索 Caches, Preferences, Application Support, LaunchAgents,
-    /// Saved Application State, Logs, WebKit, HTTPStorages
+    /// 搜索 Caches, Preferences, Application Support, `LaunchAgents`,
+    /// Saved Application State, Logs, `WebKit`, `HTTPStorages`
     pub fn find_leftovers(bundle_id: &str) -> Vec<ScanItem> {
         let home = platform::get_home_dir();
         let library = home.join("Library");
@@ -174,7 +170,7 @@ impl AppResolver {
             let entries = match fs::read_dir(&search_dir) {
                 Ok(e) => e,
                 Err(e) => {
-                    debug!("无法读取 {:?}: {:?}", search_dir, e);
+                    debug!("无法读取 {search_dir:?}: {e:?}");
                     continue;
                 }
             };
@@ -187,8 +183,8 @@ impl AppResolver {
                 let entry_lower = entry_name.to_lowercase();
                 let bid_lower = bundle_id.to_lowercase();
                 if entry_lower == bid_lower
-                    || entry_lower.starts_with(&format!("{}.", bid_lower))
-                    || entry_lower.starts_with(&format!("{}-", bid_lower))
+                    || entry_lower.starts_with(&format!("{bid_lower}."))
+                    || entry_lower.starts_with(&format!("{bid_lower}-"))
                 {
                     let path = entry.path();
                     let size = match fs::symlink_metadata(&path) {
@@ -205,7 +201,7 @@ impl AppResolver {
                         path,
                         size,
                         SafetyLevel::Safe,
-                        format!("应用残留 ({})", subdir),
+                        format!("应用残留 ({subdir})"),
                     ));
                 }
             }
@@ -311,7 +307,7 @@ mod tests {
         f.write_all(plist_content.as_bytes()).unwrap();
 
         let (bundle_id, name, version) =
-            AppResolver::parse_info_plist(&plist_path.to_path_buf(), "Fallback").unwrap();
+            AppResolver::parse_info_plist(&plist_path.clone(), "Fallback").unwrap();
 
         assert_eq!(bundle_id, Some("com.test.MyApp".to_string()));
         assert_eq!(name, "MyApp");
@@ -324,7 +320,7 @@ mod tests {
         let app_dir = dir.path().join("TestApp.app");
         fs::create_dir_all(&app_dir).unwrap();
 
-        let info = AppResolver::read_app_info(&app_dir.to_path_buf()).unwrap();
+        let info = AppResolver::read_app_info(&app_dir.clone()).unwrap();
         assert_eq!(info.name, "TestApp");
         assert!(info.bundle_id.is_none());
     }
