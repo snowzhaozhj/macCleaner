@@ -13,16 +13,39 @@ const WALK_THREADS: usize = 3;
 #[cfg(not(target_os = "macos"))]
 const WALK_THREADS: usize = 0;
 
-fn create_walker(path: &Path) -> jwalk::WalkDir {
+/// 带预取 metadata 的 walker 类型别名：client_state 存储文件大小 Option<u64>
+pub type MetaWalkDir = jwalk::WalkDirGeneric<((), Option<u64>)>;
+
+/// 创建带正确并行度配置的 walker（返回类型支持 client_state 预取）
+///
+/// 注意：此函数不设置 `process_read_dir`，调用方需自行设置并在回调中调用
+/// `prefetch_metadata` 来预取文件大小。这是因为 `process_read_dir` 是替换型 API，
+/// 后调用会覆盖前调用。
+pub fn create_walker(path: &Path) -> MetaWalkDir {
     let parallelism = if WALK_THREADS == 0 {
         jwalk::Parallelism::RayonDefaultPool { busy_timeout: std::time::Duration::from_secs(1) }
     } else {
         jwalk::Parallelism::RayonNewPool(WALK_THREADS)
     };
-    jwalk::WalkDir::new(path)
+    MetaWalkDir::new(path)
         .skip_hidden(false)
         .follow_links(false)
         .parallelism(parallelism)
+}
+
+/// 在 `process_read_dir` 回调中预取每个条目的 metadata，将文件大小存入 `client_state`。
+/// 在 rayon 工作线程上执行，消费端可零成本读取 `entry.client_state`。
+pub fn prefetch_metadata(
+    children: &mut Vec<jwalk::Result<jwalk::DirEntry<((), Option<u64>)>>>,
+) {
+    for entry in children.iter_mut() {
+        if let Ok(dir_entry) = entry {
+            if !dir_entry.file_type.is_dir() {
+                dir_entry.client_state =
+                    dir_entry.metadata().map(|m| m.len()).ok();
+            }
+        }
+    }
 }
 
 pub struct Scanner;
@@ -119,6 +142,7 @@ impl Scanner {
                         }
                         true
                     });
+                    prefetch_metadata(children);
                 });
 
             let mut batch_count: usize = 0;
@@ -135,10 +159,8 @@ impl Scanner {
                     continue;
                 }
 
+                let size = entry.client_state.unwrap_or(0);
                 let path = entry.path();
-                let size = std::fs::symlink_metadata(&path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
 
                 batch_count += 1;
 
@@ -303,6 +325,7 @@ impl Scanner {
                     }
                     true
                 });
+                prefetch_metadata(children);
             });
 
         // 遍历所有条目，对文件累加 size 到所属的匹配目录
@@ -327,10 +350,8 @@ impl Scanner {
                 });
             }
 
+            let size = entry.client_state.unwrap_or(0);
             let path = entry.path();
-            let size = std::fs::symlink_metadata(&path)
-                .map(|m| m.len())
-                .unwrap_or(0);
 
             // 找到该文件所属的最近匹配目录并累加 size
             if let Ok(mut dirs) = matched_dirs.lock() {
@@ -396,14 +417,15 @@ fn dir_size(path: &Path) -> u64 {
         return 0;
     }
 
-    let walker = create_walker(path);
+    let walker = create_walker(path)
+        .process_read_dir(|_depth, _path, _state, children| {
+            prefetch_metadata(children);
+        });
     let mut total: u64 = 0;
 
     for entry in walker.into_iter().flatten() {
         if !entry.file_type().is_dir() {
-            if let Ok(meta) = std::fs::symlink_metadata(entry.path()) {
-                total += meta.len();
-            }
+            total += entry.client_state.unwrap_or(0);
         }
     }
 

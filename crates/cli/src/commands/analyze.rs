@@ -115,14 +115,14 @@ fn build_dir_tree_recursive(path: &Path, depth: usize, max_depth: usize) -> Resu
 }
 
 fn dir_size_fast(path: &Path) -> u64 {
-    jwalk::WalkDir::new(path)
-        .skip_hidden(false)
-        .follow_links(false)
+    mc_core::create_walker(path)
+        .process_read_dir(|_depth, _path, _state, children| {
+            mc_core::prefetch_metadata(children);
+        })
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter_map(|e| e.path().symlink_metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
+        .filter(|e| !e.file_type().is_dir())
+        .map(|e| e.client_state.unwrap_or(0))
         .sum()
 }
 

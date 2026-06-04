@@ -515,26 +515,24 @@ fn start_command(
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                         let root_len = home.components().count();
-                        let walker = jwalk::WalkDir::new(&home)
-                            .skip_hidden(false)
-                            .follow_links(false)
-                            .parallelism(jwalk::Parallelism::RayonNewPool(3));
+                        let walker = mc_core::create_walker(std::path::Path::new(&home))
+                            .process_read_dir(|_depth, _path, _state, children| {
+                                mc_core::prefetch_metadata(children);
+                            });
                         let mut count = 0u64;
                         let mut total = 0u64;
                         for entry in walker.into_iter().filter_map(|e| e.ok()) {
+                            let is_file = !entry.file_type().is_dir();
+                            let size = if is_file {
+                                entry.client_state.unwrap_or(0)
+                            } else {
+                                0
+                            };
                             let entry_path = entry.path();
                             let depth = entry_path.components().count() - root_len;
                             if depth == 0 {
                                 continue;
                             }
-                            let is_file = !entry.file_type().is_dir();
-                            let size = if is_file {
-                                std::fs::symlink_metadata(&entry_path)
-                                    .map(|m| m.len())
-                                    .unwrap_or(0)
-                            } else {
-                                0
-                            };
                             let name = entry
                                 .file_name()
                                 .to_string_lossy()

@@ -6,3 +6,5 @@ pub mod platform;
 pub mod progress;
 pub mod rules;
 pub mod scanner;
+
+pub use scanner::{create_walker, prefetch_metadata, MetaWalkDir};
