@@ -53,6 +53,11 @@ pub enum AppState {
         file_count: u64,              // 已发现的文件总数
         total_size: u64,              // 已累计的字节总量
     },
+    /// 正在排序（finalize 在后台线程执行）
+    Sorting {
+        marked_for_delete: HashSet<PathBuf>,
+        cursor_stack: Vec<usize>,
+    },
 }
 
 /// 当前激活的命令

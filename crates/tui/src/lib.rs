@@ -185,7 +185,8 @@ pub fn run() -> Result<()> {
 fn needs_animation(app: &App) -> bool {
     matches!(
         app.state,
-        AppState::Scanning { .. } | AppState::Cleaning { .. } | AppState::AnalyzingLive { .. }
+        AppState::Scanning { .. } | AppState::Cleaning { .. }
+        | AppState::AnalyzingLive { .. } | AppState::Sorting { .. }
     )
 }
 
@@ -193,6 +194,7 @@ enum SelectResult {
     Key(crossterm::event::KeyEvent),
     Progress(ProgressEvent),
     Analyze(AnalyzeEvent),
+    SortDone(std::result::Result<DirNode, crossbeam_channel::RecvError>),
     Timeout,
 }
 
@@ -207,6 +209,8 @@ fn run_app(
     // Analyze 专用 channel 和树构建器
     let mut analyze_rx: Option<Receiver<AnalyzeEvent>> = None;
     let mut tree_builder: Option<IncrementalTreeBuilder> = None;
+    // Sort 完成 channel（finalize 在后台线程执行）
+    let mut sort_rx: Option<Receiver<DirNode>> = None;
 
     loop {
         // Throttle 生命周期管理：进入动画状态时创建，离开时 drop
@@ -227,6 +231,7 @@ fn run_app(
                 let key_idx = sel.recv(&events.key_rx);
                 let progress_idx = sel.recv(&events.progress_rx);
                 let analyze_idx = analyze_rx.as_ref().map(|rx| sel.recv(rx));
+                let sort_idx = sort_rx.as_ref().map(|rx| sel.recv(rx));
 
                 match sel.select_timeout(Duration::from_millis(100)) {
                     Ok(oper) if oper.index() == key_idx => oper
@@ -242,6 +247,13 @@ fn run_app(
                             oper.recv(rx)
                                 .map(SelectResult::Analyze)
                                 .unwrap_or(SelectResult::Analyze(AnalyzeEvent::Finished))
+                        } else {
+                            SelectResult::Timeout
+                        }
+                    }
+                    Ok(oper) if Some(oper.index()) == sort_idx => {
+                        if let Some(ref rx) = sort_rx {
+                            SelectResult::SortDone(oper.recv(rx))
                         } else {
                             SelectResult::Timeout
                         }
@@ -263,6 +275,7 @@ fn run_app(
                         &events,
                         &mut analyze_rx,
                         &mut tree_builder,
+                        &mut sort_rx,
                     );
                     terminal.draw(|f| ui::draw(f, &app))?;
                 }
@@ -278,6 +291,7 @@ fn run_app(
                             &mut app,
                             &mut tree_builder,
                             &mut analyze_rx,
+                            &mut sort_rx,
                         );
                         terminal.draw(|f| ui::draw(f, &app))?;
                     }
@@ -290,6 +304,29 @@ fn run_app(
                         }
                     }
                 },
+                SelectResult::SortDone(result) => {
+                    match result {
+                        Ok(sorted_tree) => {
+                            if let AppState::Sorting { marked_for_delete, cursor_stack } =
+                                std::mem::replace(&mut app.state, AppState::Menu)
+                            {
+                                app.state = AppState::Analyzing {
+                                    tree_root: Arc::new(sorted_tree),
+                                    nav_path: Vec::new(),
+                                    cursor: 0,
+                                    marked_for_delete,
+                                    cursor_stack,
+                                };
+                            }
+                        }
+                        Err(_) => {
+                            // 排序线程 panic — 回退到 Menu
+                            app.state = AppState::Menu;
+                        }
+                    }
+                    sort_rx = None;
+                    terminal.draw(|f| ui::draw(f, &app))?;
+                }
                 SelectResult::Timeout => {
                     if throttle.as_ref().is_none_or(|t| t.can_update()) {
                         terminal.draw(|f| ui::draw(f, &app))?;
@@ -306,7 +343,7 @@ fn run_app(
                         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                             break;
                         }
-                        handle_key(&mut app, key.code, &events, &mut analyze_rx, &mut tree_builder);
+                        handle_key(&mut app, key.code, &events, &mut analyze_rx, &mut tree_builder, &mut sort_rx);
                     }
                 }
                 recv(events.progress_rx) -> evt => {
@@ -334,6 +371,7 @@ fn handle_key(
     events: &EventHandler,
     analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
     tree_builder: &mut Option<IncrementalTreeBuilder>,
+    sort_rx: &mut Option<Receiver<DirNode>>,
 ) {
     match &app.state {
         AppState::Menu => handle_menu_key(app, key, events, analyze_rx, tree_builder),
@@ -387,6 +425,16 @@ fn handle_key(
         AppState::Analyzing { .. } => handle_analyzer_key(app, key),
         AppState::AnalyzingLive { .. } => {
             handle_analyzer_live_key(app, key, analyze_rx, tree_builder);
+        }
+        AppState::Sorting { .. } => {
+            match key {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    app.state = AppState::Menu;
+                    app.active_command = None;
+                    *sort_rx = None; // drop Receiver 让排序线程 send 失败
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -791,33 +839,40 @@ fn handle_analyze_entry(
     }
 }
 
-/// 处理 Finished 事件：完成树构建，切换到 Analyzing 状态
+/// 处理 Finished 事件：将排序卸载到后台线程，切换到 Sorting 状态
 fn handle_analyze_finished(
     app: &mut App,
     tree_builder: &mut Option<IncrementalTreeBuilder>,
     analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
+    sort_rx: &mut Option<Receiver<DirNode>>,
 ) {
     if let AppState::AnalyzingLive { .. } = &app.state {
         let old = std::mem::replace(&mut app.state, AppState::Menu);
         if let AppState::AnalyzingLive {
-            mut tree_root,
-            nav_path: _,
-            cursor: _,
+            tree_root,
             marked_for_delete,
+            cursor_stack,
             ..
         } = old
         {
-            IncrementalTreeBuilder::finalize(&mut tree_root);
-
-            app.state = AppState::Analyzing {
-                tree_root: Arc::new(tree_root),
-                nav_path: Vec::new(),
-                cursor: 0,
+            // 切换到 Sorting 过渡状态
+            app.state = AppState::Sorting {
                 marked_for_delete,
-                cursor_stack: Vec::new(),
+                cursor_stack,
             };
+
+            // 在后台线程执行 finalize 排序
+            let (tx, rx) = crossbeam_channel::bounded::<DirNode>(1);
+            *sort_rx = Some(rx);
+
+            thread::spawn(move || {
+                let mut tree = tree_root;
+                IncrementalTreeBuilder::finalize(&mut tree);
+                let _ = tx.send(tree); // Receiver 可能已 drop（用户取消）
+            });
         }
     }
+    // 立即清理 analyze 相关资源
     app.active_command = None;
     *analyze_rx = None;
     *tree_builder = None;

@@ -355,6 +355,44 @@ pub fn draw_live(f: &mut Frame, app: &App) {
     f.render_widget(hint, chunks[3]);
 }
 
+/// Sorting 过渡状态渲染：居中显示 spinner + "正在排序..."
+pub fn draw_sorting(f: &mut Frame, _app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
+        .split(f.area());
+
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+        / 200;
+    let spinner = spinner_char(tick);
+
+    let text = format!("{} 正在排序...", spinner);
+    let para = Paragraph::new(text)
+        .block(
+            Block::default()
+                .title(" 磁盘分析 ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(para, chunks[0]);
+
+    let hint = Paragraph::new(" 按 q/Esc 取消")
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(hint, chunks[1]);
+}
+
 /// 渲染面包屑导航栏
 fn render_breadcrumb(
     f: &mut Frame,

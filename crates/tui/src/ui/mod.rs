@@ -18,6 +18,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         AppState::Done { .. } => draw_done(f, app),
         AppState::Analyzing { .. } => analyzer::draw(f, app),
         AppState::AnalyzingLive { .. } => analyzer::draw_live(f, app),
+        AppState::Sorting { .. } => analyzer::draw_sorting(f, app),
     }
 }
 
