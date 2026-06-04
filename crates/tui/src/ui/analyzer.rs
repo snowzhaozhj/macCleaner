@@ -171,14 +171,15 @@ fn render_children_list(
 
 /// 已完成分析的磁盘浏览器渲染（Analyzing 状态）
 pub fn draw(f: &mut Frame, app: &App) {
-    let (tree_root, nav_path, cursor, marked) = match &app.state {
+    let (tree_root, nav_path, cursor, marked, partial) = match &app.state {
         AppState::Analyzing {
             tree_root,
             nav_path,
             cursor,
             marked_for_delete,
+            partial,
             ..
-        } => (tree_root, nav_path, *cursor, marked_for_delete),
+        } => (tree_root, nav_path, *cursor, marked_for_delete, *partial),
         _ => return,
     };
 
@@ -223,15 +224,12 @@ pub fn draw(f: &mut Frame, app: &App) {
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(dir_info, chunks[1]);
 
-    // 子项列表
-    render_children_list(
-        f,
-        node,
-        cursor,
-        marked,
-        chunks[2],
-        " 文件列表 (按大小排序) ",
-    );
+    let list_title = if partial {
+        " 文件列表 (按大小排序) [部分扫描] "
+    } else {
+        " 文件列表 (按大小排序) "
+    };
+    render_children_list(f, node, cursor, marked, chunks[2], list_title);
 
     let hint = Paragraph::new(
         " ↑↓/jk 移动 | Enter/l 进入目录 | Backspace/h 返回上级 | d 标记删除 | q 返回菜单",
