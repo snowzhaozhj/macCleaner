@@ -1,6 +1,9 @@
 # 开发产物清理规则
 # safety: "Safe" | "Moderate" | "Risky"
-# pattern 类型: { dir_name = "xxx" } 或 { exact = "相对于 $HOME 的路径" }
+# pattern 类型:
+#   { exact = "相对于 $HOME 的路径" }
+#   { absolute = "绝对路径" }
+#   { dir_name = "目录名" }
 
 [[rules]]
 name = "node_modules"

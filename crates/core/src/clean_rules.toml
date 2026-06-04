@@ -1,0 +1,47 @@
+# 系统缓存清理规则（全部为 Safe）
+# pattern 类型:
+#   { exact = "相对于 $HOME 的路径" }
+#   { absolute = "绝对路径" }
+#   { dir_name = "目录名" }
+
+[[rules]]
+name = "System Caches"
+description = "系统及应用缓存文件"
+category = "系统缓存"
+safety = "Safe"
+patterns = [{ exact = "Library/Caches" }]
+
+[[rules]]
+name = "Application Logs"
+description = "应用日志文件"
+category = "系统缓存"
+safety = "Safe"
+patterns = [{ exact = "Library/Logs" }]
+
+[[rules]]
+name = "System Temp Files"
+description = "系统临时文件"
+category = "系统缓存"
+safety = "Safe"
+patterns = [{ absolute = "/tmp" }]
+
+[[rules]]
+name = "Chrome Cache"
+description = "Google Chrome 浏览器缓存"
+category = "浏览器缓存"
+safety = "Safe"
+patterns = [{ exact = "Library/Caches/Google/Chrome" }]
+
+[[rules]]
+name = "Safari Cache"
+description = "Safari 浏览器缓存"
+category = "浏览器缓存"
+safety = "Safe"
+patterns = [{ exact = "Library/Caches/com.apple.Safari" }]
+
+[[rules]]
+name = "Firefox Cache"
+description = "Firefox 浏览器缓存"
+category = "浏览器缓存"
+safety = "Safe"
+patterns = [{ exact = "Library/Caches/Firefox" }]

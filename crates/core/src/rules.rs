@@ -40,6 +40,7 @@ struct RuleEntry {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum PatternEntry {
+    Absolute { absolute: String },
     Exact { exact: String },
     DirName { dir_name: String },
 }
@@ -48,9 +49,10 @@ fn home() -> PathBuf {
     crate::platform::get_home_dir()
 }
 
-fn parse_rules_toml(toml_str: &str) -> Vec<CleanRule> {
+fn parse_rules_toml(toml_str: &str, source: &str) -> Vec<CleanRule> {
     let home = home();
-    let file: RuleFile = toml::from_str(toml_str).expect("purge_rules.toml 解析失败");
+    let file: RuleFile =
+        toml::from_str(toml_str).unwrap_or_else(|e| panic!("{source} 解析失败: {e}"));
     file.rules
         .into_iter()
         .map(|entry| {
@@ -58,6 +60,9 @@ fn parse_rules_toml(toml_str: &str) -> Vec<CleanRule> {
                 .patterns
                 .into_iter()
                 .map(|p| match p {
+                    PatternEntry::Absolute { absolute } => {
+                        PathPattern::Exact(PathBuf::from(absolute))
+                    }
                     PatternEntry::Exact { exact } => PathPattern::Exact(home.join(exact)),
                     PatternEntry::DirName { dir_name } => PathPattern::DirName(dir_name),
                 })
@@ -73,65 +78,16 @@ fn parse_rules_toml(toml_str: &str) -> Vec<CleanRule> {
         .collect()
 }
 
-/// 系统缓存清理规则（全部为 Safe）
+/// 系统缓存清理规则（从 clean_rules.toml 加载）
 pub fn clean_rules() -> Vec<CleanRule> {
-    let home = home();
-    vec![
-        CleanRule {
-            name: "System Caches".into(),
-            description: "系统及应用缓存文件".into(),
-            patterns: vec![PathPattern::Exact(home.join("Library/Caches"))],
-            safety: SafetyLevel::Safe,
-            category: "系统缓存".into(),
-        },
-        CleanRule {
-            name: "Application Logs".into(),
-            description: "应用日志文件".into(),
-            patterns: vec![PathPattern::Exact(home.join("Library/Logs"))],
-            safety: SafetyLevel::Safe,
-            category: "系统缓存".into(),
-        },
-        CleanRule {
-            name: "System Temp Files".into(),
-            description: "系统临时文件".into(),
-            patterns: vec![
-                PathPattern::Exact(PathBuf::from("/tmp")),
-            ],
-            safety: SafetyLevel::Safe,
-            category: "系统缓存".into(),
-        },
-        CleanRule {
-            name: "Chrome Cache".into(),
-            description: "Google Chrome 浏览器缓存".into(),
-            patterns: vec![PathPattern::Exact(
-                home.join("Library/Caches/Google/Chrome"),
-            )],
-            safety: SafetyLevel::Safe,
-            category: "浏览器缓存".into(),
-        },
-        CleanRule {
-            name: "Safari Cache".into(),
-            description: "Safari 浏览器缓存".into(),
-            patterns: vec![PathPattern::Exact(
-                home.join("Library/Caches/com.apple.Safari"),
-            )],
-            safety: SafetyLevel::Safe,
-            category: "浏览器缓存".into(),
-        },
-        CleanRule {
-            name: "Firefox Cache".into(),
-            description: "Firefox 浏览器缓存".into(),
-            patterns: vec![PathPattern::Exact(home.join("Library/Caches/Firefox"))],
-            safety: SafetyLevel::Safe,
-            category: "浏览器缓存".into(),
-        },
-    ]
+    static TOML: &str = include_str!("clean_rules.toml");
+    parse_rules_toml(TOML, "clean_rules.toml")
 }
 
 /// 开发产物清理规则（从 purge_rules.toml 加载）
 pub fn purge_rules() -> Vec<CleanRule> {
     static TOML: &str = include_str!("purge_rules.toml");
-    parse_rules_toml(TOML)
+    parse_rules_toml(TOML, "purge_rules.toml")
 }
 
 /// 返回所有规则（系统缓存 + 开发产物）
