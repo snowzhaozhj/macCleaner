@@ -386,15 +386,11 @@ fn handle_key(
                     app.expanded.clear();
                     app.cancel_flag = Arc::new(AtomicBool::new(false));
                 }
-                KeyCode::Up | KeyCode::Char('k')
-                    if app.result_cursor > 0 => {
-                        app.result_cursor -= 1;
-                    }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.move_cursor_up();
+                }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    let row_count = app.build_flat_rows().len();
-                    if row_count > 0 && app.result_cursor < row_count - 1 {
-                        app.result_cursor += 1;
-                    }
+                    app.move_cursor_down();
                 }
                 KeyCode::Char(' ') => {
                     let flat_rows = app.build_flat_rows();
@@ -912,20 +908,17 @@ fn abort_analyze(
 /// 结果页键盘处理
 fn handle_results_key(app: &mut App, key: KeyCode, _events: &EventHandler) {
     let flat_rows = app.build_flat_rows();
-    let row_count = flat_rows.len();
 
     match key {
         KeyCode::Char('q') | KeyCode::Esc => {
             app.back_to_menu();
         }
-        KeyCode::Up | KeyCode::Char('k')
-            if app.result_cursor > 0 => {
-                app.result_cursor -= 1;
-            }
-        KeyCode::Down | KeyCode::Char('j')
-            if row_count > 0 && app.result_cursor < row_count - 1 => {
-                app.result_cursor += 1;
-            }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.move_cursor_up();
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.move_cursor_down();
+        }
         KeyCode::Char(' ') => {
             if let Some(row) = flat_rows.get(app.result_cursor) {
                 let row = row.clone();

@@ -1,4 +1,4 @@
-use mc_core::models::{CleanReport, DirNode, ScanResult};
+use mc_core::models::{CleanReport, DirNode, SafetyLevel, ScanResult};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -113,26 +113,60 @@ impl App {
     }
 
     /// 构建扁平化的行列表，用于结果页渲染和交互
+    ///
+    /// 按 SafetyLevel 分区（Safe → Moderate → Risky），组内按 total_size 降序排列。
+    /// 每个非空分区前插入一个 Separator 标题行。
     pub fn build_flat_rows(&self) -> Vec<FlatRow> {
         let result = match &self.scan_result {
             Some(r) => r,
             None => return Vec::new(),
         };
 
+        let safety_order = [SafetyLevel::Safe, SafetyLevel::Moderate, SafetyLevel::Risky];
+
         let mut rows = Vec::new();
-        for (cat_idx, cat) in result.categories.iter().enumerate() {
-            let expanded = self.expanded.get(cat_idx).copied().unwrap_or(false);
-            rows.push(FlatRow::Category {
-                cat_idx,
-                expanded,
+        for &level in &safety_order {
+            let mut indices: Vec<usize> = result
+                .categories
+                .iter()
+                .enumerate()
+                .filter(|(_, cat)| Self::dominant_safety(cat) == level)
+                .map(|(idx, _)| idx)
+                .collect();
+
+            if indices.is_empty() {
+                continue;
+            }
+
+            indices.sort_by(|&a, &b| {
+                result.categories[b]
+                    .total_size
+                    .cmp(&result.categories[a].total_size)
             });
-            if expanded {
-                for item_idx in 0..cat.items.len() {
-                    rows.push(FlatRow::Item { cat_idx, item_idx });
+
+            rows.push(FlatRow::Separator { level });
+            for cat_idx in indices {
+                let expanded = self.expanded.get(cat_idx).copied().unwrap_or(false);
+                rows.push(FlatRow::Category { cat_idx, expanded });
+                if expanded {
+                    for item_idx in 0..result.categories[cat_idx].items.len() {
+                        rows.push(FlatRow::Item { cat_idx, item_idx });
+                    }
                 }
             }
         }
         rows
+    }
+
+    /// 计算一个 category 的主导安全等级
+    fn dominant_safety(cat: &mc_core::models::CategoryGroup) -> SafetyLevel {
+        if cat.items.iter().any(|i| i.safety == SafetyLevel::Risky) {
+            SafetyLevel::Risky
+        } else if cat.items.iter().all(|i| i.safety == SafetyLevel::Safe) {
+            SafetyLevel::Safe
+        } else {
+            SafetyLevel::Moderate
+        }
     }
 
     /// 初始化结果页状态
@@ -141,6 +175,48 @@ impl App {
             self.expanded = vec![false; result.categories.len()];
             self.result_cursor = 0;
             self.result_scroll = 0;
+            // 跳过开头的 Separator
+            let rows = self.build_flat_rows();
+            self.skip_separator_forward(&rows);
+        }
+    }
+
+    /// 光标向下移动，跳过 Separator 行
+    pub fn move_cursor_down(&mut self) {
+        let rows = self.build_flat_rows();
+        let row_count = rows.len();
+        if row_count > 0 && self.result_cursor < row_count - 1 {
+            self.result_cursor += 1;
+            self.skip_separator_forward(&rows);
+        }
+    }
+
+    /// 光标向上移动，跳过 Separator 行
+    pub fn move_cursor_up(&mut self) {
+        if self.result_cursor > 0 {
+            self.result_cursor -= 1;
+            let rows = self.build_flat_rows();
+            self.skip_separator_backward(&rows);
+        }
+    }
+
+    fn skip_separator_forward(&mut self, rows: &[FlatRow]) {
+        while self.result_cursor < rows.len()
+            && matches!(rows[self.result_cursor], FlatRow::Separator { .. })
+        {
+            if self.result_cursor < rows.len() - 1 {
+                self.result_cursor += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn skip_separator_backward(&mut self, rows: &[FlatRow]) {
+        while self.result_cursor > 0
+            && matches!(rows[self.result_cursor], FlatRow::Separator { .. })
+        {
+            self.result_cursor -= 1;
         }
     }
 
@@ -160,10 +236,10 @@ impl App {
     /// 切换某行的选中状态
     pub fn toggle_selection(&mut self, row: &FlatRow) {
         match row {
+            FlatRow::Separator { .. } => {}
             FlatRow::Category { cat_idx, .. } => {
                 if let Some(ref mut result) = self.scan_result {
                     if let Some(cat) = result.categories.get_mut(*cat_idx) {
-                        // 如果全部选中则取消全部，否则全部选中
                         let all_selected = cat.items.iter().all(|i| i.selected);
                         for item in &mut cat.items {
                             item.selected = !all_selected;
@@ -217,6 +293,8 @@ impl App {
 /// 扁平化的行类型，用于结果列表渲染
 #[derive(Debug, Clone)]
 pub enum FlatRow {
+    /// 风险分区标题行（不可选中）
+    Separator { level: SafetyLevel },
     /// 分类头部行
     Category { cat_idx: usize, expanded: bool },
     /// 文件项行

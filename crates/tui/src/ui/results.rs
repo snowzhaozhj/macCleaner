@@ -82,6 +82,17 @@ pub fn draw(f: &mut Frame, app: &App) {
         .map(|(idx, row)| {
             let is_cursor = idx == app.result_cursor;
             match row {
+                FlatRow::Separator { level } => {
+                    let (label, color) = match level {
+                        SafetyLevel::Safe => ("安全 (可放心删除)", Color::Green),
+                        SafetyLevel::Moderate => ("中等风险 (删除后需重新下载)", Color::Yellow),
+                        SafetyLevel::Risky => ("危险 (请谨慎操作)", Color::Red),
+                    };
+                    ListItem::new(Line::from(Span::styled(
+                        format!(" ────── {} ──────", label),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    )))
+                }
                 FlatRow::Category { cat_idx, expanded } => {
                     let cat = &result.categories[*cat_idx];
                     let dominant_safety = if cat.items.iter().all(|i| i.safety == SafetyLevel::Safe)
