@@ -253,4 +253,28 @@ mod tests {
         let all_count = all_rules().len();
         assert_eq!(all_count, clean_count + purge_count);
     }
+
+    #[test]
+    fn no_duplicate_rule_names() {
+        let rules = all_rules();
+        let mut seen = std::collections::HashSet::new();
+        for rule in &rules {
+            assert!(
+                seen.insert(&rule.name),
+                "重复的规则名: '{}'",
+                rule.name
+            );
+        }
+    }
+
+    #[test]
+    fn no_empty_patterns() {
+        for rule in all_rules() {
+            assert!(
+                !rule.patterns.is_empty(),
+                "规则 '{}' 的 patterns 不能为空",
+                rule.name
+            );
+        }
+    }
 }
