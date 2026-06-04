@@ -142,7 +142,7 @@ impl Scanner {
 
                 batch_count += 1;
 
-                if batch_count % 200 == 0 {
+                if batch_count.is_multiple_of(200) {
                     if reporter.is_cancelled() {
                         break;
                     }
@@ -249,8 +249,8 @@ impl Scanner {
 
         // 单遍遍历：匹配目录时不剪枝，继续遍历子目录以就地累加 size
         // matched_dirs: path -> (safety, category, size)
-        let matched_dirs: Arc<Mutex<HashMap<PathBuf, (SafetyLevel, String, u64)>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        type MatchedDirMap = HashMap<PathBuf, (SafetyLevel, String, u64)>;
+        let matched_dirs: Arc<Mutex<MatchedDirMap>> = Arc::new(Mutex::new(HashMap::new()));
 
         let dirname_rules_arc = Arc::new(dirname_rules);
         let matched_clone = matched_dirs.clone();
@@ -318,10 +318,10 @@ impl Scanner {
             }
 
             batch_count += 1;
-            if batch_count % 500 == 0 && reporter.is_cancelled() {
+            if batch_count.is_multiple_of(500) && reporter.is_cancelled() {
                 break;
             }
-            if batch_count % 500 == 0 {
+            if batch_count.is_multiple_of(500) {
                 reporter.on_event(ProgressEvent::Scanning {
                     path: entry.path(),
                 });
@@ -399,12 +399,10 @@ fn dir_size(path: &Path) -> u64 {
     let walker = create_walker(path);
     let mut total: u64 = 0;
 
-    for entry in walker {
-        if let Ok(entry) = entry {
-            if !entry.file_type().is_dir() {
-                if let Ok(meta) = std::fs::symlink_metadata(entry.path()) {
-                    total += meta.len();
-                }
+    for entry in walker.into_iter().flatten() {
+        if !entry.file_type().is_dir() {
+            if let Ok(meta) = std::fs::symlink_metadata(entry.path()) {
+                total += meta.len();
             }
         }
     }

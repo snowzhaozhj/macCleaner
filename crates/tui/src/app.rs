@@ -42,6 +42,16 @@ pub enum AppState {
         /// 每层的 cursor 位置缓存（用于 Backspace 恢复）
         cursor_stack: Vec<usize>,
     },
+    /// 磁盘分析进行中（增量构建 + 可导航）
+    AnalyzingLive {
+        tree_root: DirNode,           // owned，非 Arc，正在增量构建
+        nav_path: Vec<usize>,
+        cursor: usize,
+        marked_for_delete: Vec<PathBuf>,
+        cursor_stack: Vec<usize>,
+        file_count: u64,              // 已发现的文件总数
+        total_size: u64,              // 已累计的字节总量
+    },
 }
 
 /// 当前激活的命令
@@ -73,8 +83,6 @@ pub struct App {
     pub purge_path: PathBuf,
     // 扫描取消标志
     pub cancel_flag: Arc<AtomicBool>,
-    // Analyzer 渐进式预览（扫描中的快照）
-    pub analyze_preview: Option<DirNode>,
 }
 
 impl App {
@@ -91,7 +99,6 @@ impl App {
             expanded: Vec::new(),
             purge_path: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
             cancel_flag: Arc::new(AtomicBool::new(false)),
-            analyze_preview: None,
         }
     }
 
@@ -191,7 +198,6 @@ impl App {
         self.active_command = None;
         self.scan_result = None;
         self.clean_report = None;
-        self.analyze_preview = None;
         self.expanded.clear();
         self.result_cursor = 0;
         self.result_scroll = 0;

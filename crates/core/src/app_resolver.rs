@@ -52,7 +52,7 @@ impl AppResolver {
                     }
                 };
                 let path = entry.path();
-                if !path.extension().is_some_and(|ext| ext == "app") {
+                if path.extension().is_none_or(|ext| ext != "app") {
                     continue;
                 }
                 match Self::read_app_info(&path) {
@@ -64,7 +64,7 @@ impl AppResolver {
             }
         }
 
-        apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        apps.sort_by_key(|a| a.name.to_lowercase());
         apps
     }
 

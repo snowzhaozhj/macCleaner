@@ -17,6 +17,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         AppState::Cleaning { .. } => scan::draw_cleaning(f, app),
         AppState::Done { .. } => draw_done(f, app),
         AppState::Analyzing { .. } => analyzer::draw(f, app),
+        AppState::AnalyzingLive { .. } => analyzer::draw_live(f, app),
     }
 }
 

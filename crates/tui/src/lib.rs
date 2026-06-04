@@ -1,6 +1,7 @@
 mod app;
 mod event;
 mod reporter;
+mod throttle;
 mod ui;
 
 use app::{ActiveCommand, App, AppState, FlatRow};
@@ -8,6 +9,7 @@ use event::EventHandler;
 use reporter::TuiReporter;
 
 use anyhow::Result;
+use crossbeam_channel::Receiver;
 use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -17,12 +19,192 @@ use humansize::{format_size, DECIMAL};
 use mc_core::engine::Engine;
 use mc_core::models::{DeleteMode, DirNode};
 use mc_core::platform;
-use mc_core::progress::{ProgressEvent, ProgressReporter};
+use mc_core::progress::{AnalyzeEvent, ProgressEvent, ProgressReporter};
 use std::io::{self, stdout, BufWriter};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
+
+// ===== IncrementalTreeBuilder =====
+
+struct IncrementalTreeBuilder {
+    /// 深度栈：depth_stack[d] = 深度 d 的当前节点在其父 children 中的索引
+    depth_stack: Vec<usize>,
+    previous_depth: usize,
+}
+
+impl IncrementalTreeBuilder {
+    fn new() -> Self {
+        Self {
+            depth_stack: Vec::new(),
+            previous_depth: 0,
+        }
+    }
+
+    /// 将一个 AnalyzeEvent::Entry 集成到 tree_root。
+    /// jwalk 保证 DFS 序，depth 相对于 previous_depth 的关系决定导航方向。
+    /// 返回 Option：异常 depth 时返回 None 并跳过，不 panic。
+    fn integrate_entry(
+        &mut self,
+        tree_root: &mut DirNode,
+        depth: usize,
+        name: String,
+        path: PathBuf,
+        size: u64,
+        is_file: bool,
+    ) -> Option<()> {
+        // 运行时安全检查
+        if depth == 0 || depth > self.previous_depth + 1 {
+            return None; // 跳过异常 entry，不 panic
+        }
+
+        // 深度导航
+        if depth > self.previous_depth {
+            if self.previous_depth > 0 {
+                // 进入子目录：push 当前深度节点的最后一个 children 索引
+                let parent = Self::navigate_to_parent(tree_root, &self.depth_stack, self.previous_depth)?;
+                if parent.children.is_empty() {
+                    return None;
+                }
+                self.depth_stack.push(parent.children.len() - 1);
+            }
+            // previous_depth == 0 时是第一个 entry，直接添加到 tree_root，无需 push
+        } else if depth < self.previous_depth {
+            // 回退到上层目录
+            self.depth_stack.truncate(depth.saturating_sub(1));
+        }
+        // depth == previous_depth: 不变
+
+        let parent = Self::navigate_to_parent(tree_root, &self.depth_stack, depth)?;
+        let new_idx = parent.children.len();
+        if is_file {
+            parent.children.push(DirNode::new_file(path, name, size));
+        } else {
+            parent.children.push(DirNode::new_dir(path, name));
+        }
+
+        // 更新 depth_stack 以指向新节点
+        if self.depth_stack.len() < depth {
+            self.depth_stack.push(new_idx);
+        } else if let Some(slot) = self.depth_stack.get_mut(depth - 1) {
+            *slot = new_idx;
+        }
+
+        if is_file && size > 0 {
+            Self::propagate_size(tree_root, &self.depth_stack, depth, size);
+        }
+
+        self.previous_depth = depth;
+        Some(())
+    }
+
+    /// 导航到目标深度的父节点，返回 Option 而非裸索引
+    fn navigate_to_parent<'a>(
+        tree_root: &'a mut DirNode,
+        depth_stack: &[usize],
+        target_depth: usize,
+    ) -> Option<&'a mut DirNode> {
+        let mut node = tree_root;
+        for i in 0..target_depth.saturating_sub(1) {
+            let idx = *depth_stack.get(i)?;
+            node = node.children.get_mut(idx)?;
+        }
+        Some(node)
+    }
+
+    /// 向上传播 size 到所有祖先节点
+    fn propagate_size(
+        tree_root: &mut DirNode,
+        depth_stack: &[usize],
+        depth: usize,
+        size: u64,
+    ) {
+        tree_root.size += size;
+        let mut node = tree_root;
+        for i in 0..depth.saturating_sub(1) {
+            let idx = match depth_stack.get(i) {
+                Some(&idx) => idx,
+                None => return, // 栈不一致，停止传播但不 panic
+            };
+            node = match node.children.get_mut(idx) {
+                Some(n) => n,
+                None => return,
+            };
+            node.size += size;
+        }
+    }
+
+    /// 遍历完成后递归排序所有 children（按 size 降序）
+    fn finalize(tree_root: &mut DirNode) {
+        fn sort_recursive(node: &mut DirNode) {
+            node.children.sort_by_key(|c| std::cmp::Reverse(c.size));
+            for child in &mut node.children {
+                if !child.is_file {
+                    sort_recursive(child);
+                }
+            }
+        }
+        sort_recursive(tree_root);
+    }
+}
+
+// ===== 导航辅助函数 =====
+
+/// 在 finalize 排序前调用：将 nav_path 中的索引序列解析为 PathBuf 序列
+fn resolve_nav_paths(root: &DirNode, nav_path: &[usize]) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(nav_path.len());
+    let mut node = root;
+    for &idx in nav_path {
+        if let Some(child) = node.children.get(idx) {
+            paths.push(child.path.clone());
+            node = child;
+        } else {
+            break;
+        }
+    }
+    paths
+}
+
+/// 在 finalize 排序前调用：记录 cursor 指向的子节点的 PathBuf
+fn resolve_cursor_target(root: &DirNode, nav_path: &[usize], cursor: usize) -> Option<PathBuf> {
+    let node = resolve_nav_node(root, nav_path);
+    node.children.get(cursor).map(|c| c.path.clone())
+}
+
+/// 在 finalize 排序后调用：用 PathBuf 在排序后的树中查找新索引
+fn remap_nav_after_sort(
+    root: &DirNode,
+    paths: &[PathBuf],
+    cursor_target: Option<PathBuf>,
+) -> (Vec<usize>, usize) {
+    let mut nav_path = Vec::with_capacity(paths.len());
+    let mut node = root;
+    for path in paths {
+        if let Some(idx) = node.children.iter().position(|c| c.path == *path) {
+            nav_path.push(idx);
+            node = &node.children[idx];
+        } else {
+            // 路径在排序后找不到（不应发生），截断导航
+            break;
+        }
+    }
+    // 重映射 cursor
+    let new_cursor = if let Some(ref target) = cursor_target {
+        let current_node = resolve_nav_node(root, &nav_path);
+        current_node
+            .children
+            .iter()
+            .position(|c| c.path == *target)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    (nav_path, new_cursor)
+}
+
+// ===== 核心运行逻辑 =====
 
 pub fn run() -> Result<()> {
     // 设置 panic hook：确保终端在 panic 时恢复
@@ -37,7 +219,8 @@ pub fn run() -> Result<()> {
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
 
-    let backend = ratatui::backend::CrosstermBackend::new(BufWriter::with_capacity(8192, stdout()));
+    let backend =
+        ratatui::backend::CrosstermBackend::new(BufWriter::with_capacity(8192, stdout()));
     let mut terminal = ratatui::Terminal::new(backend)?;
 
     let result = run_app(&mut terminal);
@@ -52,66 +235,170 @@ pub fn run() -> Result<()> {
 fn needs_animation(app: &App) -> bool {
     matches!(
         app.state,
-        AppState::Scanning { .. } | AppState::Cleaning { .. }
+        AppState::Scanning { .. } | AppState::Cleaning { .. } | AppState::AnalyzingLive { .. }
     )
 }
 
-fn run_app(terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<BufWriter<io::Stdout>>>) -> Result<()> {
+fn run_app(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<BufWriter<io::Stdout>>>,
+) -> Result<()> {
     let mut app = App::new();
     let events = EventHandler::new();
-    let pending_tree: Arc<Mutex<Option<DirNode>>> = Arc::new(Mutex::new(None));
+
+    // Throttle 在动画状态时激活
+    let mut throttle: Option<throttle::Throttle> = None;
+    // Analyze 专用 channel 和树构建器
+    let mut analyze_rx: Option<Receiver<AnalyzeEvent>> = None;
+    let mut tree_builder: Option<IncrementalTreeBuilder> = None;
 
     loop {
-        // 检查是否有后台完成的目录树
-        if matches!(app.state, AppState::Scanning { .. })
-            && app.active_command == Some(ActiveCommand::Analyze)
-        {
-            let mut lock = pending_tree.lock().unwrap();
-            if let Some(tree) = lock.take() {
-                app.analyze_preview = None;
-                app.state = AppState::Analyzing {
-                    tree_root: Arc::new(tree),
-                    nav_path: Vec::new(),
-                    cursor: 0,
-                    marked_for_delete: Vec::new(),
-                    cursor_stack: Vec::new(),
-                };
+        // Throttle 生命周期管理：进入动画状态时创建，离开时 drop
+        if needs_animation(&app) {
+            if throttle.is_none() {
+                // 200ms 与 spinner 帧率对齐（scan.rs 中 SystemTime / 200ms）
+                throttle = Some(throttle::Throttle::new(Duration::from_millis(200)));
             }
+        } else {
+            throttle = None; // drop -> 后台线程自动退出
         }
 
-        // 渲染
-        terminal.draw(|f| ui::draw(f, &app))?;
-
-        // 事件驱动：动画状态使用超时，静态状态纯阻塞
         if needs_animation(&app) {
-            // 动画状态：100ms 超时驱动 spinner 刷新
-            crossbeam_channel::select! {
-                recv(events.key_rx) -> key => {
-                    if let Ok(key) = key {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            // ---- 动画状态分支 ----
+
+            // 阶段 A：批量消费 analyze_rx（如果存在）
+            let mut had_analyze_events = false;
+            let mut finished = false;
+            let mut disconnected = false;
+            if let Some(ref rx) = analyze_rx {
+                for _ in 0..5000 {
+                    match rx.try_recv() {
+                        Ok(AnalyzeEvent::Finished) => {
+                            finished = true;
+                            had_analyze_events = true;
                             break;
                         }
-                        handle_key(&mut app, key.code, &events, &pending_tree);
+                        Ok(evt) => {
+                            if let Some(ref mut builder) = tree_builder {
+                                handle_analyze_entry(&mut app, evt, builder);
+                            }
+                            had_analyze_events = true;
+                        }
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            // 发送方已 drop 但未发送 Finished，合成 Finished 避免卡死
+                            disconnected = true;
+                            had_analyze_events = true;
+                            break;
+                        }
                     }
                 }
-                recv(events.progress_rx) -> evt => {
-                    if let Ok(evt) = evt {
-                        handle_progress(&mut app, evt);
+            }
+            // Finished/Disconnected 处理（此处 rx 的不可变借用已结束）
+            if finished || disconnected {
+                handle_analyze_finished(&mut app, &mut tree_builder, &mut analyze_rx);
+            }
+
+            // 消费到 analyze events 时立即 continue，不进入 select 等待
+            if had_analyze_events {
+                if throttle.as_ref().is_none_or(|t| t.can_update()) {
+                    terminal.draw(|f| ui::draw(f, &app))?;
+                }
+                if app.should_quit {
+                    break;
+                }
+                continue;
+            }
+
+            // 阶段 B：无 analyze 事件可消费，进入 select 等待
+            // 两阶段处理：先 select+recv（不可变借用），再 handle（可变借用）
+            enum SelectResult {
+                Key(crossterm::event::KeyEvent),
+                Progress(ProgressEvent),
+                Analyze(AnalyzeEvent),
+                Timeout,
+            }
+
+            let select_result = {
+                let mut sel = crossbeam_channel::Select::new();
+                let key_idx = sel.recv(&events.key_rx);
+                let progress_idx = sel.recv(&events.progress_rx);
+                let analyze_idx = analyze_rx.as_ref().map(|rx| sel.recv(rx));
+
+                match sel.select_timeout(Duration::from_millis(100)) {
+                    Ok(oper) if oper.index() == key_idx => oper
+                        .recv(&events.key_rx)
+                        .map(SelectResult::Key)
+                        .unwrap_or(SelectResult::Timeout),
+                    Ok(oper) if oper.index() == progress_idx => oper
+                        .recv(&events.progress_rx)
+                        .map(SelectResult::Progress)
+                        .unwrap_or(SelectResult::Timeout),
+                    Ok(oper) if Some(oper.index()) == analyze_idx => {
+                        if let Some(ref rx) = analyze_rx {
+                            oper.recv(rx)
+                                .map(SelectResult::Analyze)
+                                .unwrap_or(SelectResult::Timeout)
+                        } else {
+                            SelectResult::Timeout
+                        }
+                    }
+                    _ => SelectResult::Timeout,
+                }
+            };
+
+            match select_result {
+                SelectResult::Key(key) => {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c')
+                    {
+                        break;
+                    }
+                    handle_key(
+                        &mut app,
+                        key.code,
+                        &events,
+                        &mut analyze_rx,
+                        &mut tree_builder,
+                    );
+                    terminal.draw(|f| ui::draw(f, &app))?;
+                }
+                SelectResult::Progress(evt) => {
+                    handle_progress(&mut app, evt);
+                    if throttle.as_ref().is_none_or(|t| t.can_update()) {
+                        terminal.draw(|f| ui::draw(f, &app))?;
                     }
                 }
-                default(std::time::Duration::from_millis(100)) => {
-                    // 超时：仅用于刷新 spinner 动画，循环回到 draw
+                SelectResult::Analyze(evt) => match evt {
+                    AnalyzeEvent::Finished => {
+                        handle_analyze_finished(
+                            &mut app,
+                            &mut tree_builder,
+                            &mut analyze_rx,
+                        );
+                    }
+                    other => {
+                        if let Some(ref mut builder) = tree_builder {
+                            handle_analyze_entry(&mut app, other, builder);
+                        }
+                    }
+                },
+                SelectResult::Timeout => {
+                    if throttle.as_ref().is_none_or(|t| t.can_update()) {
+                        terminal.draw(|f| ui::draw(f, &app))?;
+                    }
                 }
             }
         } else {
-            // 静态状态：纯阻塞等待事件，零 CPU 开销
+            // 静态状态：先渲染，再纯阻塞等待事件，零 CPU 开销
+            terminal.draw(|f| ui::draw(f, &app))?;
+
             crossbeam_channel::select! {
                 recv(events.key_rx) -> key => {
                     if let Ok(key) = key {
                         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                             break;
                         }
-                        handle_key(&mut app, key.code, &events, &pending_tree);
+                        handle_key(&mut app, key.code, &events, &mut analyze_rx, &mut tree_builder);
                     }
                 }
                 recv(events.progress_rx) -> evt => {
@@ -130,10 +417,18 @@ fn run_app(terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<B
     Ok(())
 }
 
+// ===== 键盘处理 =====
+
 /// 处理键盘输入
-fn handle_key(app: &mut App, key: KeyCode, events: &EventHandler, pending_tree: &Arc<Mutex<Option<DirNode>>>) {
+fn handle_key(
+    app: &mut App,
+    key: KeyCode,
+    events: &EventHandler,
+    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
+    tree_builder: &mut Option<IncrementalTreeBuilder>,
+) {
     match &app.state {
-        AppState::Menu => handle_menu_key(app, key, events, pending_tree),
+        AppState::Menu => handle_menu_key(app, key, events, analyze_rx, tree_builder),
         AppState::Scanning { .. } => {
             match key {
                 KeyCode::Esc => {
@@ -144,11 +439,10 @@ fn handle_key(app: &mut App, key: KeyCode, events: &EventHandler, pending_tree: 
                     app.expanded.clear();
                     app.cancel_flag = Arc::new(AtomicBool::new(false));
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if app.result_cursor > 0 {
+                KeyCode::Up | KeyCode::Char('k')
+                    if app.result_cursor > 0 => {
                         app.result_cursor -= 1;
                     }
-                }
                 KeyCode::Down | KeyCode::Char('j') => {
                     let row_count = app.build_flat_rows().len();
                     if row_count > 0 && app.result_cursor < row_count - 1 {
@@ -164,7 +458,9 @@ fn handle_key(app: &mut App, key: KeyCode, events: &EventHandler, pending_tree: 
                 }
                 KeyCode::Tab => {
                     let flat_rows = app.build_flat_rows();
-                    if let Some(FlatRow::Category { cat_idx, .. }) = flat_rows.get(app.result_cursor) {
+                    if let Some(FlatRow::Category { cat_idx, .. }) =
+                        flat_rows.get(app.result_cursor)
+                    {
                         app.toggle_expand(*cat_idx);
                     }
                 }
@@ -180,26 +476,33 @@ fn handle_key(app: &mut App, key: KeyCode, events: &EventHandler, pending_tree: 
             // 清理中不响应按键
         }
         AppState::Done { .. } => handle_done_key(app, key),
-        AppState::Analyzing { .. } => handle_analyzer_key(app, key, pending_tree),
+        AppState::Analyzing { .. } => handle_analyzer_key(app, key),
+        AppState::AnalyzingLive { .. } => {
+            handle_analyzer_live_key(app, key, analyze_rx, tree_builder);
+        }
     }
 }
 
 /// 菜单页键盘处理
-fn handle_menu_key(app: &mut App, key: KeyCode, events: &EventHandler, pending_tree: &Arc<Mutex<Option<DirNode>>>) {
+fn handle_menu_key(
+    app: &mut App,
+    key: KeyCode,
+    events: &EventHandler,
+    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
+    tree_builder: &mut Option<IncrementalTreeBuilder>,
+) {
     match key {
         KeyCode::Char('q') | KeyCode::Esc => {
             app.should_quit = true;
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if app.menu_index > 0 {
+        KeyCode::Up | KeyCode::Char('k')
+            if app.menu_index > 0 => {
                 app.menu_index -= 1;
             }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if app.menu_index < 3 {
+        KeyCode::Down | KeyCode::Char('j')
+            if app.menu_index < 3 => {
                 app.menu_index += 1;
             }
-        }
         KeyCode::Enter => {
             let cmd = match app.menu_index {
                 0 => ActiveCommand::Clean,
@@ -209,14 +512,20 @@ fn handle_menu_key(app: &mut App, key: KeyCode, events: &EventHandler, pending_t
                 _ => return,
             };
             app.active_command = Some(cmd);
-            start_command(app, cmd, events, pending_tree);
+            start_command(app, cmd, events, analyze_rx, tree_builder);
         }
         _ => {}
     }
 }
 
 /// 启动命令执行
-fn start_command(app: &mut App, cmd: ActiveCommand, events: &EventHandler, pending_tree: &Arc<Mutex<Option<DirNode>>>) {
+fn start_command(
+    app: &mut App,
+    cmd: ActiveCommand,
+    events: &EventHandler,
+    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
+    tree_builder: &mut Option<IncrementalTreeBuilder>,
+) {
     match cmd {
         ActiveCommand::Clean => {
             app.cancel_flag = Arc::new(AtomicBool::new(false));
@@ -233,9 +542,7 @@ fn start_command(app: &mut App, cmd: ActiveCommand, events: &EventHandler, pendi
             thread::spawn(move || {
                 let reporter = TuiReporter::new(tx, cancel);
                 match Engine::scan_clean(&reporter) {
-                    Ok(_result) => {
-                        // Complete 事件已由引擎发送
-                    }
+                    Ok(_result) => {}
                     Err(e) => {
                         reporter.on_event(ProgressEvent::Error(e.to_string()));
                     }
@@ -266,32 +573,91 @@ fn start_command(app: &mut App, cmd: ActiveCommand, events: &EventHandler, pendi
             });
         }
         ActiveCommand::Analyze => {
-            app.state = AppState::Scanning {
-                progress_text: "正在分析磁盘（单次并行遍历）...".into(),
-                found_count: 0,
-                found_size: 0,
-                rule_current: 0,
-                rule_total: 0,
-                rule_name: String::new(),
-            };
-            let tree_slot = pending_tree.clone();
+            // 通过独立 AnalyzeEvent channel + IncrementalTreeBuilder 实现增量构建
+            let (tx, rx) = crossbeam_channel::bounded::<AnalyzeEvent>(4096);
+            *analyze_rx = Some(rx);
+            *tree_builder = Some(IncrementalTreeBuilder::new());
+
             let home = platform::get_home_dir();
-            let tx = events.progress_sender();
+            let root_name = home
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| "~".into());
+            app.state = AppState::AnalyzingLive {
+                tree_root: DirNode::new_dir(home.clone(), root_name),
+                nav_path: Vec::new(),
+                cursor: 0,
+                marked_for_delete: Vec::new(),
+                cursor_stack: Vec::new(),
+                file_count: 0,
+                total_size: 0,
+            };
+
             thread::spawn(move || {
-                match build_dir_tree(&home, Some(&tx)) {
-                    Ok(tree) => {
-                        if let Ok(mut slot) = tree_slot.lock() {
-                            *slot = Some(tree);
+                // 用 catch_unwind 包裹遍历，确保 Finished 始终被发送
+                let tx_clone = tx.clone();
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        let root_len = home.components().count();
+                        let walker = jwalk::WalkDir::new(&home)
+                            .skip_hidden(false)
+                            .follow_links(false)
+                            .parallelism(jwalk::Parallelism::RayonNewPool(3));
+                        let mut count = 0u64;
+                        let mut total = 0u64;
+                        for entry in walker.into_iter().filter_map(|e| e.ok()) {
+                            let entry_path = entry.path();
+                            let depth = entry_path.components().count() - root_len;
+                            if depth == 0 {
+                                continue;
+                            }
+                            let is_file = !entry.file_type().is_dir();
+                            let size = if is_file {
+                                std::fs::symlink_metadata(&entry_path)
+                                    .map(|m| m.len())
+                                    .unwrap_or(0)
+                            } else {
+                                0
+                            };
+                            let name = entry
+                                .file_name()
+                                .to_string_lossy()
+                                .into_owned();
+                            if tx_clone
+                                .send(AnalyzeEvent::Entry {
+                                    depth,
+                                    name,
+                                    path: entry_path,
+                                    size,
+                                    is_file,
+                                })
+                                .is_err()
+                            {
+                                return; // Receiver 已 drop（用户取消），直接退出
+                            }
+                            if is_file {
+                                count += 1;
+                                total += size;
+                            }
+                            if count.is_multiple_of(500) {
+                                let _ = tx_clone.send(AnalyzeEvent::Progress {
+                                    file_count: count,
+                                    total_size: total,
+                                });
+                            }
                         }
-                    }
-                    Err(_) => {}
+                    }));
+                // 无论正常完成还是 panic，都发送 Finished
+                let _ = tx.send(AnalyzeEvent::Finished);
+                if let Err(e) = result {
+                    eprintln!("Analyze 遍历线程 panic: {:?}", e);
                 }
             });
         }
         ActiveCommand::Uninstall => {
             // Uninstall 使用同步扫描应用列表，然后跳转到结果页
             use mc_core::app_resolver::AppResolver;
-            use mc_core::models::{CategoryGroup, ScanItem, SafetyLevel, ScanResult};
+            use mc_core::models::{CategoryGroup, SafetyLevel, ScanItem, ScanResult};
 
             let apps = AppResolver::list_apps();
             if apps.is_empty() {
@@ -301,7 +667,6 @@ fn start_command(app: &mut App, cmd: ActiveCommand, events: &EventHandler, pendi
                 return;
             }
 
-            // 将应用列表转换为 ScanResult 格式
             let items: Vec<ScanItem> = apps
                 .iter()
                 .map(|a| {
@@ -323,6 +688,8 @@ fn start_command(app: &mut App, cmd: ActiveCommand, events: &EventHandler, pendi
     }
 }
 
+// ===== 进度事件处理 =====
+
 /// 处理引擎进度事件
 fn handle_progress(app: &mut App, evt: ProgressEvent) {
     match evt {
@@ -332,7 +699,18 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
                 ..
             } = app.state
             {
-                *progress_text = path.display().to_string();
+                // 提取顶层目录名（低频变化），不再显示快速闪烁的完整路径
+                let home = platform::get_home_dir();
+                let home_depth = home.components().count();
+                let toplevel = path
+                    .components()
+                    .nth(home_depth)
+                    .map(|c| c.as_os_str().to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let new_text = format!("当前: {}", toplevel);
+                if *progress_text != new_text {
+                    *progress_text = new_text;
+                }
             }
         }
         ProgressEvent::RuleProgress {
@@ -357,17 +735,10 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
             path,
             size,
             safety,
+            ..
         } => {
+            // __analyze_tree__ 路径已废弃，但保留兼容处理避免数据丢失
             if category == "__analyze_tree__" {
-                if let AppState::Scanning {
-                    ref mut found_count,
-                    ref mut found_size,
-                    ..
-                } = app.state
-                {
-                    *found_count += 1;
-                    *found_size += size;
-                }
                 return;
             }
             if let AppState::Scanning {
@@ -406,7 +777,6 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
             total_size,
             count,
         } => {
-            // 用引擎汇总的信息更新 category（修正增量累加的差异）
             if let Some(ref mut result) = app.scan_result {
                 if let Some(cat) = result.categories.iter_mut().find(|c| c.name == category) {
                     cat.total_size = total_size;
@@ -414,42 +784,34 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
                 }
             }
         }
-        ProgressEvent::AnalyzeSnapshot { tree } => {
-            if app.active_command == Some(ActiveCommand::Analyze) {
-                app.analyze_preview = Some(tree);
-            }
+        ProgressEvent::AnalyzeSnapshot { .. } => {
+            // 已废弃，AnalyzingLive 使用独立 channel
         }
         ProgressEvent::Complete => {
-            // 扫描完成，切换到结果页
-            match &app.state {
-                AppState::Scanning { .. } => {
-                    if app.active_command == Some(ActiveCommand::Analyze) {
-                        // Analyze 不使用异步扫描流程
-                        return;
-                    }
-                    if let Some(ref result) = app.scan_result {
-                        if result.file_count == 0 {
-                            app.state = AppState::Done {
-                                message: "未发现可清理的文件。".into(),
-                            };
-                            return;
-                        }
-                    } else {
+            if let AppState::Scanning { .. } = &app.state {
+                if app.active_command == Some(ActiveCommand::Analyze) {
+                    return;
+                }
+                if let Some(ref result) = app.scan_result {
+                    if result.file_count == 0 {
                         app.state = AppState::Done {
                             message: "未发现可清理的文件。".into(),
                         };
                         return;
                     }
-                    // 重新计算 ScanResult 的 total（以 CategoryDone 为准）
-                    if let Some(ref mut result) = app.scan_result {
-                        result.total_size = result.categories.iter().map(|c| c.total_size).sum();
-                        result.file_count = result.categories.iter().map(|c| c.file_count).sum();
-                        result.categories.sort_by(|a, b| a.name.cmp(&b.name));
-                    }
-                    app.init_results();
-                    app.state = AppState::Results;
+                } else {
+                    app.state = AppState::Done {
+                        message: "未发现可清理的文件。".into(),
+                    };
+                    return;
                 }
-                _ => {}
+                if let Some(ref mut result) = app.scan_result {
+                    result.total_size = result.categories.iter().map(|c| c.total_size).sum();
+                    result.file_count = result.categories.iter().map(|c| c.file_count).sum();
+                    result.categories.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+                app.init_results();
+                app.state = AppState::Results;
             }
         }
         ProgressEvent::CleaningFile { path } => {
@@ -477,6 +839,96 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
     }
 }
 
+// ===== Analyze 事件处理（拆分为 entry 和 finished 解决借用冲突）=====
+
+/// 处理 AnalyzeEvent::Entry 和 Progress（不修改 analyze_rx）
+fn handle_analyze_entry(
+    app: &mut App,
+    evt: AnalyzeEvent,
+    builder: &mut IncrementalTreeBuilder,
+) {
+    match evt {
+        AnalyzeEvent::Entry {
+            depth,
+            name,
+            path,
+            size,
+            is_file,
+        } => {
+            if let AppState::AnalyzingLive {
+                tree_root,
+                file_count,
+                total_size,
+                ..
+            } = &mut app.state
+            {
+                let _ = builder.integrate_entry(tree_root, depth, name, path, size, is_file);
+                if is_file {
+                    *file_count += 1;
+                    *total_size += size;
+                }
+            }
+        }
+        AnalyzeEvent::Progress { .. } => { /* 统计已在 Entry 中更新 */ }
+        AnalyzeEvent::Finished => {
+            // Finished 应由 handle_analyze_finished 处理，此处不应到达
+        }
+    }
+}
+
+/// 处理 Finished 事件：完成树构建，切换到 Analyzing 状态
+fn handle_analyze_finished(
+    app: &mut App,
+    tree_builder: &mut Option<IncrementalTreeBuilder>,
+    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
+) {
+    if let AppState::AnalyzingLive { .. } = &app.state {
+        let old = std::mem::replace(&mut app.state, AppState::Menu);
+        if let AppState::AnalyzingLive {
+            mut tree_root,
+            nav_path,
+            cursor,
+            marked_for_delete,
+            ..
+        } = old
+        {
+            // 排序前捕获路径快照，避免索引失效
+            let resolved_paths = resolve_nav_paths(&tree_root, &nav_path);
+            let cursor_target = resolve_cursor_target(&tree_root, &nav_path, cursor);
+
+            IncrementalTreeBuilder::finalize(&mut tree_root);
+
+            // 排序后用 PathBuf 重映射索引和 cursor
+            let (new_nav, new_cursor) =
+                remap_nav_after_sort(&tree_root, &resolved_paths, cursor_target);
+
+            app.state = AppState::Analyzing {
+                tree_root: Arc::new(tree_root),
+                nav_path: new_nav,
+                cursor: new_cursor,
+                marked_for_delete,
+                cursor_stack: Vec::new(), // 清空 cursor_stack 以避免排序后的索引失效
+            };
+        }
+    }
+    *analyze_rx = None;
+    *tree_builder = None;
+}
+
+/// 原子性中止 Analyze：清理三个资源
+fn abort_analyze(
+    app: &mut App,
+    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
+    tree_builder: &mut Option<IncrementalTreeBuilder>,
+) {
+    app.state = AppState::Menu;
+    app.active_command = None; // 必须重置，否则残留 Some(Analyze) 污染后续流程
+    *analyze_rx = None; // drop Receiver -> 后台线程 send 失败退出
+    *tree_builder = None; // drop IncrementalTreeBuilder
+}
+
+// ===== 各状态键盘处理 =====
+
 /// 结果页键盘处理
 fn handle_results_key(app: &mut App, key: KeyCode, _events: &EventHandler) {
     let flat_rows = app.build_flat_rows();
@@ -486,25 +938,21 @@ fn handle_results_key(app: &mut App, key: KeyCode, _events: &EventHandler) {
         KeyCode::Char('q') | KeyCode::Esc => {
             app.back_to_menu();
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if app.result_cursor > 0 {
+        KeyCode::Up | KeyCode::Char('k')
+            if app.result_cursor > 0 => {
                 app.result_cursor -= 1;
             }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if row_count > 0 && app.result_cursor < row_count - 1 {
+        KeyCode::Down | KeyCode::Char('j')
+            if row_count > 0 && app.result_cursor < row_count - 1 => {
                 app.result_cursor += 1;
             }
-        }
         KeyCode::Char(' ') => {
-            // 切换选中状态
             if let Some(row) = flat_rows.get(app.result_cursor) {
                 let row = row.clone();
                 app.toggle_selection(&row);
             }
         }
         KeyCode::Tab => {
-            // 展开/折叠
             if let Some(FlatRow::Category { cat_idx, .. }) = flat_rows.get(app.result_cursor) {
                 app.toggle_expand(*cat_idx);
             }
@@ -526,13 +974,11 @@ fn handle_results_key(app: &mut App, key: KeyCode, _events: &EventHandler) {
 fn handle_confirm_key(app: &mut App, key: KeyCode, events: &EventHandler) {
     match key {
         KeyCode::Enter | KeyCode::Char('y') => {
-            // 执行清理
             app.state = AppState::Cleaning {
                 progress_text: "准备清理...".into(),
             };
 
-            // 收集选中的项目路径和大小
-            let items: Vec<(std::path::PathBuf, u64)> = if let Some(ref result) = app.scan_result {
+            let items: Vec<(PathBuf, u64)> = if let Some(ref result) = app.scan_result {
                 result
                     .selected_items()
                     .iter()
@@ -546,8 +992,7 @@ fn handle_confirm_key(app: &mut App, key: KeyCode, events: &EventHandler) {
             let cancel = Arc::new(AtomicBool::new(false));
             thread::spawn(move || {
                 let reporter = TuiReporter::new(tx, cancel);
-                // 重新构建 ScanItem 列表（因为跨线程不能直接引用 result）
-                use mc_core::models::{ScanItem, SafetyLevel};
+                use mc_core::models::{SafetyLevel, ScanItem};
                 let scan_items: Vec<ScanItem> = items
                     .iter()
                     .map(|(path, size)| {
@@ -557,9 +1002,7 @@ fn handle_confirm_key(app: &mut App, key: KeyCode, events: &EventHandler) {
                 let refs: Vec<&ScanItem> = scan_items.iter().collect();
 
                 match Engine::clean(&refs, DeleteMode::Trash, &reporter) {
-                    Ok(_report) => {
-                        // CleaningDone 事件已由引擎发送
-                    }
+                    Ok(_report) => {}
                     Err(e) => {
                         reporter.on_event(ProgressEvent::Error(e.to_string()));
                     }
@@ -590,13 +1033,17 @@ fn handle_done_key(app: &mut App, key: KeyCode) {
 fn resolve_nav_node<'a>(root: &'a DirNode, nav_path: &[usize]) -> &'a DirNode {
     let mut node = root;
     for &idx in nav_path {
-        node = &node.children[idx];
+        if let Some(child) = node.children.get(idx) {
+            node = child;
+        } else {
+            break;
+        }
     }
     node
 }
 
-/// 磁盘分析器键盘处理（纯内存导航，不做 I/O）
-fn handle_analyzer_key(app: &mut App, key: KeyCode, _pending_tree: &Arc<Mutex<Option<DirNode>>>) {
+/// 磁盘分析器键盘处理（Analyzing 状态，完成后的纯内存导航）
+fn handle_analyzer_key(app: &mut App, key: KeyCode) {
     if let AppState::Analyzing {
         tree_root,
         nav_path,
@@ -608,23 +1055,16 @@ fn handle_analyzer_key(app: &mut App, key: KeyCode, _pending_tree: &Arc<Mutex<Op
         let current_node = resolve_nav_node(tree_root, nav_path);
         match key {
             KeyCode::Char('q') => {
-                if nav_path.is_empty() {
-                    app.back_to_menu();
-                } else {
-                    // q 在子目录中也返回菜单
-                    app.back_to_menu();
-                }
+                app.back_to_menu();
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if *cursor > 0 {
+            KeyCode::Up | KeyCode::Char('k')
+                if *cursor > 0 => {
                     *cursor -= 1;
                 }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !current_node.children.is_empty() && *cursor < current_node.children.len() - 1 {
+            KeyCode::Down | KeyCode::Char('j')
+                if !current_node.children.is_empty() && *cursor < current_node.children.len() - 1 => {
                     *cursor += 1;
                 }
-            }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if let Some(child) = current_node.children.get(*cursor) {
                     if !child.is_file && !child.children.is_empty() {
@@ -657,157 +1097,67 @@ fn handle_analyzer_key(app: &mut App, key: KeyCode, _pending_tree: &Arc<Mutex<Op
     }
 }
 
-/// 构建完整递归目录树：单次 jwalk 遍历 + 深度栈聚合
-fn build_dir_tree(path: &Path, progress_tx: Option<&crossbeam_channel::Sender<ProgressEvent>>) -> Result<DirNode> {
-    use std::collections::HashMap;
-    use std::time::Instant;
-
-    let root_len = path.components().count();
-
-    let mut dir_children: HashMap<PathBuf, HashMap<String, DirNode>> = HashMap::new();
-    dir_children.insert(path.to_path_buf(), HashMap::new());
-
-    // 顶层目录大小追踪（用于渐进式预览）
-    let mut toplevel_sizes: HashMap<PathBuf, u64> = HashMap::new();
-    let mut last_snapshot = Instant::now();
-
-    let walker = jwalk::WalkDir::new(path)
-        .skip_hidden(false)
-        .follow_links(false)
-        .parallelism(jwalk::Parallelism::RayonNewPool(
-            if cfg!(target_os = "macos") { 3 } else { 0 },
-        ));
-
-    let mut file_count: usize = 0;
-    let mut last_reported_size: u64 = 0;
-    let mut total_size: u64 = 0;
-
-    for entry in walker.into_iter().filter_map(|e| e.ok()) {
-        let entry_path = entry.path();
-        let depth = entry_path.components().count() - root_len;
-        if depth == 0 {
-            continue;
-        }
-
-        let parent_path = match entry_path.parent() {
-            Some(p) => p.to_path_buf(),
-            None => continue,
-        };
-
-        let name = entry_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        if entry.file_type().is_dir() {
-            dir_children.entry(entry_path.clone()).or_insert_with(HashMap::new);
-            let siblings = dir_children.entry(parent_path).or_insert_with(HashMap::new);
-            siblings
-                .entry(name)
-                .or_insert_with(|| DirNode::new_dir(entry_path, String::new()));
-        } else {
-            let size = std::fs::symlink_metadata(&entry_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let siblings = dir_children.entry(parent_path).or_insert_with(HashMap::new);
-            siblings
-                .entry(name.clone())
-                .or_insert_with(|| DirNode::new_file(entry_path.clone(), name, size));
-
-            file_count += 1;
-            total_size += size;
-
-            // 追踪顶层目录大小
-            if depth >= 1 {
-                let toplevel_path: PathBuf = entry_path
-                    .components()
-                    .take(root_len + 1)
-                    .collect();
-                *toplevel_sizes.entry(toplevel_path).or_insert(0) += size;
-            }
-
-            if file_count % 500 == 0 {
-                if let Some(tx) = progress_tx {
-                    let _ = tx.send(ProgressEvent::Scanning {
-                        path: entry_path,
-                    });
-                    let size_delta = total_size - last_reported_size;
-                    last_reported_size = total_size;
-                    let _ = tx.send(ProgressEvent::Found {
-                        category: "__analyze_tree__".into(),
-                        path: path.to_path_buf(),
-                        size: size_delta,
-                        safety: mc_core::models::SafetyLevel::Safe,
-                    });
-
-                    // 每 250ms 发送一次顶层快照
-                    if last_snapshot.elapsed() >= std::time::Duration::from_millis(250) {
-                        last_snapshot = Instant::now();
-                        let mut children: Vec<DirNode> = toplevel_sizes
-                            .iter()
-                            .map(|(p, &sz)| {
-                                let n = p.file_name()
-                                    .map(|f| f.to_string_lossy().to_string())
-                                    .unwrap_or_default();
-                                let mut node = DirNode::new_dir(p.clone(), n);
-                                node.size = sz;
-                                node
-                            })
-                            .collect();
-                        children.sort_by(|a, b| b.size.cmp(&a.size));
-                        let mut snapshot = DirNode::new_dir(path.to_path_buf(), path.file_name()
-                            .map(|f| f.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "~".into()));
-                        snapshot.size = total_size;
-                        snapshot.children = children;
-                        let _ = tx.send(ProgressEvent::AnalyzeSnapshot { tree: snapshot });
+/// AnalyzingLive 状态键盘处理（增量构建中的可导航界面）
+fn handle_analyzer_live_key(
+    app: &mut App,
+    key: KeyCode,
+    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
+    tree_builder: &mut Option<IncrementalTreeBuilder>,
+) {
+    // 先提取需要的字段进行操作
+    if let AppState::AnalyzingLive {
+        tree_root,
+        nav_path,
+        cursor,
+        marked_for_delete,
+        cursor_stack,
+        ..
+    } = &mut app.state
+    {
+        let current_node = resolve_nav_node(tree_root, nav_path);
+        match key {
+            KeyCode::Up | KeyCode::Char('k')
+                if *cursor > 0 => {
+                    *cursor -= 1;
+                }
+            KeyCode::Down | KeyCode::Char('j')
+                if !current_node.children.is_empty() && *cursor < current_node.children.len() - 1 => {
+                    *cursor += 1;
+                }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if let Some(child) = current_node.children.get(*cursor) {
+                    // AnalyzingLive 允许进入 children 为空的非文件节点
+                    // live 模式下内容会渐进式出现，不需要等 children 非空
+                    if !child.is_file {
+                        cursor_stack.push(*cursor);
+                        nav_path.push(*cursor);
+                        *cursor = 0;
                     }
                 }
             }
-        }
-    }
-
-    // 自底向上组装树：按路径深度从深到浅处理
-    let mut all_dirs: Vec<PathBuf> = dir_children.keys().cloned().collect();
-    all_dirs.sort_by(|a, b| {
-        let da = a.components().count();
-        let db = b.components().count();
-        db.cmp(&da) // 深的先处理
-    });
-
-    // node_cache: 完整构建好的 DirNode
-    let mut node_cache: HashMap<PathBuf, DirNode> = HashMap::new();
-
-    for dir_path in &all_dirs {
-        let children_map = dir_children.remove(dir_path).unwrap_or_default();
-        let dir_name = dir_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| dir_path.display().to_string());
-
-        let mut children: Vec<DirNode> = Vec::new();
-
-        for (_name, mut child_node) in children_map {
-            if !child_node.is_file {
-                // 用已构建好的子树替换
-                if let Some(built) = node_cache.remove(&child_node.path) {
-                    child_node = built;
+            KeyCode::Backspace | KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
+                if nav_path.is_empty() {
+                    // 根层：取消 Analyze，原子性清理三个资源
+                    abort_analyze(app, analyze_rx, tree_builder);
+                } else {
+                    nav_path.pop();
+                    *cursor = cursor_stack.pop().unwrap_or(0);
                 }
             }
-            children.push(child_node);
+            KeyCode::Char('q') => {
+                abort_analyze(app, analyze_rx, tree_builder);
+            }
+            KeyCode::Char('d') => {
+                if let Some(child) = current_node.children.get(*cursor) {
+                    let path = child.path.clone();
+                    if let Some(pos) = marked_for_delete.iter().position(|p| *p == path) {
+                        marked_for_delete.remove(pos);
+                    } else {
+                        marked_for_delete.push(path);
+                    }
+                }
+            }
+            _ => {}
         }
-
-        children.sort_by(|a, b| b.size.cmp(&a.size));
-        let total_size: u64 = children.iter().map(|c| c.size).sum();
-
-        let mut node = DirNode::new_dir(dir_path.clone(), dir_name);
-        node.size = total_size;
-        node.children = children;
-
-        node_cache.insert(dir_path.clone(), node);
     }
-
-    node_cache
-        .remove(path)
-        .ok_or_else(|| anyhow::anyhow!("failed to build directory tree"))
 }

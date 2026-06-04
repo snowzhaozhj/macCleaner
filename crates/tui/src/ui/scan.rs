@@ -22,13 +22,7 @@ fn safety_color(safety: SafetyLevel) -> Color {
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
-    // Analyze 模式：有预览时渲染渐进式目录树
-    if app.active_command == Some(crate::app::ActiveCommand::Analyze) {
-        if app.analyze_preview.is_some() {
-            draw_analyze_preview(f, app);
-            return;
-        }
-    }
+    // Analyze 模式不再经过 scan::draw()，直接由 mod.rs 分发到 analyzer::draw_live()
 
     let has_results = app
         .scan_result
@@ -130,15 +124,19 @@ fn render_progress(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         / 200;
     let spinner = spinner_char(tick);
 
-    let max_path_len = (area.width as usize).saturating_sub(10);
-
+    // 显示稳定的统计数字 + 顶层目录名（低频变化），不再显示快速闪烁的文件路径
     let mut lines = vec![Line::from(vec![
         Span::styled(
             format!("  {} ", spinner),
             Style::default().fg(Color::Yellow),
         ),
         Span::styled(
-            truncate_path(progress_text, max_path_len),
+            format!(
+                "已扫描 {} 个文件 | {} | {}",
+                found_count,
+                format_size(found_size, DECIMAL),
+                progress_text,
+            ),
             Style::default().fg(Color::White),
         ),
     ])];
@@ -226,10 +224,7 @@ fn render_result_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
                     ListItem::new(Line::from(vec![
                         Span::styled(format!(" {} {} ", expand_icon, check), style),
-                        Span::styled(
-                            cat.name.clone(),
-                            style.add_modifier(Modifier::BOLD),
-                        ),
+                        Span::styled(cat.name.clone(), style.add_modifier(Modifier::BOLD)),
                         Span::styled(
                             format!(
                                 "  ({} 个文件, {})",
@@ -348,147 +343,4 @@ fn truncate_path(path: &str, max_len: usize) -> String {
     let keep = max_len - 3;
     let suffix: String = path.chars().skip(char_count - keep).collect();
     format!("...{}", suffix)
-}
-
-fn draw_analyze_preview(f: &mut Frame, app: &App) {
-    let preview = match &app.analyze_preview {
-        Some(p) => p,
-        None => return,
-    };
-
-    let (progress_text, found_count, found_size) = match &app.state {
-        AppState::Scanning {
-            progress_text,
-            found_count,
-            found_size,
-            ..
-        } => (progress_text.as_str(), *found_count, *found_size),
-        _ => ("", 0, 0),
-    };
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(3),
-        ])
-        .split(f.area());
-
-    // 标题 + 扫描状态
-    let tick = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-        / 200;
-    let spinner = spinner_char(tick);
-
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            format!("  {} 磁盘分析中... ", spinner),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(
-                "已扫描 {} 个文件, {}",
-                found_count,
-                format_size(found_size, DECIMAL),
-            ),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]))
-    .block(
-        Block::default()
-            .title(" 磁盘分析 ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
-    f.render_widget(title, chunks[0]);
-
-    // 当前扫描路径
-    let max_path_len = (chunks[1].width as usize).saturating_sub(10);
-    let path_info = Paragraph::new(vec![Line::from(vec![
-        Span::styled("  扫描: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            truncate_path(progress_text, max_path_len),
-            Style::default().fg(Color::White),
-        ),
-    ])])
-    .block(Block::default().borders(Borders::ALL));
-    f.render_widget(path_info, chunks[1]);
-
-    // 顶层目录列表（渐进式增长）
-    let parent_size = if preview.size > 0 { preview.size } else { 1 };
-    let bar_width = (chunks[2].width as usize).saturating_sub(50).max(10);
-
-    let items: Vec<ListItem> = preview
-        .children
-        .iter()
-        .take(chunks[2].height.saturating_sub(2) as usize)
-        .map(|child| {
-            let icon = "  ";
-            let percent = (child.size as f64 / parent_size as f64 * 100.0) as u16;
-            let filled = (bar_width as f64 * child.size as f64 / parent_size as f64) as usize;
-            let bar: String = format!(
-                "{}{}",
-                "█".repeat(filled.min(bar_width)),
-                "░".repeat(bar_width.saturating_sub(filled)),
-            );
-
-            let name = if child.name.is_empty() {
-                child.path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| child.path.display().to_string())
-            } else {
-                child.name.clone()
-            };
-
-            ListItem::new(Line::from(vec![
-                Span::styled(icon, Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    format!("{:<24}", truncate_name(&name, 24)),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled(
-                    format!(" {:>8} ", format_size(child.size, DECIMAL)),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    format!("{:>3}% ", percent),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(bar, Style::default().fg(Color::Blue)),
-            ]))
-        })
-        .collect();
-
-    let list = List::new(items).block(
-        Block::default()
-            .title(format!(
-                " 目录 (实时, {} 个子项) ",
-                preview.children.len()
-            ))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Blue)),
-    );
-    f.render_widget(list, chunks[2]);
-
-    let hint = Paragraph::new(" Esc 取消 | 扫描完成后可导航浏览")
-        .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(hint, chunks[3]);
-}
-
-fn truncate_name(name: &str, max_len: usize) -> String {
-    let char_count = name.chars().count();
-    if char_count <= max_len {
-        name.to_string()
-    } else if max_len > 3 {
-        let prefix: String = name.chars().take(max_len - 3).collect();
-        format!("{}...", prefix)
-    } else {
-        name.chars().take(max_len).collect()
-    }
 }
