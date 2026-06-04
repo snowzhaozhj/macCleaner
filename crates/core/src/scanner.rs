@@ -1,12 +1,26 @@
 use crate::models::{CategoryGroup, SafetyLevel, ScanItem, ScanResult};
 use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::rules::{clean_rules, purge_rules, CleanRule, PathPattern};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// 需要在遍历时跳过的目录名
+/// 需要在遍历时跳过的目录名（通用）
 const SKIP_DIRS: &[&str] = &[".git", ".Spotlight-V100", ".fseventsd"];
+
+/// purge 模式额外跳过的目录（不可能包含开发产物的大目录）
+const PURGE_SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".Spotlight-V100",
+    ".fseventsd",
+    "Library",
+    "Applications",
+    ".Trash",
+    "Pictures",
+    "Music",
+    "Movies",
+];
 
 #[cfg(target_os = "macos")]
 const WALK_THREADS: usize = 3;
@@ -242,37 +256,44 @@ impl Scanner {
             })
             .collect();
 
-        // Exact 规则（如 DerivedData）单独处理——这些路径固定，不需要遍历发现
-        for rule in rules {
-            for pattern in &rule.patterns {
-                if let PathPattern::Exact(exact_path) = pattern {
-                    if exact_path.exists() && exact_path.starts_with(base_path) {
-                        let size = dir_size(exact_path);
-                        reporter.on_event(ProgressEvent::Found {
-                            category: rule.category.to_string(),
-                            path: exact_path.clone(),
-                            size,
-                            safety: rule.safety,
-                        });
-                        let item = ScanItem::new(
-                            exact_path.clone(),
-                            size,
-                            rule.safety,
-                            rule.category.clone(),
-                        );
-                        category_map
-                            .entry(rule.category.clone())
-                            .or_default()
-                            .push(item);
+        // Exact 规则（如 DerivedData）单独处理——并行计算各路径大小
+        let exact_entries: Vec<(PathBuf, SafetyLevel, String)> = rules
+            .iter()
+            .flat_map(|rule| {
+                rule.patterns.iter().filter_map(move |p| {
+                    if let PathPattern::Exact(exact_path) = p {
+                        if exact_path.exists() && exact_path.starts_with(base_path) {
+                            return Some((exact_path.clone(), rule.safety, rule.category.clone()));
+                        }
                     }
-                }
-            }
+                    None
+                })
+            })
+            .collect();
+
+        let exact_results: Vec<(PathBuf, u64, SafetyLevel, String)> = exact_entries
+            .par_iter()
+            .map(|(path, safety, category)| {
+                let size = dir_size(path);
+                (path.clone(), size, *safety, category.clone())
+            })
+            .collect();
+
+        for (path, size, safety, category) in exact_results {
+            reporter.on_event(ProgressEvent::Found {
+                category: category.clone(),
+                path: path.clone(),
+                size,
+                safety,
+            });
+            let item = ScanItem::new(path, size, safety, category.clone());
+            category_map.entry(category).or_default().push(item);
         }
 
-        // 单遍遍历：匹配目录时不剪枝，继续遍历子目录以就地累加 size
-        // matched_dirs: path -> (safety, category, size)
-        type MatchedDirMap = HashMap<PathBuf, (SafetyLevel, String, u64)>;
-        let matched_dirs: Arc<Mutex<MatchedDirMap>> = Arc::new(Mutex::new(HashMap::new()));
+        // 剪枝遍历：匹配到目录名后立即剪枝（不进入子树），收集匹配路径
+        // 遍历完成后再并行计算各目录大小
+        let matched_dirs: Arc<Mutex<Vec<(PathBuf, SafetyLevel, String)>>> =
+            Arc::new(Mutex::new(Vec::new()));
 
         let dirname_rules_arc = Arc::new(dirname_rules);
         let matched_clone = matched_dirs.clone();
@@ -285,23 +306,11 @@ impl Scanner {
                         if e.file_type().is_dir() {
                             let name = e.file_name().to_string_lossy();
 
-                            if SKIP_DIRS.contains(&name.as_ref()) {
+                            if PURGE_SKIP_DIRS.contains(&name.as_ref()) {
                                 return false;
                             }
 
                             let entry_path = e.path();
-
-                            // 如果当前目录已在某个匹配目录内部，不再匹配（避免嵌套重复计数）
-                            let already_inside = {
-                                if let Ok(dirs) = matched_clone.lock() {
-                                    dirs.keys().any(|mp| entry_path.starts_with(mp) && entry_path != *mp)
-                                } else {
-                                    false
-                                }
-                            };
-                            if already_inside {
-                                return true; // 继续遍历但不匹配
-                            }
 
                             for (dir_name, safety, category) in dirname_clone.iter() {
                                 if name.as_ref() == dir_name.as_str() {
@@ -313,63 +322,43 @@ impl Scanner {
                                         }
                                     }
                                     if let Ok(mut dirs) = matched_clone.lock() {
-                                        dirs.insert(
+                                        dirs.push((
                                             entry_path,
-                                            (*safety, category.clone(), 0),
-                                        );
+                                            *safety,
+                                            category.clone(),
+                                        ));
                                     }
-                                    return true; // 不剪枝，继续遍历以累加 size
+                                    return false; // 剪枝：不进入匹配的目录子树
                                 }
                             }
                         }
                     }
                     true
                 });
-                prefetch_metadata(children);
             });
 
-        // 遍历所有条目，对文件累加 size 到所属的匹配目录
-        let mut batch_count: usize = 0;
+        // 快速遍历（剪枝后只触碰非匹配目录）
         for entry in walker {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            if entry.file_type().is_dir() {
-                continue;
-            }
-
-            batch_count += 1;
-            if batch_count.is_multiple_of(500) && reporter.is_cancelled() {
+            if reporter.is_cancelled() {
                 break;
             }
-            if batch_count.is_multiple_of(500) {
-                reporter.on_event(ProgressEvent::Scanning {
-                    path: entry.path(),
-                });
-            }
-
-            let size = entry.client_state.unwrap_or(0);
-            let path = entry.path();
-
-            // 找到该文件所属的最近匹配目录并累加 size
-            if let Ok(mut dirs) = matched_dirs.lock() {
-                for (matched_path, (_, _, ref mut dir_size)) in dirs.iter_mut() {
-                    if path.starts_with(matched_path) {
-                        *dir_size += size;
-                        break;
-                    }
-                }
-            }
+            let _ = entry;
         }
 
-        // 构建结果
+        // 并行计算各匹配目录的大小
         let dirs = Arc::try_unwrap(matched_dirs)
             .map(|mutex| mutex.into_inner().unwrap_or_default())
             .unwrap_or_else(|arc| arc.lock().unwrap().clone());
 
-        for (path, (safety, category, size)) in dirs {
+        let dir_sizes: Vec<(PathBuf, u64, SafetyLevel, String)> = dirs
+            .par_iter()
+            .map(|(path, safety, category)| {
+                let size = dir_size(path);
+                (path.clone(), size, *safety, category.clone())
+            })
+            .collect();
+
+        for (path, size, safety, category) in dir_sizes {
             reporter.on_event(ProgressEvent::Found {
                 category: category.clone(),
                 path: path.clone(),
