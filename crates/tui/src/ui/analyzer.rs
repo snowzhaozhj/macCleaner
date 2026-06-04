@@ -1,6 +1,8 @@
 use crate::app::{App, AppState};
 use humansize::{format_size, DECIMAL};
 use mc_core::models::DirNode;
+use std::collections::HashSet;
+use std::path::PathBuf;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -45,7 +47,7 @@ fn render_children_list(
     f: &mut Frame,
     node: &DirNode,
     cursor: usize,
-    marked: &[std::path::PathBuf],
+    marked: &HashSet<PathBuf>,
     area: Rect,
     title: &str,
 ) {

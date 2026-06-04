@@ -4,6 +4,8 @@ mod reporter;
 mod throttle;
 mod ui;
 
+use std::collections::HashSet;
+
 use app::{ActiveCommand, App, AppState, FlatRow};
 use event::EventHandler;
 use reporter::TuiReporter;
@@ -503,7 +505,7 @@ fn start_command(
                 tree_root: DirNode::new_dir(home.clone(), root_name),
                 nav_path: Vec::new(),
                 cursor: 0,
-                marked_for_delete: Vec::new(),
+                marked_for_delete: HashSet::new(),
                 cursor_stack: Vec::new(),
                 file_count: 0,
                 total_size: 0,
@@ -985,10 +987,8 @@ fn handle_analyzer_key(app: &mut App, key: KeyCode) {
             KeyCode::Char('d') => {
                 if let Some(child) = current_node.children.get(*cursor) {
                     let path = child.path.clone();
-                    if let Some(pos) = marked_for_delete.iter().position(|p| *p == path) {
-                        marked_for_delete.remove(pos);
-                    } else {
-                        marked_for_delete.push(path);
+                    if !marked_for_delete.remove(&path) {
+                        marked_for_delete.insert(path);
                     }
                 }
             }
@@ -1050,10 +1050,8 @@ fn handle_analyzer_live_key(
             KeyCode::Char('d') => {
                 if let Some(child) = current_node.children.get(*cursor) {
                     let path = child.path.clone();
-                    if let Some(pos) = marked_for_delete.iter().position(|p| *p == path) {
-                        marked_for_delete.remove(pos);
-                    } else {
-                        marked_for_delete.push(path);
+                    if !marked_for_delete.remove(&path) {
+                        marked_for_delete.insert(path);
                     }
                 }
             }
