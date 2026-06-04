@@ -244,12 +244,16 @@ pub fn draw_live(f: &mut Frame, app: &App) {
         .as_millis() as u64
         / 200;
     let spinner = spinner_char(tick);
-    let stats_text = format!(
-        " {} 已发现 {} 个文件, {}",
-        spinner,
-        file_count,
-        format_size(total_size, DECIMAL),
-    );
+    let stats_text = if nav_path.is_empty() {
+        format!(
+            " {} 已发现 {} 个文件, {}",
+            spinner,
+            file_count,
+            format_size(total_size, DECIMAL),
+        )
+    } else {
+        format!(" {} 扫描中...", spinner)
+    };
     render_breadcrumb(f, &breadcrumb_names, chunks[0], Some(&stats_text));
 
     // chunks[1]: 当前目录统计，标注 "(扫描中)"
