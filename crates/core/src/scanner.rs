@@ -3,9 +3,27 @@ use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::rules::{clean_rules, purge_rules, CleanRule, PathPattern};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// 需要在遍历时跳过的目录名
 const SKIP_DIRS: &[&str] = &[".git", ".Spotlight-V100", ".fseventsd"];
+
+#[cfg(target_os = "macos")]
+const WALK_THREADS: usize = 3;
+#[cfg(not(target_os = "macos"))]
+const WALK_THREADS: usize = 0;
+
+fn create_walker(path: &Path) -> jwalk::WalkDir {
+    let parallelism = if WALK_THREADS == 0 {
+        jwalk::Parallelism::RayonDefaultPool { busy_timeout: std::time::Duration::from_secs(1) }
+    } else {
+        jwalk::Parallelism::RayonNewPool(WALK_THREADS)
+    };
+    jwalk::WalkDir::new(path)
+        .skip_hidden(false)
+        .follow_links(false)
+        .parallelism(parallelism)
+}
 
 pub struct Scanner;
 
@@ -25,84 +43,146 @@ impl Scanner {
         Self::scan_purge_dir(base_path, &rules, reporter)
     }
 
-    /// 按 Exact 规则扫描：遍历每条规则的 Exact 路径下的所有文件
+    /// 按 Exact 规则扫描：合并重叠路径后遍历，每个文件只计入最具体的匹配规则
     fn scan_with_rules(
         rules: &[CleanRule],
         reporter: &dyn ProgressReporter,
     ) -> anyhow::Result<ScanResult> {
         let mut category_map: HashMap<String, Vec<ScanItem>> = HashMap::new();
 
+        // 收集所有 (path, safety, category) 并按路径排序（短路径优先）
+        let mut all_paths: Vec<(PathBuf, SafetyLevel, String)> = Vec::new();
         for rule in rules {
             for pattern in &rule.patterns {
                 if let PathPattern::Exact(base) = pattern {
-                    if !base.exists() {
-                        continue;
-                    }
-
-                    reporter.on_event(ProgressEvent::Scanning {
-                        path: base.clone(),
-                    });
-
-                    let walker = jwalk::WalkDir::new(base)
-                        .skip_hidden(false)
-                        .follow_links(false)
-                        .process_read_dir(|_depth, _path, _state, children| {
-                            children.retain(|entry| {
-                                if let Ok(ref e) = entry {
-                                    if e.file_type().is_dir() {
-                                        let name = e.file_name().to_string_lossy();
-                                        return !SKIP_DIRS.contains(&name.as_ref());
-                                    }
-                                }
-                                true
-                            });
-                        });
-
-                    let mut batch_count: usize = 0;
-                    let mut rule_total_size: u64 = 0;
-
-                    for entry in walker {
-                        let entry = match entry {
-                            Ok(e) => e,
-                            Err(_) => continue,
-                        };
-
-                        if entry.file_type().is_dir() {
-                            continue;
-                        }
-
-                        let path = entry.path();
-                        let size = std::fs::symlink_metadata(&path)
-                            .map(|m| m.len())
-                            .unwrap_or(0);
-
-                        batch_count += 1;
-                        rule_total_size += size;
-
-                        if batch_count % 200 == 0 {
-                            reporter.on_event(ProgressEvent::Scanning {
-                                path: path.clone(),
-                            });
-                        }
-
-                        let item =
-                            ScanItem::new(path, size, rule.safety, rule.category.clone());
-
-                        category_map
-                            .entry(rule.category.clone())
-                            .or_default()
-                            .push(item);
-                    }
-
-                    if batch_count > 0 {
-                        reporter.on_event(ProgressEvent::Found {
-                            category: rule.category.clone(),
-                            path: base.clone(),
-                            size: rule_total_size,
-                            safety: rule.safety,
-                        });
+                    if base.exists() {
+                        all_paths.push((base.clone(), rule.safety, rule.category.clone()));
                     }
                 }
+            }
+        }
+        all_paths.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // 识别根路径（不被其他路径包含的路径）
+        // 对于被包含的路径，记录为子规则
+        struct RootEntry {
+            path: PathBuf,
+            safety: SafetyLevel,
+            category: String,
+            children: Vec<(PathBuf, SafetyLevel, String)>,
+        }
+
+        let mut roots: Vec<RootEntry> = Vec::new();
+        for (path, safety, category) in &all_paths {
+            let is_child = roots.iter_mut().any(|root| {
+                if path.starts_with(&root.path) && path != &root.path {
+                    root.children.push((path.clone(), *safety, category.clone()));
+                    true
+                } else {
+                    false
+                }
+            });
+            if !is_child {
+                roots.push(RootEntry {
+                    path: path.clone(),
+                    safety: *safety,
+                    category: category.clone(),
+                    children: Vec::new(),
+                });
+            }
+        }
+
+        let root_count = roots.len();
+        // 遍历每个根路径
+        for (root_idx, root) in roots.iter().enumerate() {
+            if reporter.is_cancelled() {
+                break;
+            }
+
+            reporter.on_event(ProgressEvent::RuleProgress {
+                current: root_idx + 1,
+                total: root_count,
+                name: root.category.clone(),
+            });
+            reporter.on_event(ProgressEvent::Scanning {
+                path: root.path.clone(),
+            });
+
+            let walker = create_walker(&root.path)
+                .process_read_dir(|_depth, _path, _state, children| {
+                    children.retain(|entry| {
+                        if let Ok(ref e) = entry {
+                            if e.file_type().is_dir() {
+                                let name = e.file_name().to_string_lossy();
+                                return !SKIP_DIRS.contains(&name.as_ref());
+                            }
+                        }
+                        true
+                    });
+                });
+
+            let mut batch_count: usize = 0;
+            // 每个规则的大小累加器：(category, size)
+            let mut size_by_category: HashMap<String, u64> = HashMap::new();
+
+            for entry in walker {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+
+                if entry.file_type().is_dir() {
+                    continue;
+                }
+
+                let path = entry.path();
+                let size = std::fs::symlink_metadata(&path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+
+                batch_count += 1;
+
+                if batch_count.is_multiple_of(200) {
+                    if reporter.is_cancelled() {
+                        break;
+                    }
+                    reporter.on_event(ProgressEvent::Scanning {
+                        path: path.clone(),
+                    });
+                }
+
+                // 最长前缀匹配：文件归入最具体的子规则，否则归入根规则
+                let (safety, category) = root
+                    .children
+                    .iter()
+                    .rev()
+                    .find(|(child_path, _, _)| path.starts_with(child_path))
+                    .map(|(_, s, c)| (*s, c.clone()))
+                    .unwrap_or((root.safety, root.category.clone()));
+
+                *size_by_category.entry(category.clone()).or_insert(0) += size;
+
+                let item = ScanItem::new(path, size, safety, category);
+                category_map
+                    .entry(item.category.clone())
+                    .or_default()
+                    .push(item);
+            }
+
+            // 为根路径下的每个 category 发送 Found 事件
+            for (category, total_size) in &size_by_category {
+                let safety = root
+                    .children
+                    .iter()
+                    .find(|(_, _, c)| c == category)
+                    .map(|(_, s, _)| *s)
+                    .unwrap_or(root.safety);
+                reporter.on_event(ProgressEvent::Found {
+                    category: category.clone(),
+                    path: root.path.clone(),
+                    size: *total_size,
+                    safety,
+                });
             }
         }
 
@@ -110,7 +190,7 @@ impl Scanner {
         Ok(result)
     }
 
-    /// 按 DirName 规则扫描：遍历 base_path 寻找匹配的目录名
+    /// 按 DirName 规则扫描：单遍遍历，就地累加匹配目录的大小
     fn scan_purge_dir(
         base_path: &Path,
         rules: &[CleanRule],
@@ -127,7 +207,6 @@ impl Scanner {
             path: base_path.to_path_buf(),
         });
 
-        // 收集所有 DirName 规则用于匹配（使用 owned 类型以满足 'static）
         let dirname_rules: Vec<(String, SafetyLevel, String)> = rules
             .iter()
             .flat_map(|rule| {
@@ -141,27 +220,24 @@ impl Scanner {
             })
             .collect();
 
-        // 同时也收集 Exact 规则（如 DerivedData）
+        // Exact 规则（如 DerivedData）单独处理——这些路径固定，不需要遍历发现
         for rule in rules {
             for pattern in &rule.patterns {
                 if let PathPattern::Exact(exact_path) = pattern {
                     if exact_path.exists() && exact_path.starts_with(base_path) {
                         let size = dir_size(exact_path);
-
                         reporter.on_event(ProgressEvent::Found {
                             category: rule.category.to_string(),
                             path: exact_path.clone(),
                             size,
                             safety: rule.safety,
                         });
-
                         let item = ScanItem::new(
                             exact_path.clone(),
                             size,
                             rule.safety,
                             rule.category.clone(),
                         );
-
                         category_map
                             .entry(rule.category.clone())
                             .or_default()
@@ -171,55 +247,56 @@ impl Scanner {
             }
         }
 
-        // 使用 jwalk 遍历 base_path，寻找匹配的 DirName 目录
-        // process_read_dir 中只收集路径（不计算大小，避免嵌套 jwalk 死锁）
-        // 匹配的目录不再深入扫描
-        let matched_paths: std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, SafetyLevel, String)>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // 单遍遍历：匹配目录时不剪枝，继续遍历子目录以就地累加 size
+        // matched_dirs: path -> (safety, category, size)
+        type MatchedDirMap = HashMap<PathBuf, (SafetyLevel, String, u64)>;
+        let matched_dirs: Arc<Mutex<MatchedDirMap>> = Arc::new(Mutex::new(HashMap::new()));
 
-        let dirname_rules_arc = std::sync::Arc::new(dirname_rules);
-        let matched_clone = matched_paths.clone();
+        let dirname_rules_arc = Arc::new(dirname_rules);
+        let matched_clone = matched_dirs.clone();
         let dirname_clone = dirname_rules_arc.clone();
 
-        let walker = jwalk::WalkDir::new(base_path)
-            .skip_hidden(false)
-            .follow_links(false)
+        let walker = create_walker(base_path)
             .process_read_dir(move |_depth, _path, _state, children| {
                 children.retain(|entry| {
                     if let Ok(ref e) = entry {
                         if e.file_type().is_dir() {
                             let name = e.file_name().to_string_lossy();
 
-                            // 跳过系统特殊目录
                             if SKIP_DIRS.contains(&name.as_ref()) {
                                 return false;
                             }
 
-                            // 检查是否匹配 DirName 规则
+                            let entry_path = e.path();
+
+                            // 如果当前目录已在某个匹配目录内部，不再匹配（避免嵌套重复计数）
+                            let already_inside = {
+                                if let Ok(dirs) = matched_clone.lock() {
+                                    dirs.keys().any(|mp| entry_path.starts_with(mp) && entry_path != *mp)
+                                } else {
+                                    false
+                                }
+                            };
+                            if already_inside {
+                                return true; // 继续遍历但不匹配
+                            }
+
                             for (dir_name, safety, category) in dirname_clone.iter() {
                                 if name.as_ref() == dir_name.as_str() {
-                                    // Rust target 目录需要验证父目录有 Cargo.toml
                                     if dir_name == "target" {
-                                        let entry_path = e.path();
                                         if let Some(p) = entry_path.parent() {
                                             if !p.join("Cargo.toml").exists() {
                                                 continue;
                                             }
                                         }
                                     }
-
-                                    let entry_path = e.path();
-
-                                    if let Ok(mut items) = matched_clone.lock() {
-                                        items.push((
+                                    if let Ok(mut dirs) = matched_clone.lock() {
+                                        dirs.insert(
                                             entry_path,
-                                            *safety,
-                                            category.clone(),
-                                        ));
+                                            (*safety, category.clone(), 0),
+                                        );
                                     }
-
-                                    // 不再深入已匹配的目录
-                                    return false;
+                                    return true; // 不剪枝，继续遍历以累加 size
                                 }
                             }
                         }
@@ -228,23 +305,56 @@ impl Scanner {
                 });
             });
 
-        // 驱动遍历器消费所有条目
-        for _ in walker {}
+        // 遍历所有条目，对文件累加 size 到所属的匹配目录
+        let mut batch_count: usize = 0;
+        for entry in walker {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
 
-        // 遍历完成后，为匹配的目录计算大小并生成 ScanItem
-        let paths = std::sync::Arc::try_unwrap(matched_paths)
+            if entry.file_type().is_dir() {
+                continue;
+            }
+
+            batch_count += 1;
+            if batch_count.is_multiple_of(500) && reporter.is_cancelled() {
+                break;
+            }
+            if batch_count.is_multiple_of(500) {
+                reporter.on_event(ProgressEvent::Scanning {
+                    path: entry.path(),
+                });
+            }
+
+            let path = entry.path();
+            let size = std::fs::symlink_metadata(&path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+
+            // 找到该文件所属的最近匹配目录并累加 size
+            if let Ok(mut dirs) = matched_dirs.lock() {
+                for (matched_path, (_, _, ref mut dir_size)) in dirs.iter_mut() {
+                    if path.starts_with(matched_path) {
+                        *dir_size += size;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 构建结果
+        let dirs = Arc::try_unwrap(matched_dirs)
             .map(|mutex| mutex.into_inner().unwrap_or_default())
             .unwrap_or_else(|arc| arc.lock().unwrap().clone());
-        for (path, safety, category) in paths {
-            let size = dir_size(&path);
 
+        for (path, (safety, category, size)) in dirs {
             reporter.on_event(ProgressEvent::Found {
                 category: category.clone(),
                 path: path.clone(),
                 size,
                 safety,
             });
-
             let item = ScanItem::new(path, size, safety, category.clone());
             category_map.entry(category).or_default().push(item);
         }
@@ -286,15 +396,13 @@ fn dir_size(path: &Path) -> u64 {
         return 0;
     }
 
-    let walker = jwalk::WalkDir::new(path).skip_hidden(false).follow_links(false);
+    let walker = create_walker(path);
     let mut total: u64 = 0;
 
-    for entry in walker {
-        if let Ok(entry) = entry {
-            if !entry.file_type().is_dir() {
-                if let Ok(meta) = std::fs::symlink_metadata(entry.path()) {
-                    total += meta.len();
-                }
+    for entry in walker.into_iter().flatten() {
+        if !entry.file_type().is_dir() {
+            if let Ok(meta) = std::fs::symlink_metadata(entry.path()) {
+                total += meta.len();
             }
         }
     }
@@ -333,6 +441,9 @@ mod tests {
                 ProgressEvent::Found { ref category, .. } => format!("Found:{}", category),
                 ProgressEvent::CategoryDone { category, .. } => {
                     format!("CategoryDone:{}", category)
+                }
+                ProgressEvent::RuleProgress { current, total, .. } => {
+                    format!("RuleProgress:{}/{}", current, total)
                 }
                 ProgressEvent::Complete => "Complete".to_string(),
                 ProgressEvent::Error(msg) => format!("Error:{}", msg),

@@ -12,7 +12,7 @@ pub fn run(cli: &Cli) -> Result<()> {
             let p = path
                 .as_ref()
                 .map(PathBuf::from)
-                .unwrap_or_else(|| platform::get_home_dir());
+                .unwrap_or_else(platform::get_home_dir);
             (p, *threshold)
         }
         _ => (platform::get_home_dir(), 100),
@@ -107,7 +107,7 @@ fn build_dir_tree_recursive(path: &Path, depth: usize, max_depth: usize) -> Resu
         }
     }
 
-    children.sort_by(|a, b| b.size.cmp(&a.size));
+    children.sort_by_key(|c| std::cmp::Reverse(c.size));
     node.size = children.iter().map(|c| c.size).sum();
     node.children = children;
 
@@ -148,7 +148,7 @@ fn print_tree(node: &DirNode, indent: usize, threshold: u64) {
 fn find_large_files(node: &DirNode, threshold: u64) -> Vec<(PathBuf, u64)> {
     let mut result = Vec::new();
     find_large_files_recursive(node, threshold, &mut result);
-    result.sort_by(|a, b| b.1.cmp(&a.1));
+    result.sort_by_key(|item| std::cmp::Reverse(item.1));
     result
 }
 

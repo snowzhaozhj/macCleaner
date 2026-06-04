@@ -1,5 +1,7 @@
 use mc_core::models::{CleanReport, DirNode, ScanResult};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 /// TUI 应用状态机
 #[derive(Debug)]
@@ -11,6 +13,9 @@ pub enum AppState {
         progress_text: String,
         found_count: usize,
         found_size: u64,
+        rule_current: usize,
+        rule_total: usize,
+        rule_name: String,
     },
     /// 扫描结果展示
     Results,
@@ -26,13 +31,26 @@ pub enum AppState {
     },
     /// 磁盘分析浏览器
     Analyzing {
-        node: DirNode,
-        /// 面包屑导航栈：每一项是父节点
-        breadcrumb: Vec<DirNode>,
+        /// 完整缓存树根节点
+        tree_root: Arc<DirNode>,
+        /// 导航路径：每个元素是 children 中的索引
+        nav_path: Vec<usize>,
         /// 当前选中行
         cursor: usize,
         /// 标记为删除的路径
         marked_for_delete: Vec<PathBuf>,
+        /// 每层的 cursor 位置缓存（用于 Backspace 恢复）
+        cursor_stack: Vec<usize>,
+    },
+    /// 磁盘分析进行中（增量构建 + 可导航）
+    AnalyzingLive {
+        tree_root: DirNode,           // owned，非 Arc，正在增量构建
+        nav_path: Vec<usize>,
+        cursor: usize,
+        marked_for_delete: Vec<PathBuf>,
+        cursor_stack: Vec<usize>,
+        file_count: u64,              // 已发现的文件总数
+        total_size: u64,              // 已累计的字节总量
     },
 }
 
@@ -63,8 +81,8 @@ pub struct App {
     pub expanded: Vec<bool>,
     // Purge 路径
     pub purge_path: PathBuf,
-    // Analyze 导航时暂存的面包屑
-    pub analyze_breadcrumb_stash: Option<(Vec<DirNode>, DirNode)>,
+    // 扫描取消标志
+    pub cancel_flag: Arc<AtomicBool>,
 }
 
 impl App {
@@ -80,7 +98,7 @@ impl App {
             result_cursor: 0,
             expanded: Vec::new(),
             purge_path: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
-            analyze_breadcrumb_stash: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 

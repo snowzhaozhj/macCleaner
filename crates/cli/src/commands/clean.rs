@@ -17,8 +17,9 @@ impl ProgressReporter for CliReporter {
             ProgressEvent::Scanning { path } => {
                 eprint!("\r扫描中: {} ", path.display());
             }
-            ProgressEvent::Found { .. } => {
-                // 可用于更新进度条
+            ProgressEvent::Found { .. } => {}
+            ProgressEvent::RuleProgress { current, total, name } => {
+                eprint!("\r[{}/{}] {} ", current, total, name);
             }
             ProgressEvent::CategoryDone {
                 category,

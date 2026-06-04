@@ -39,7 +39,7 @@ pub fn run(cli: &Cli) -> Result<()> {
         Some(Commands::Purge { path }) => path
             .as_ref()
             .map(PathBuf::from)
-            .unwrap_or_else(|| platform::get_home_dir()),
+            .unwrap_or_else(platform::get_home_dir),
         _ => platform::get_home_dir(),
     };
 
