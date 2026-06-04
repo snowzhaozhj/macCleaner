@@ -46,7 +46,6 @@ impl ProgressReporter for CliReporter {
                     format_size(freed, DECIMAL)
                 );
             }
-            ProgressEvent::AnalyzeSnapshot { .. } => {}
             ProgressEvent::Error(msg) => {
                 eprintln!("错误: {}", msg);
             }

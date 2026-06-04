@@ -447,11 +447,16 @@ fn start_command(
             let cancel = app.cancel_flag.clone();
             thread::spawn(move || {
                 let reporter = TuiReporter::new(tx, cancel);
-                match Engine::scan_clean(&reporter) {
-                    Ok(_result) => {}
-                    Err(e) => {
-                        reporter.on_event(ProgressEvent::Error(e.to_string()));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match Engine::scan_clean(&reporter) {
+                        Ok(_result) => {}
+                        Err(e) => {
+                            reporter.on_event(ProgressEvent::Error(e.to_string()));
+                        }
                     }
+                }));
+                if let Err(e) = result {
+                    reporter.on_event(ProgressEvent::Error(format!("内部错误: {:?}", e)));
                 }
             });
         }
@@ -470,11 +475,16 @@ fn start_command(
             let cancel = app.cancel_flag.clone();
             thread::spawn(move || {
                 let reporter = TuiReporter::new(tx, cancel);
-                match Engine::scan_purge(&path, &reporter) {
-                    Ok(_result) => {}
-                    Err(e) => {
-                        reporter.on_event(ProgressEvent::Error(e.to_string()));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match Engine::scan_purge(&path, &reporter) {
+                        Ok(_result) => {}
+                        Err(e) => {
+                            reporter.on_event(ProgressEvent::Error(e.to_string()));
+                        }
                     }
+                }));
+                if let Err(e) = result {
+                    reporter.on_event(ProgressEvent::Error(format!("内部错误: {:?}", e)));
                 }
             });
         }
@@ -689,9 +699,6 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
                     cat.file_count = count;
                 }
             }
-        }
-        ProgressEvent::AnalyzeSnapshot { .. } => {
-            // 已废弃，AnalyzingLive 使用独立 channel
         }
         ProgressEvent::Complete => {
             if let AppState::Scanning { .. } = &app.state {

@@ -449,7 +449,6 @@ mod tests {
                 ProgressEvent::Error(msg) => format!("Error:{}", msg),
                 ProgressEvent::CleaningFile { .. } => "CleaningFile".to_string(),
                 ProgressEvent::CleaningDone { .. } => "CleaningDone".to_string(),
-                ProgressEvent::AnalyzeSnapshot { .. } => "AnalyzeSnapshot".to_string(),
             };
             if let Ok(mut evts) = self.events.lock() {
                 evts.push(tag);
