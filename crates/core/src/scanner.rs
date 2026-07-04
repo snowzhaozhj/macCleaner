@@ -27,10 +27,10 @@ const WALK_THREADS: usize = 3;
 #[cfg(not(target_os = "macos"))]
 const WALK_THREADS: usize = 0;
 
-/// 带预取 metadata 的 walker 类型别名：client_state 存储文件大小 Option<u64>
+/// 带预取 metadata 的 walker `类型别名：client_state` 存储文件大小 Option<u64>
 pub type MetaWalkDir = jwalk::WalkDirGeneric<((), Option<u64>)>;
 
-/// 创建带正确并行度配置的 walker（返回类型支持 client_state 预取）
+/// 创建带正确并行度配置的 walker（返回类型支持 `client_state` 预取）
 ///
 /// 注意：此函数不设置 `process_read_dir`，调用方需自行设置并在回调中调用
 /// `prefetch_metadata` 来预取文件大小。这是因为 `process_read_dir` 是替换型 API，
@@ -52,12 +52,10 @@ pub fn create_walker(path: &Path) -> MetaWalkDir {
 pub fn prefetch_metadata(
     children: &mut Vec<jwalk::Result<jwalk::DirEntry<((), Option<u64>)>>>,
 ) {
-    for entry in children.iter_mut() {
-        if let Ok(dir_entry) = entry {
-            if !dir_entry.file_type.is_dir() {
-                dir_entry.client_state =
-                    dir_entry.metadata().map(|m| m.len()).ok();
-            }
+    for dir_entry in children.iter_mut().flatten() {
+        if !dir_entry.file_type.is_dir() {
+            dir_entry.client_state =
+                dir_entry.metadata().map(|m| m.len()).ok();
         }
     }
 }
@@ -211,8 +209,7 @@ impl Scanner {
                     .children
                     .iter()
                     .find(|(_, _, c)| c == category)
-                    .map(|(_, s, _)| *s)
-                    .unwrap_or(root.safety);
+                    .map_or(root.safety, |(_, s, _)| *s);
                 reporter.on_event(ProgressEvent::Found {
                     category: category.clone(),
                     path: root.path.clone(),
@@ -226,7 +223,7 @@ impl Scanner {
         Ok(result)
     }
 
-    /// 按 DirName 规则扫描：单遍遍历，就地累加匹配目录的大小
+    /// 按 `DirName` 规则扫描：单遍遍历，就地累加匹配目录的大小
     fn scan_purge_dir(
         base_path: &Path,
         rules: &[CleanRule],
@@ -351,9 +348,7 @@ impl Scanner {
         }
 
         // 并行计算各匹配目录的大小
-        let dirs = Arc::try_unwrap(matched_dirs)
-            .map(|mutex| mutex.into_inner().unwrap_or_default())
-            .unwrap_or_else(|arc| arc.lock().unwrap().clone());
+        let dirs = Arc::try_unwrap(matched_dirs).map_or_else(|arc| arc.lock().unwrap().clone(), |mutex| mutex.into_inner().unwrap_or_default());
 
         let dir_sizes: Vec<(PathBuf, u64, SafetyLevel, String)> =
             dir_size_pool.install(|| {
@@ -381,7 +376,7 @@ impl Scanner {
     }
 }
 
-/// 将 category_map 转换为 ScanResult，并报告进度
+/// 将 `category_map` 转换为 ScanResult，并报告进度
 fn build_scan_result(
     category_map: HashMap<String, Vec<ScanItem>>,
     reporter: &dyn ProgressReporter,
@@ -433,15 +428,15 @@ extern "C" {
     fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
 }
 
-/// 构建 dir_size 专用线程池：4 线程 + macOS I/O 优先级降级
+/// 构建 `dir_size` 专用线程池：4 线程 + macOS I/O 优先级降级
 fn build_dir_size_pool() -> rayon::ThreadPool {
     rayon::ThreadPoolBuilder::new()
         .num_threads(4)
         .thread_name(|i| format!("mc-dir-size-{i}"))
         .start_handler(|_| {
             #[cfg(target_os = "macos")]
+            #[allow(unsafe_code)]
             unsafe {
-                // IOPOL_TYPE_DISK=0, IOPOL_SCOPE_THREAD=1, IOPOL_UTILITY=4
                 setiopolicy_np(0, 1, 4);
             }
         })
@@ -477,15 +472,15 @@ mod tests {
         fn on_event(&self, event: ProgressEvent) {
             let tag = match &event {
                 ProgressEvent::Scanning { .. } => "Scanning".to_string(),
-                ProgressEvent::Found { ref category, .. } => format!("Found:{}", category),
+                ProgressEvent::Found { ref category, .. } => format!("Found:{category}"),
                 ProgressEvent::CategoryDone { category, .. } => {
-                    format!("CategoryDone:{}", category)
+                    format!("CategoryDone:{category}")
                 }
                 ProgressEvent::RuleProgress { current, total, .. } => {
-                    format!("RuleProgress:{}/{}", current, total)
+                    format!("RuleProgress:{current}/{total}")
                 }
                 ProgressEvent::Complete => "Complete".to_string(),
-                ProgressEvent::Error(msg) => format!("Error:{}", msg),
+                ProgressEvent::Error(msg) => format!("Error:{msg}"),
                 ProgressEvent::CleaningFile { .. } => "CleaningFile".to_string(),
                 ProgressEvent::CleaningDone { .. } => "CleaningDone".to_string(),
             };
@@ -553,13 +548,11 @@ mod tests {
 
         assert!(
             all_paths.contains(&"node_modules".to_string()),
-            "应找到 node_modules，实际找到: {:?}",
-            all_paths
+            "应找到 node_modules，实际找到: {all_paths:?}"
         );
         assert!(
             all_paths.contains(&".venv".to_string()),
-            "应找到 .venv，实际找到: {:?}",
-            all_paths
+            "应找到 .venv，实际找到: {all_paths:?}"
         );
     }
 
@@ -632,8 +625,7 @@ mod tests {
             .filter(|i| {
                 i.path
                     .file_name()
-                    .map(|n| n == "node_modules")
-                    .unwrap_or(false)
+                    .is_some_and(|n| n == "node_modules")
             })
             .collect();
 
@@ -683,8 +675,7 @@ mod tests {
             .find(|i| {
                 i.path
                     .file_name()
-                    .map(|n| n == "node_modules")
-                    .unwrap_or(false)
+                    .is_some_and(|n| n == "node_modules")
             });
 
         assert!(nm_item.is_some(), "应找到 node_modules");
@@ -693,8 +684,7 @@ mod tests {
         // node_modules 大小不应包含 real 目录的 1000 字节（因为不跟随符号链接）
         assert!(
             nm_size < 1000,
-            "不应跟随符号链接计算大小，实际大小: {}",
-            nm_size
+            "不应跟随符号链接计算大小，实际大小: {nm_size}"
         );
     }
 
@@ -721,7 +711,7 @@ mod tests {
             .categories
             .iter()
             .flat_map(|c| c.items.iter())
-            .filter(|i| i.path.file_name().map(|n| n == "target").unwrap_or(false))
+            .filter(|i| i.path.file_name().is_some_and(|n| n == "target"))
             .collect();
 
         assert_eq!(

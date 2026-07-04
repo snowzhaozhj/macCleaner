@@ -38,21 +38,21 @@ pub fn get_app_support_paths() -> Vec<PathBuf> {
 
 /// 检测是否拥有 Full Disk Access 权限
 ///
-/// 尝试读取 ~/Library/Mail 目录，若返回 PermissionDenied 则无权限。
+/// 尝试读取 ~/Library/Mail 目录，若返回 `PermissionDenied` 则无权限。
 pub fn check_full_disk_access() -> bool {
     let mail_dir = get_home_dir().join("Library/Mail");
     match fs::read_dir(&mail_dir) {
         Ok(_) => {
-            debug!("Full Disk Access 检测通过: 可读取 {:?}", mail_dir);
+            debug!("Full Disk Access 检测通过: 可读取 {mail_dir:?}");
             true
         }
         Err(e) => {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
-                warn!("无 Full Disk Access 权限: {:?}", e);
+                warn!("无 Full Disk Access 权限: {e:?}");
                 false
             } else {
                 // 目录不存在等其他错误，不代表缺少权限
-                debug!("Full Disk Access 检测: 目录可能不存在 ({:?})", e);
+                debug!("Full Disk Access 检测: 目录可能不存在 ({e:?})");
                 true
             }
         }
@@ -70,21 +70,21 @@ pub fn get_trash_size() -> Result<u64> {
     match calc_dir_size(&trash_dir) {
         Ok(size) => Ok(size),
         Err(e) => {
-            warn!("无法计算废纸篓大小（可能缺少权限）: {:?}", e);
+            warn!("无法计算废纸篓大小（可能缺少权限）: {e:?}");
             Ok(0)
         }
     }
 }
 
-/// 递归计算目录大小，使用 symlink_metadata 避免跟随符号链接
+/// 递归计算目录大小，使用 `symlink_metadata` 避免跟随符号链接
 fn calc_dir_size(path: &PathBuf) -> Result<u64> {
     let mut total: u64 = 0;
-    let entries = fs::read_dir(path).with_context(|| format!("无法读取目录: {:?}", path))?;
+    let entries = fs::read_dir(path).with_context(|| format!("无法读取目录: {path:?}"))?;
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                warn!("读取目录条目失败: {:?}", e);
+                warn!("读取目录条目失败: {e:?}");
                 continue;
             }
         };
@@ -126,7 +126,7 @@ pub fn empty_trash() -> Result<()> {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                warn!("读取废纸篓条目失败: {:?}", e);
+                warn!("读取废纸篓条目失败: {e:?}");
                 continue;
             }
         };
@@ -134,7 +134,7 @@ pub fn empty_trash() -> Result<()> {
         let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(e) => {
-                warn!("获取废纸篓条目元数据失败 {:?}: {:?}", path, e);
+                warn!("获取废纸篓条目元数据失败 {path:?}: {e:?}");
                 continue;
             }
         };
@@ -144,7 +144,7 @@ pub fn empty_trash() -> Result<()> {
             fs::remove_file(&path)
         };
         if let Err(e) = result {
-            warn!("删除废纸篓条目失败 {:?}: {:?}", path, e);
+            warn!("删除废纸篓条目失败 {path:?}: {e:?}");
         }
     }
     debug!("废纸篓已清空");
@@ -195,7 +195,7 @@ mod tests {
     fn test_get_trash_size_no_panic() {
         // 只确保不 panic
         let result = get_trash_size();
-        assert!(result.is_ok(), "get_trash_size 不应返回错误: {:?}", result);
+        assert!(result.is_ok(), "get_trash_size 不应返回错误: {result:?}");
     }
 
     #[test]

@@ -37,9 +37,7 @@ impl ProgressReporter for CliReporter {
 pub fn run(cli: &Cli) -> Result<()> {
     let path = match &cli.command {
         Some(Commands::Purge { path }) => path
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(platform::get_home_dir),
+            .as_ref().map_or_else(platform::get_home_dir, PathBuf::from),
         _ => platform::get_home_dir(),
     };
 

@@ -19,7 +19,7 @@ impl ProgressReporter for CliReporter {
             }
             ProgressEvent::Found { .. } => {}
             ProgressEvent::RuleProgress { current, total, name } => {
-                eprint!("\r[{}/{}] {} ", current, total, name);
+                eprint!("\r[{current}/{total}] {name} ");
             }
             ProgressEvent::CategoryDone {
                 category,
@@ -47,7 +47,7 @@ impl ProgressReporter for CliReporter {
                 );
             }
             ProgressEvent::Error(msg) => {
-                eprintln!("错误: {}", msg);
+                eprintln!("错误: {msg}");
             }
         }
     }

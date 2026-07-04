@@ -25,3 +25,6 @@ criterion = { workspace = true }
 [[bench]]
 name = "scan_purge_bench"
 harness = false
+
+[lints]
+workspace = true
