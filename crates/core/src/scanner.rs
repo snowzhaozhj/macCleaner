@@ -270,24 +270,31 @@ impl Scanner {
 
         let dir_size_pool = build_dir_size_pool();
 
+        // Exact 路径（如 Xcode DerivedData）体积可达数十 GB，其 dir_size 单个就要数秒。
+        // 在并行 map 内：开算前报 Scanning(当前路径)、算完报 Found，避免这段静默造成
+        // "扫描中: ~ + 长时间无反应"的冻结感。
         let exact_results: Vec<(PathBuf, u64, SafetyLevel, String)> =
             dir_size_pool.install(|| {
                 exact_entries
                     .par_iter()
                     .map(|(path, safety, category)| {
+                        if reporter.is_cancelled() {
+                            return (path.clone(), 0, *safety, category.clone());
+                        }
+                        reporter.on_event(ProgressEvent::Scanning { path: path.clone() });
                         let size = dir_size(path);
+                        reporter.on_event(ProgressEvent::Found {
+                            category: category.clone(),
+                            path: path.clone(),
+                            size,
+                            safety: *safety,
+                        });
                         (path.clone(), size, *safety, category.clone())
                     })
                     .collect()
             });
 
         for (path, size, safety, category) in exact_results {
-            reporter.on_event(ProgressEvent::Found {
-                category: category.clone(),
-                path: path.clone(),
-                size,
-                safety,
-            });
             let item = ScanItem::new(path, size, safety, category.clone());
             category_map.entry(category).or_default().push(item);
         }
@@ -339,34 +346,51 @@ impl Scanner {
                 });
             });
 
-        // 快速遍历（剪枝后只触碰非匹配目录）
+        // 快速遍历（剪枝后只触碰非匹配目录）。
+        // 遍历整棵树可能耗时数秒——期间必须周期性上报当前目录，否则界面停在
+        // "已扫描 0 | 当前:空 + spinner" 看起来像卡死（对齐 Analyze 的实时反馈）。
+        let mut walked: u64 = 0;
         for entry in walker {
             if reporter.is_cancelled() {
                 break;
             }
-            let _ = entry;
+            if let Ok(e) = entry {
+                if e.file_type().is_dir() {
+                    walked += 1;
+                    if walked.is_multiple_of(48) {
+                        reporter.on_event(ProgressEvent::Scanning { path: e.path() });
+                    }
+                }
+            }
         }
 
-        // 并行计算各匹配目录的大小
+        // 并行计算各匹配目录的大小。这是 Purge 最耗时的相位（大目录可达上百秒）——
+        // 因此在并行 map 内**边算边流式 emit Found**，让 TUI 逐个填充列表、found 计数
+        // 实时增长，而非静默上百秒后一次性爆出（对齐 Analyze 的实时反馈）。
         let dirs = Arc::try_unwrap(matched_dirs).map_or_else(|arc| arc.lock().unwrap().clone(), |mutex| mutex.into_inner().unwrap_or_default());
 
         let dir_sizes: Vec<(PathBuf, u64, SafetyLevel, String)> =
             dir_size_pool.install(|| {
                 dirs.par_iter()
                     .map(|(path, safety, category)| {
+                        if reporter.is_cancelled() {
+                            return (path.clone(), 0, *safety, category.clone());
+                        }
                         let size = dir_size(path);
+                        // 每算完一个目录立刻上报，供 TUI 增量渲染
+                        reporter.on_event(ProgressEvent::Found {
+                            category: category.clone(),
+                            path: path.clone(),
+                            size,
+                            safety: *safety,
+                        });
                         (path.clone(), size, *safety, category.clone())
                     })
                     .collect()
             });
 
+        // 汇总用于返回值（CLI 路径）；Found 已在并行阶段发过，此处不再重复 emit
         for (path, size, safety, category) in dir_sizes {
-            reporter.on_event(ProgressEvent::Found {
-                category: category.clone(),
-                path: path.clone(),
-                size,
-                safety,
-            });
             let item = ScanItem::new(path, size, safety, category.clone());
             category_map.entry(category).or_default().push(item);
         }
