@@ -1,4 +1,6 @@
 use crate::app::{App, AppState};
+use crate::theme;
+use crate::ui::chrome;
 use humansize::{format_size, DECIMAL};
 use mc_core::models::DirNode;
 use std::collections::HashSet;
@@ -10,10 +12,16 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 const LARGE_FILE_THRESHOLD: u64 = 100 * 1024 * 1024;
 
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-fn spinner_char(tick: u64) -> &'static str {
-    SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
+/// 按 size 降序返回 children 的**显示顺序索引排列**（稳定排序，等大小保持插入序）。
+///
+/// 用于 `AnalyzingLive`：增量树以 jwalk 的发现顺序追加，实时排序若原地改动
+/// `children` 会破坏 `IncrementalTreeBuilder` 的 `depth_stack` 索引与 `nav_path`。
+/// 因此排序仅作用于**渲染层**——本函数返回一个不改动底层树的显示排列，
+/// 光标在显示序空间中解释，落到底层树时再经此排列映回存储索引。
+pub(crate) fn size_desc_order(children: &[DirNode]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..children.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(children[i].size));
+    order
 }
 
 pub(crate) fn resolve_node<'a>(root: &'a DirNode, nav_path: &[usize]) -> &'a DirNode {
@@ -53,6 +61,7 @@ fn render_children_list(
     marked: &HashSet<PathBuf>,
     area: Rect,
     title: &str,
+    sorted: bool,
 ) {
     let total = node.children.len();
     if total == 0 {
@@ -61,7 +70,7 @@ fn render_children_list(
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue)),
+                .border_style(Style::default().fg(theme::c(Color::Blue))),
         );
         f.render_widget(empty, area);
         return;
@@ -79,6 +88,14 @@ fn render_children_list(
     // 防御性 clamp
     let cursor = cursor.min(total.saturating_sub(1));
 
+    // 显示排列：AnalyzingLive 按 size 降序（仅渲染层，不改底层树）；
+    // Analyzing 已在 finalize 排好序，用恒等排列零开销。
+    let order: Vec<usize> = if sorted {
+        size_desc_order(&node.children)
+    } else {
+        (0..total).collect()
+    };
+
     // 复刻 ratatui ListState(offset=0) 的滚动行为：
     // cursor 在第一屏时 window_start=0，超出时 cursor 置于窗口末行
     let window_start = if cursor >= visible_height {
@@ -88,12 +105,10 @@ fn render_children_list(
     };
     let window_end = (window_start + visible_height).min(total);
 
-    // 仅为可见区间构建 ListItem
-    let items: Vec<ListItem> = node.children[window_start..window_end]
-        .iter()
-        .enumerate()
-        .map(|(i, child)| {
-            let abs_idx = window_start + i;
+    // 仅为可见区间构建 ListItem（经 order 映射到底层 children）
+    let items: Vec<ListItem> = (window_start..window_end)
+        .map(|abs_idx| {
+            let child = &node.children[order[abs_idx]];
             let is_cursor = abs_idx == cursor;
             let is_marked = marked.contains(&child.path);
             let is_large = child.size >= LARGE_FILE_THRESHOLD;
@@ -112,7 +127,7 @@ fn render_children_list(
                 "░".repeat(bar_width.saturating_sub(filled)),
             );
 
-            let name_color = if is_marked {
+            let name_color = theme::c(if is_marked {
                 Color::Red
             } else if is_large {
                 Color::Yellow
@@ -120,15 +135,13 @@ fn render_children_list(
                 Color::White
             } else {
                 Color::Cyan
-            };
+            });
 
             let mut name_style = Style::default().fg(name_color);
-            let mut bar_style = Style::default().fg(Color::Blue);
+            let mut bar_style = Style::default().fg(theme::c(Color::Blue));
             if is_cursor {
-                name_style = name_style
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD);
-                bar_style = bar_style.bg(Color::DarkGray);
+                name_style = theme::cursor_highlight(name_style.add_modifier(Modifier::BOLD));
+                bar_style = theme::cursor_highlight(bar_style);
             }
             if is_marked {
                 name_style = name_style.add_modifier(Modifier::CROSSED_OUT);
@@ -144,14 +157,14 @@ fn render_children_list(
                 ),
                 Span::styled(
                     format!(" {:>8} ", format_size(child.size, DECIMAL)),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::c(Color::DarkGray)),
                 ),
                 Span::styled(
                     format!("{percent:>3}% "),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::c(Color::DarkGray)),
                 ),
                 Span::styled(bar, bar_style),
-                Span::styled(mark, Style::default().fg(Color::Red)),
+                Span::styled(mark, Style::default().fg(theme::c(Color::Red))),
             ]))
         })
         .collect();
@@ -160,201 +173,178 @@ fn render_children_list(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Blue)),
+            .border_style(Style::default().fg(theme::c(Color::Blue))),
     );
 
     // 使用相对索引：cursor 在窗口切片中的位置
     let mut state = ListState::default();
     state.select(Some(cursor - window_start));
     f.render_stateful_widget(list, area, &mut state);
+
+    // 右侧滚动条（内容超出一屏时才绘制）
+    chrome::render_scrollbar(f, area, total, cursor);
 }
 
 /// 已完成分析的磁盘浏览器渲染（Analyzing 状态）
 pub fn draw(f: &mut Frame, app: &App) {
-    let (tree_root, nav_path, cursor, marked, partial) = match &app.state {
+    let (tree_root, nav_path, cursor) = match &app.state {
         AppState::Analyzing {
             tree_root,
             nav_path,
             cursor,
-            marked_for_delete,
-            partial,
             ..
-        } => (tree_root, nav_path, *cursor, marked_for_delete, *partial),
+        } => (tree_root, nav_path, *cursor),
         _ => return,
     };
+    let marked = &app.marked;
 
     let node = resolve_node(tree_root, nav_path);
     let breadcrumb_names = build_breadcrumb_names(tree_root, nav_path);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(3),
-        ])
-        .split(f.area());
+    // 3 段布局：header(3) / 列表(Min) / footer(1)
+    let [header_area, list_area, footer_area] = chrome::three_row_layout(f.area());
 
-    // 面包屑导航
-    render_breadcrumb(f, &breadcrumb_names, chunks[0], None);
-
-    // 当前目录总大小
-    let dir_info = Paragraph::new(vec![Line::from(vec![
-        Span::styled("  总大小: ", Style::default().fg(Color::DarkGray)),
+    // header 左侧：面包屑；右侧：总大小 | 子项 | 已标记
+    let left = build_breadcrumb_spans(&breadcrumb_names);
+    let mut right = vec![
+        Span::styled("总大小: ", Style::default().fg(theme::c(Color::DarkGray))),
         Span::styled(
             format_size(node.size, DECIMAL),
             Style::default()
-                .fg(Color::Green)
+                .fg(theme::c(Color::Green))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("  |  {} 个子项", node.children.len()),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::c(Color::DarkGray)),
         ),
-        if marked.is_empty() {
-            Span::raw("")
-        } else {
-            Span::styled(
-                format!("  |  已标记删除: {} 个", marked.len()),
-                Style::default().fg(Color::Red),
-            )
-        },
-    ])])
-    .block(Block::default().borders(Borders::ALL));
-    f.render_widget(dir_info, chunks[1]);
+    ];
+    if !marked.is_empty() {
+        right.push(Span::styled(
+            format!("  |  已标记删除: {} 个", marked.len()),
+            Style::default().fg(theme::c(Color::Red)),
+        ));
+    }
+    chrome::render_header(f, header_area, " 磁盘分析 ", left, right);
 
-    let list_title = if partial {
-        " 文件列表 (按大小排序) [部分扫描] "
-    } else {
-        " 文件列表 (按大小排序) "
-    };
-    render_children_list(f, node, cursor, marked, chunks[2], list_title);
+    render_children_list(
+        f,
+        node,
+        cursor,
+        marked,
+        list_area,
+        " 文件列表 (按大小排序) ",
+        false,
+    );
 
-    let hint = Paragraph::new(
-        " ↑↓/jk 移动 | Enter/l 进入目录 | Backspace/h 返回上级 | d 标记删除 | q 返回菜单",
-    )
-    .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(hint, chunks[3]);
+    chrome::render_footer(f, footer_area, &crate::keymap::footer_line(&app.state));
 }
 
 /// `AnalyzingLive` 状态渲染：增量构建中的可导航界面
 pub fn draw_live(f: &mut Frame, app: &App) {
-    let (tree_root, nav_path, cursor, marked, file_count, total_size) = match &app.state {
+    let (tree_root, nav_path, cursor, file_count, total_size) = match &app.state {
         AppState::AnalyzingLive {
             tree_root,
             nav_path,
             cursor,
-            marked_for_delete,
             file_count,
             total_size,
             ..
-        } => (
-            tree_root,
-            nav_path,
-            *cursor,
-            marked_for_delete,
-            *file_count,
-            *total_size,
-        ),
+        } => (tree_root, nav_path, *cursor, *file_count, *total_size),
         _ => return,
     };
+    let marked = &app.marked;
 
     let node = resolve_node(tree_root, nav_path);
     let breadcrumb_names = build_breadcrumb_names(tree_root, nav_path);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(3),
-        ])
-        .split(f.area());
+    // 3 段布局：header(3) / 列表(Min) / footer(1)
+    let [header_area, list_area, footer_area] = chrome::three_row_layout(f.area());
 
-    // chunks[0]: 面包屑 + spinner + 统计
-    let tick = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-        / 200;
-    let spinner = spinner_char(tick);
-    let stats_text = if nav_path.is_empty() {
-        format!(
-            " {} 已发现 {} 个文件, {}",
-            spinner,
-            file_count,
-            format_size(total_size, DECIMAL),
-        )
-    } else {
-        format!(" {spinner} 扫描中...")
-    };
-    render_breadcrumb(f, &breadcrumb_names, chunks[0], Some(&stats_text));
+    // header 左侧：面包屑
+    let left = build_breadcrumb_spans(&breadcrumb_names);
 
-    // chunks[1]: 当前目录统计，标注 "(扫描中)"
-    let dir_info = Paragraph::new(vec![Line::from(vec![
-        Span::styled("  总大小: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format_size(node.size, DECIMAL),
+    // header 右侧：spinner+扫描统计 | 总大小 | 子项 | (扫描中) | 已标记
+    let spinner = chrome::spinner(app.tick);
+    let mut right: Vec<Span> = vec![Span::styled(
+        format!("{spinner} "),
+        Style::default().fg(theme::c(Color::Yellow)),
+    )];
+    if nav_path.is_empty() {
+        right.push(Span::styled(
+            format!(
+                "已发现 {} 个文件, {}  |  ",
+                file_count,
+                format_size(total_size, DECIMAL),
+            ),
             Style::default()
-                .fg(Color::Green)
+                .fg(theme::c(Color::Yellow))
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  |  {} 个子项", node.children.len()),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled("  (扫描中)", Style::default().fg(Color::Yellow)),
-        if marked.is_empty() {
-            Span::raw("")
-        } else {
-            Span::styled(
-                format!("  |  已标记删除: {} 个", marked.len()),
-                Style::default().fg(Color::Red),
-            )
-        },
-    ])])
-    .block(Block::default().borders(Borders::ALL));
-    f.render_widget(dir_info, chunks[1]);
+        ));
+    } else {
+        right.push(Span::styled(
+            "扫描中...  |  ",
+            Style::default()
+                .fg(theme::c(Color::Yellow))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    right.push(Span::styled(
+        "总大小: ",
+        Style::default().fg(theme::c(Color::DarkGray)),
+    ));
+    right.push(Span::styled(
+        format_size(node.size, DECIMAL),
+        Style::default()
+            .fg(theme::c(Color::Green))
+            .add_modifier(Modifier::BOLD),
+    ));
+    right.push(Span::styled(
+        format!("  |  {} 个子项", node.children.len()),
+        Style::default().fg(theme::c(Color::DarkGray)),
+    ));
+    right.push(Span::styled("  (扫描中)", Style::default().fg(theme::c(Color::Yellow))));
+    if !marked.is_empty() {
+        right.push(Span::styled(
+            format!("  |  已标记删除: {} 个", marked.len()),
+            Style::default().fg(theme::c(Color::Red)),
+        ));
+    }
+    chrome::render_header(f, header_area, " 磁盘分析 ", left, right);
 
-    // chunks[2]: 子项列表或空目录提示
+    // 子项列表或空目录提示
     if node.children.is_empty() {
         let empty_hint = Paragraph::new(vec![
             Line::from(""),
             Line::from(Span::styled(
                 "  正在扫描此目录...",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::c(Color::DarkGray)),
             )),
         ])
         .block(
             Block::default()
                 .title(" 文件列表 (实时更新) ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue)),
+                .border_style(Style::default().fg(theme::c(Color::Blue))),
         );
-        f.render_widget(empty_hint, chunks[2]);
+        f.render_widget(empty_hint, list_area);
     } else {
         render_children_list(
             f,
             node,
             cursor,
             marked,
-            chunks[2],
-            " 文件列表 (实时更新) ",
+            list_area,
+            " 文件列表 (实时更新, 按大小排序) ",
+            true,
         );
     }
 
-    // chunks[3]: 提示
-    let hint = Paragraph::new(
-        " ↑↓ 导航 | Enter 进入 | Esc 返回/取消 | d 标记删除 | 数据实时更新中...",
-    )
-    .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(hint, chunks[3]);
+    chrome::render_footer(f, footer_area, &crate::keymap::footer_line(&app.state));
 }
 
 /// Sorting 过渡状态渲染：居中显示 spinner + "正在排序..."
-pub fn draw_sorting(f: &mut Frame, _app: &App) {
+pub fn draw_sorting(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -363,12 +353,7 @@ pub fn draw_sorting(f: &mut Frame, _app: &App) {
         ])
         .split(f.area());
 
-    let tick = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-        / 200;
-    let spinner = spinner_char(tick);
+    let spinner = chrome::spinner(app.tick);
 
     let text = format!("{spinner} 正在排序...");
     let para = Paragraph::new(text)
@@ -376,63 +361,40 @@ pub fn draw_sorting(f: &mut Frame, _app: &App) {
             Block::default()
                 .title(" 磁盘分析 ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(theme::c(Color::Cyan))),
         )
         .style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::c(Color::Yellow))
                 .add_modifier(Modifier::BOLD),
         )
         .alignment(ratatui::layout::Alignment::Center);
     f.render_widget(para, chunks[0]);
 
-    let hint = Paragraph::new(" 按 q/Esc 取消")
-        .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(hint, chunks[1]);
+    chrome::render_footer(f, chunks[1], &crate::keymap::footer_line(&app.state));
 }
 
-/// 渲染面包屑导航栏
-fn render_breadcrumb(
-    f: &mut Frame,
-    breadcrumb_names: &[String],
-    area: Rect,
-    extra_info: Option<&str>,
-) {
+/// 构建面包屑导航 span 列表（供 header 左侧使用）
+fn build_breadcrumb_spans(breadcrumb_names: &[String]) -> Vec<Span<'static>> {
     let mut breadcrumb_parts: Vec<Span> = Vec::new();
     for (i, name) in breadcrumb_names.iter().enumerate() {
         if i > 0 {
             breadcrumb_parts.push(Span::styled(
                 " / ",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::c(Color::DarkGray)),
             ));
         }
         let is_last = i == breadcrumb_names.len() - 1;
         let style = if is_last {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::c(Color::Cyan))
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(theme::c(Color::Cyan))
         };
         breadcrumb_parts.push(Span::styled(name.clone(), style));
     }
-
-    if let Some(info) = extra_info {
-        breadcrumb_parts.push(Span::styled(
-            format!("  {info}"),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    let breadcrumb_line = Paragraph::new(Line::from(breadcrumb_parts)).block(
-        Block::default()
-            .title(" 磁盘分析 ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
-    f.render_widget(breadcrumb_line, area);
+    breadcrumb_parts
 }
 
 fn truncate_name(name: &str, max_len: usize) -> String {
@@ -444,5 +406,43 @@ fn truncate_name(name: &str, max_len: usize) -> String {
         format!("{prefix}...")
     } else {
         name.chars().take(max_len).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::size_desc_order;
+    use mc_core::models::DirNode;
+    use std::path::PathBuf;
+
+    fn file(name: &str, size: u64) -> DirNode {
+        DirNode::new_file(PathBuf::from(name), name.to_string(), size)
+    }
+
+    #[test]
+    fn size_desc_order_sorts_descending_and_is_stable() {
+        // 大小 [10, 30, 20, 30]：等大小的 idx1 与 idx3 应保持插入序（稳定）
+        let children = vec![
+            file("a", 10),
+            file("b", 30),
+            file("c", 20),
+            file("d", 30),
+        ];
+        let order = size_desc_order(&children);
+        // 期望显示序：b(30@1), d(30@3), c(20@2), a(10@0)
+        assert_eq!(order, vec![1, 3, 2, 0]);
+    }
+
+    #[test]
+    fn size_desc_order_is_a_valid_permutation() {
+        let children = vec![file("a", 5), file("b", 1), file("c", 9), file("d", 1)];
+        let mut sorted = size_desc_order(&children);
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3]); // 恰好是 0..n 的排列
+    }
+
+    #[test]
+    fn size_desc_order_empty() {
+        assert!(size_desc_order(&[]).is_empty());
     }
 }

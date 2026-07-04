@@ -1,25 +1,12 @@
-use crate::app::{App, AppState, FlatRow};
+use crate::app::{App, AppState};
+use crate::theme;
+use crate::ui::chrome;
 use humansize::{format_size, DECIMAL};
-use mc_core::models::SafetyLevel;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
-
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-fn spinner_char(tick: u64) -> &'static str {
-    SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
-}
-
-fn safety_color(safety: SafetyLevel) -> Color {
-    match safety {
-        SafetyLevel::Safe => Color::Green,
-        SafetyLevel::Moderate => Color::Yellow,
-        SafetyLevel::Risky => Color::Red,
-    }
-}
 
 pub fn draw(f: &mut Frame, app: &App) {
     // Analyze 模式不再经过 scan::draw()，直接由 mod.rs 分发到 analyzer::draw_live()
@@ -49,9 +36,7 @@ fn draw_scanning_only(f: &mut Frame, app: &App) {
     render_title(f, app, chunks[0]);
     render_progress(f, app, chunks[1]);
 
-    let hint = Paragraph::new(" Esc 取消 | 请等待扫描完成...")
-        .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(hint, chunks[2]);
+    chrome::render_footer(f, chunks[2], &crate::keymap::footer_line(&app.state));
 }
 
 fn draw_with_results(f: &mut Frame, app: &App) {
@@ -69,11 +54,7 @@ fn draw_with_results(f: &mut Frame, app: &App) {
     render_progress(f, app, chunks[1]);
     render_result_list(f, app, chunks[2]);
 
-    let hint = Paragraph::new(
-        " ↑↓ 移动 | Space 选择 | Tab 展开/折叠 | a 全选安全项 | Esc 取消",
-    )
-    .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(hint, chunks[3]);
+    chrome::render_footer(f, chunks[3], &crate::keymap::footer_line(&app.state));
 }
 
 fn render_title(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -88,7 +69,7 @@ fn render_title(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let title = Paragraph::new(format!(" {cmd_name} 中..."))
         .style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::c(Color::Yellow))
                 .add_modifier(Modifier::BOLD),
         )
         .block(Block::default().borders(Borders::ALL));
@@ -116,18 +97,13 @@ fn render_progress(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             _ => return,
         };
 
-    let tick = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-        / 200;
-    let spinner = spinner_char(tick);
+    let spinner = chrome::spinner(app.tick);
 
     // 显示稳定的统计数字 + 顶层目录名（低频变化），不再显示快速闪烁的文件路径
     let mut lines = vec![Line::from(vec![
         Span::styled(
             format!("  {spinner} "),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::c(Color::Yellow)),
         ),
         Span::styled(
             format!(
@@ -136,27 +112,27 @@ fn render_progress(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 format_size(found_size, DECIMAL),
                 progress_text,
             ),
-            Style::default().fg(Color::White),
+            Style::default().fg(theme::c(Color::White)),
         ),
     ])];
 
     let mut info_spans = vec![
-        Span::styled("  已发现: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  已发现: ", Style::default().fg(theme::c(Color::DarkGray))),
         Span::styled(
             format!("{found_count} 个项目"),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme::c(Color::Cyan)),
         ),
-        Span::styled("  |  大小: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  |  大小: ", Style::default().fg(theme::c(Color::DarkGray))),
         Span::styled(
             format_size(found_size, DECIMAL),
-            Style::default().fg(Color::Green),
+            Style::default().fg(theme::c(Color::Green)),
         ),
     ];
 
     if rule_total > 0 {
         info_spans.push(Span::styled(
             format!("  |  [{rule_current}/{rule_total}] {rule_name}"),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::c(Color::Yellow)),
         ));
     }
 
@@ -166,7 +142,7 @@ fn render_progress(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Block::default()
             .title(" 扫描进度 ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
+            .border_style(Style::default().fg(theme::c(Color::Yellow))),
     );
 
     f.render_widget(info, area);
@@ -191,92 +167,14 @@ fn render_result_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let items: Vec<ListItem> = flat_rows
         .iter()
         .enumerate()
-        .map(|(idx, row)| {
-            let is_cursor = idx == app.result_cursor;
-            match row {
-                FlatRow::Separator { level } => {
-                    let (label, color) = match level {
-                        SafetyLevel::Safe => ("安全 (可放心删除)", Color::Green),
-                        SafetyLevel::Moderate => ("中等风险 (删除后需重新下载)", Color::Yellow),
-                        SafetyLevel::Risky => ("危险 (请谨慎操作)", Color::Red),
-                    };
-                    ListItem::new(Line::from(Span::styled(
-                        format!(" ────── {label} ──────"),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    )))
-                }
-                FlatRow::Category { cat_idx, expanded } => {
-                    let cat = &result.categories[*cat_idx];
-                    let dominant_safety = if cat.items.iter().all(|i| i.safety == SafetyLevel::Safe)
-                    {
-                        SafetyLevel::Safe
-                    } else if cat.items.iter().any(|i| i.safety == SafetyLevel::Risky) {
-                        SafetyLevel::Risky
-                    } else {
-                        SafetyLevel::Moderate
-                    };
-
-                    let expand_icon = if *expanded { "▼" } else { "▶" };
-                    let selected_in_cat = cat.items.iter().filter(|i| i.selected).count();
-                    let check = if selected_in_cat == cat.items.len() {
-                        "[x]"
-                    } else if selected_in_cat > 0 {
-                        "[-]"
-                    } else {
-                        "[ ]"
-                    };
-
-                    let color = safety_color(dominant_safety);
-                    let mut style = Style::default().fg(color);
-                    if is_cursor {
-                        style = style.add_modifier(Modifier::BOLD).bg(Color::DarkGray);
-                    }
-
-                    ListItem::new(Line::from(vec![
-                        Span::styled(format!(" {expand_icon} {check} "), style),
-                        Span::styled(cat.name.clone(), style.add_modifier(Modifier::BOLD)),
-                        Span::styled(
-                            format!(
-                                "  ({} 个文件, {})",
-                                cat.file_count,
-                                format_size(cat.total_size, DECIMAL),
-                            ),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]))
-                }
-                FlatRow::Item { cat_idx, item_idx } => {
-                    let item = &result.categories[*cat_idx].items[*item_idx];
-                    let check = if item.selected { "[x]" } else { "[ ]" };
-                    let color = safety_color(item.safety);
-
-                    let mut style = Style::default().fg(color);
-                    if is_cursor {
-                        style = style.bg(Color::DarkGray);
-                    }
-
-                    let path_str = item
-                        .path
-                        .file_name().map_or_else(|| item.path.display().to_string(), |n| n.to_string_lossy().to_string());
-
-                    ListItem::new(Line::from(vec![
-                        Span::styled(format!("     {check} "), style),
-                        Span::styled(path_str, style),
-                        Span::styled(
-                            format!("  ({})", format_size(item.size, DECIMAL)),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]))
-                }
-            }
-        })
+        .map(|(idx, row)| crate::ui::rows::flat_row_item(app, result, row, idx == app.result_cursor, false))
         .collect();
 
     let list = List::new(items).block(
         Block::default()
             .title(" 已发现 (扫描中...) ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(Style::default().fg(theme::c(Color::Cyan))),
     );
 
     let mut state = ListState::default();
@@ -298,7 +196,7 @@ pub fn draw_cleaning(f: &mut Frame, app: &App) {
     let title = Paragraph::new(" 清理中...")
         .style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::c(Color::Yellow))
                 .add_modifier(Modifier::BOLD),
         )
         .block(Block::default().borders(Borders::ALL));
@@ -309,23 +207,18 @@ pub fn draw_cleaning(f: &mut Frame, app: &App) {
         _ => "",
     };
 
-    let tick = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-        / 200;
-    let spinner = spinner_char(tick);
+    let spinner = chrome::spinner(app.tick);
 
     let info = Paragraph::new(vec![
         Line::from(""),
         Line::from(vec![
             Span::styled(
                 format!("  {spinner} "),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme::c(Color::Yellow)),
             ),
             Span::styled(
                 truncate_path(progress_text, (chunks[1].width as usize).saturating_sub(10)),
-                Style::default().fg(Color::White),
+                Style::default().fg(theme::c(Color::White)),
             ),
         ]),
     ])
@@ -333,14 +226,12 @@ pub fn draw_cleaning(f: &mut Frame, app: &App) {
         Block::default()
             .title(" 清理进度 ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
+            .border_style(Style::default().fg(theme::c(Color::Yellow))),
     );
 
     f.render_widget(info, chunks[1]);
 
-    let hint = Paragraph::new(" 请等待清理完成...")
-        .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(hint, chunks[2]);
+    chrome::render_footer(f, chunks[2], " 请等待清理完成...");
 }
 
 fn truncate_path(path: &str, max_len: usize) -> String {

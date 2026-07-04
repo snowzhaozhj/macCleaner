@@ -1,4 +1,6 @@
 use crate::app::App;
+use crate::theme;
+use crate::ui::chrome;
 use ratatui::layout::{Constraint, Direction, Layout, Alignment};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -29,13 +31,13 @@ pub fn draw(f: &mut Frame, app: &App) {
             Span::styled(
                 " macCleaner ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme::c(Color::Cyan))
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(Span::styled(
             " macOS 系统清理工具",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::c(Color::DarkGray)),
         )),
     ])
     .alignment(Alignment::Center);
@@ -49,16 +51,16 @@ pub fn draw(f: &mut Frame, app: &App) {
             let marker = if i == app.menu_index { "▶ " } else { "  " };
             let style = if i == app.menu_index {
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme::c(Color::Cyan))
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(theme::c(Color::White))
             };
             ListItem::new(vec![
                 Line::from(Span::styled(format!("{marker}{name}"), style)),
                 Line::from(Span::styled(
                     format!("    {desc}"),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::c(Color::DarkGray)),
                 )),
             ])
         })
@@ -69,7 +71,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             Block::default()
                 .title(" 选择操作 ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(theme::c(Color::Cyan))),
         );
 
     let mut state = ListState::default();
@@ -77,7 +79,5 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_stateful_widget(menu, chunks[1], &mut state);
 
     // 底部提示
-    let hint = Paragraph::new(" ↑↓ 选择 | Enter 执行 | q 退出")
-        .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(hint, chunks[2]);
+    chrome::render_footer(f, chunks[2], &crate::keymap::footer_line(&app.state));
 }
