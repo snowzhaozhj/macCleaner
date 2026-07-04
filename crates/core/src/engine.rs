@@ -18,6 +18,11 @@ impl Engine {
         Scanner::scan_purge(path, reporter)
     }
 
+    /// 流式扫描已安装应用（用于 TUI Uninstall 后台线程，边扫边报）
+    pub fn scan_uninstall(reporter: &dyn ProgressReporter) {
+        crate::app_resolver::AppResolver::scan_apps_streaming(reporter);
+    }
+
     /// 执行清理操作（实际删除文件）
     pub fn clean(
         items: &[&ScanItem],

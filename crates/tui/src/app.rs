@@ -95,6 +95,14 @@ pub struct App {
     pub marked: HashSet<PathBuf>,
     /// 删除确认覆盖层：Some 时弹出确认框，内含待删的 (路径, 大小) 清单
     pub confirm_delete: Option<Vec<(PathBuf, u64)>>,
+    /// 从磁盘分析器发起删除时暂存的树与导航状态；删除在后台线程完成后据此
+    /// **剪除已删节点并原地返回分析器**，而非拆树回菜单（修复"删除后莫名退出"）。
+    pub analyzer_return: Option<AnalyzerReturn>,
+    /// 瞬时状态提示（如"扫描中不可标记"），渲染在底部一行，下一次按键即清除。
+    pub status_message: Option<String>,
+    /// 沉没成本二次确认：存在已标记项时，第一次按 q 返回菜单只置位并提示，
+    /// 第二次按才真正放弃标记返回（对齐 dua 的 `pending_exit`，避免手滑丢标记）。
+    pub pending_leave: bool,
 }
 
 impl App {
@@ -117,6 +125,9 @@ impl App {
             filter_query: String::new(),
             marked: HashSet::new(),
             confirm_delete: None,
+            analyzer_return: None,
+            status_message: None,
+            pending_leave: false,
         }
     }
 
@@ -134,6 +145,9 @@ impl App {
 
         let query = self.filter_query.to_lowercase();
         let filtering = !query.is_empty();
+        // 扫描中按发现(插入)顺序稳定排列；仅在扫描完成的 Results 页才按大小降序。
+        // 否则扫描时各分类 total_size 不断增长会每帧重排，导致行位置来回跳(跳变)。
+        let scanning = matches!(self.state, AppState::Scanning { .. });
         let safety_order = [SafetyLevel::Safe, SafetyLevel::Moderate, SafetyLevel::Risky];
 
         let mut rows = Vec::new();
@@ -150,11 +164,16 @@ impl App {
                 continue;
             }
 
-            indices.sort_by(|&a, &b| {
-                result.categories[b]
-                    .total_size
-                    .cmp(&result.categories[a].total_size)
-            });
+            if scanning {
+                // 稳定：按分类发现(插入)顺序，扫描中不随大小重排
+                indices.sort_unstable();
+            } else {
+                indices.sort_by(|&a, &b| {
+                    result.categories[b]
+                        .total_size
+                        .cmp(&result.categories[a].total_size)
+                });
+            }
 
             // 先构建该分区的行；过滤时跳过无匹配分类，最终无行则连 Separator 一起跳过
             let mut level_rows = Vec::new();
@@ -473,7 +492,20 @@ impl App {
         self.filter_query.clear();
         self.marked.clear();
         self.confirm_delete = None;
+        self.analyzer_return = None;
+        self.status_message = None;
+        self.pending_leave = false;
     }
+}
+
+/// 分析器删除的返回上下文：删除在后台线程执行期间暂存整棵树与光标位置，
+/// 完成后剪除 `deleted` 中的路径、修正各层大小，再恢复到暂存的导航位置。
+pub struct AnalyzerReturn {
+    pub tree: Arc<DirNode>,
+    pub nav_path: Vec<usize>,
+    pub cursor: usize,
+    pub cursor_stack: Vec<usize>,
+    pub deleted: Vec<PathBuf>,
 }
 
 /// 扁平化的行类型，用于结果列表渲染

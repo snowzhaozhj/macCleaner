@@ -6,6 +6,7 @@ use log::{debug, warn};
 
 use crate::models::{AppInfo, SafetyLevel, ScanItem};
 use crate::platform;
+use crate::progress::{ProgressEvent, ProgressReporter};
 
 /// 应用解析器：发现已安装应用，查找应用残留
 pub struct AppResolver;
@@ -66,6 +67,49 @@ impl AppResolver {
 
         apps.sort_by_key(|a| a.name.to_lowercase());
         apps
+    }
+
+    /// 流式扫描已安装应用：每解析出一个 .app 立刻 `Found` 一条，末尾 `Complete`。
+    ///
+    /// 与 `list_apps` 的区别是把每个 `calc_app_size` 的重活边算边报，供 TUI 在
+    /// 后台线程调用、边扫边渲染，避免主线程同步计算全部应用体积造成界面冻结。
+    /// 尊重 `reporter.is_cancelled()`，用户取消时提前返回。
+    pub fn scan_apps_streaming(reporter: &dyn ProgressReporter) {
+        let home = platform::get_home_dir();
+        let app_dirs = [PathBuf::from("/Applications"), home.join("Applications")];
+
+        for dir in &app_dirs {
+            if !dir.exists() {
+                continue;
+            }
+            let entries = match fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    warn!("无法读取应用目录 {dir:?}: {e:?}");
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                if reporter.is_cancelled() {
+                    return;
+                }
+                let path = entry.path();
+                if path.extension().is_none_or(|ext| ext != "app") {
+                    continue;
+                }
+                match Self::read_app_info(&path) {
+                    Ok(info) => reporter.on_event(ProgressEvent::Found {
+                        category: "已安装应用".to_string(),
+                        path: info.path,
+                        size: info.size,
+                        safety: SafetyLevel::Moderate,
+                    }),
+                    Err(e) => debug!("解析应用信息失败 {path:?}: {e:?}"),
+                }
+            }
+        }
+
+        reporter.on_event(ProgressEvent::Complete);
     }
 
     /// 从 .app 包的 Info.plist 中读取应用信息
