@@ -92,7 +92,9 @@ pub struct App {
     /// TUI 统一标记集：Results 与 Analyzer 共用的"待删路径"单一来源
     pub marked: HashSet<PathBuf>,
     /// 删除确认覆盖层：Some 时弹出确认框，内含待删的 (路径, 大小) 清单
-    pub confirm_delete: Option<Vec<(PathBuf, u64)>>,
+    pub confirm_delete: Option<Vec<ConfirmItem>>,
+    /// 含 Risky 项时的 type-to-confirm 输入缓冲（D4）。
+    pub confirm_input: String,
     /// 从磁盘分析器发起删除时暂存的树与导航状态；删除在后台线程完成后据此
     /// **剪除已删节点并原地返回分析器**，而非拆树回菜单（修复"删除后莫名退出"）。
     pub analyzer_return: Option<AnalyzerReturn>,
@@ -122,6 +124,7 @@ impl App {
             filter_query: String::new(),
             marked: HashSet::new(),
             confirm_delete: None,
+            confirm_input: String::new(),
             analyzer_return: None,
             status_message: None,
             pending_leave: false,
@@ -459,18 +462,31 @@ impl App {
     }
 
     /// 从 Results 收集已标记项的 (路径, 大小) 清单，用于删除确认
-    pub fn results_delete_list(&self) -> Vec<(PathBuf, u64)> {
+    pub fn results_delete_list(&self) -> Vec<ConfirmItem> {
         let mut list = Vec::new();
         if let Some(result) = &self.scan_result {
             for cat in &result.categories {
                 for item in &cat.items {
                     if self.marked.contains(&item.path) {
-                        list.push((item.path.clone(), item.size));
+                        list.push(ConfirmItem {
+                            path: item.path.clone(),
+                            size: item.size,
+                            safety: item.safety,
+                            impact: item.impact.clone(),
+                            recovery: item.recovery.clone(),
+                        });
                     }
                 }
             }
         }
         list
+    }
+
+    /// 待删集合是否含 Risky 项（决定确认框是否升级为 type-to-confirm，D4）。
+    pub fn confirm_has_risky(&self) -> bool {
+        self.confirm_delete.as_ref().is_some_and(|list| {
+            list.iter().any(|i| i.safety == SafetyLevel::Risky)
+        })
     }
 
     /// 统计"已标记但不匹配当前过滤词"的项数（过滤词为空时恒为 0）。
@@ -533,6 +549,16 @@ pub enum FlatRow {
     Item { cat_idx: usize, item_idx: usize },
 }
 
+/// 删除确认框的单项：携带 safety/impact/recovery 以支持 Risky 强调与证据展示（U7/R9）。
+#[derive(Debug, Clone)]
+pub struct ConfirmItem {
+    pub path: PathBuf,
+    pub size: u64,
+    pub safety: SafetyLevel,
+    pub impact: String,
+    pub recovery: String,
+}
+
 /// 结果页详情面板内容（U5）：随光标位置给出可读说明。
 #[derive(Debug, Clone)]
 pub enum DetailView {
@@ -581,6 +607,42 @@ mod tests {
         app.scan_result = Some(ScanResult::from_categories(vec![cat]));
         app.expanded = vec![true];
         app
+    }
+
+    #[test]
+    fn results_delete_list_carries_safety_and_evidence() {
+        let items = vec![
+            ScanItem::new(PathBuf::from("/x/docker"), 30, SafetyLevel::Risky, "Docker".into())
+                .with_evidence("卷内数据丢失".into(), "不可恢复".into()),
+            ScanItem::new(PathBuf::from("/x/nm"), 20, SafetyLevel::Moderate, "Node.js".into()),
+        ];
+        let cat = CategoryGroup::new("c".into(), items);
+        let mut app = App::new();
+        app.scan_result = Some(ScanResult::from_categories(vec![cat]));
+        app.marked.insert(PathBuf::from("/x/docker"));
+        app.marked.insert(PathBuf::from("/x/nm"));
+
+        let list = app.results_delete_list();
+        let docker = list.iter().find(|i| i.path.ends_with("docker")).unwrap();
+        assert_eq!(docker.safety, SafetyLevel::Risky);
+        assert_eq!(docker.impact, "卷内数据丢失");
+        assert_eq!(docker.recovery, "不可恢复");
+
+        app.confirm_delete = Some(list);
+        assert!(app.confirm_has_risky(), "含 Docker(Risky) 应触发 type-to-confirm");
+    }
+
+    #[test]
+    fn confirm_has_risky_false_without_risky() {
+        let mut app = App::new();
+        app.confirm_delete = Some(vec![ConfirmItem {
+            path: PathBuf::from("/x/nm"),
+            size: 1,
+            safety: SafetyLevel::Moderate,
+            impact: String::new(),
+            recovery: String::new(),
+        }]);
+        assert!(!app.confirm_has_risky());
     }
 
     #[test]

@@ -292,22 +292,34 @@ fn handle_key(
     }
     // 删除确认覆盖层优先：Some 时只处理确认/取消并吞键
     if app.confirm_delete.is_some() {
-        match key {
-            KeyCode::Enter | KeyCode::Char('y') => {
-                if let Some(list) = app.confirm_delete.take() {
-                    // 分析器发起的删除：删后原地留在树内（暂存树剪枝恢复）；
-                    // 其余（Results）：删后走 Done → 菜单。
-                    if matches!(app.state, AppState::Analyzing { .. }) {
-                        start_cleaning_from_analyzer(app, list, events);
-                    } else {
-                        start_cleaning(app, list, events);
+        // D4：待删含 Risky（不可逆内容，如 Docker 卷/dSYM）时升级为 type-to-confirm——
+        // 需输入 token 才执行，且 Enter 不绑定确认（GNOME HIG：不可逆动作不绑 Enter）。
+        if app.confirm_has_risky() {
+            match key {
+                KeyCode::Esc => {
+                    app.confirm_delete = None;
+                    app.confirm_input.clear();
+                }
+                KeyCode::Backspace => {
+                    app.confirm_input.pop();
+                }
+                KeyCode::Char(c) => {
+                    app.confirm_input.push(c);
+                    if app.confirm_input.eq_ignore_ascii_case(CONFIRM_TOKEN) {
+                        confirm_accept(app, events);
                     }
                 }
+                _ => {}
             }
-            KeyCode::Esc | KeyCode::Char('n') => {
-                app.confirm_delete = None;
+        } else {
+            match key {
+                KeyCode::Enter | KeyCode::Char('y') => confirm_accept(app, events),
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    app.confirm_delete = None;
+                    app.confirm_input.clear();
+                }
+                _ => {}
             }
-            _ => {}
         }
         return;
     }
@@ -968,6 +980,23 @@ fn handle_results_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers, _eve
 }
 
 /// 后台删除线程：把 (路径, 大小) 清单移入废纸篓，完成后 send `CleaningDone`。
+/// 含 Risky 项时需输入的确认 token（type-to-confirm，D4）。
+const CONFIRM_TOKEN: &str = "delete";
+
+/// 执行已确认的删除：把确认项映射回 (path, size) 交给删除线程（KTD8：线程签名不变）。
+fn confirm_accept(app: &mut App, events: &EventHandler) {
+    app.confirm_input.clear();
+    if let Some(list) = app.confirm_delete.take() {
+        let items: Vec<(PathBuf, u64)> = list.into_iter().map(|i| (i.path, i.size)).collect();
+        // 分析器发起的删除：删后原地留在树内（暂存树剪枝恢复）；其余（Results）：删后走 Done → 菜单。
+        if matches!(app.state, AppState::Analyzing { .. }) {
+            start_cleaning_from_analyzer(app, items, events);
+        } else {
+            start_cleaning(app, items, events);
+        }
+    }
+}
+
 fn spawn_trash_thread(items: Vec<(PathBuf, u64)>, events: &EventHandler) {
     let tx = events.progress_sender();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1260,7 +1289,18 @@ fn handle_analyzer_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
                 let mut list = Vec::new();
                 collect_marked(tree_root, &app.marked, &mut list);
                 if !list.is_empty() {
-                    app.confirm_delete = Some(list);
+                    // 分析器项来自 DirNode，无规则元数据：默认 Safe、空证据（KTD8）。
+                    let items = list
+                        .into_iter()
+                        .map(|(path, size)| crate::app::ConfirmItem {
+                            path,
+                            size,
+                            safety: mc_core::models::SafetyLevel::Safe,
+                            impact: String::new(),
+                            recovery: String::new(),
+                        })
+                        .collect();
+                    app.confirm_delete = Some(items);
                 }
             }
             _ => {}
