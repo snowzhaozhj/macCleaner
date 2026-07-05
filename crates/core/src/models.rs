@@ -187,3 +187,40 @@ impl DirNode {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_defaults_to_non_risky() {
+        // 预选边界：Safe/Moderate 默认勾选，Risky 不勾（CLI --yes 与 TUI 预选共用此语义）。
+        assert!(ScanItem::new(PathBuf::from("/a"), 1, SafetyLevel::Safe, "c".into()).selected);
+        assert!(ScanItem::new(PathBuf::from("/a"), 1, SafetyLevel::Moderate, "c".into()).selected);
+        assert!(!ScanItem::new(PathBuf::from("/a"), 1, SafetyLevel::Risky, "c".into()).selected);
+    }
+
+    #[test]
+    fn with_preselect_false_deselects_non_risky() {
+        let item = ScanItem::new(PathBuf::from("/a"), 1, SafetyLevel::Moderate, "c".into())
+            .with_preselect(false);
+        assert!(!item.selected, "preselect=false 的 Moderate 项不应默认勾选");
+        // Risky 即便 preselect=true 也不勾选
+        let risky = ScanItem::new(PathBuf::from("/a"), 1, SafetyLevel::Risky, "c".into())
+            .with_preselect(true);
+        assert!(!risky.selected, "Risky 无论 preselect 都不默认勾选");
+    }
+
+    #[test]
+    fn selected_items_excludes_unselected() {
+        let items = vec![
+            ScanItem::new(PathBuf::from("/safe"), 1, SafetyLevel::Safe, "c".into()),
+            ScanItem::new(PathBuf::from("/risky"), 1, SafetyLevel::Risky, "c".into()),
+            ScanItem::new(PathBuf::from("/build"), 1, SafetyLevel::Moderate, "c".into())
+                .with_preselect(false),
+        ];
+        let result = ScanResult::from_categories(vec![CategoryGroup::new("c".into(), items)]);
+        let selected: Vec<_> = result.selected_items().iter().map(|i| i.path.clone()).collect();
+        assert_eq!(selected, vec![PathBuf::from("/safe")], "只应含默认勾选项");
+    }
+}

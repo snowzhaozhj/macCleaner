@@ -90,15 +90,21 @@ root_markers = [{ sibling = "Podfile" }]
 
 [[rules]]
 name = "Docker Desktop Data"
-description = "Docker Desktop 虚拟机磁盘和 buildx 缓存"
+description = "Docker Desktop 虚拟机磁盘（含全部镜像/容器/命名卷）"
 category = "Docker"
 safety = "Risky"
 impact = "删除后全部本地镜像、容器和命名卷丢失，命名卷内的数据（如数据库）不可恢复"
 recovery = "镜像可重新 pull/build；命名卷内数据无法恢复"
-patterns = [
-    { exact = "Library/Containers/com.docker.docker/Data/vms" },
-    { exact = ".docker/buildx" },
-]
+patterns = [{ exact = "Library/Containers/com.docker.docker/Data/vms" }]
+
+[[rules]]
+name = "Docker buildx Cache"
+description = "Docker buildx 构建缓存（可重建，与虚拟机磁盘分开）"
+category = "Docker"
+safety = "Safe"
+impact = "buildx 构建缓存被清空，下次构建按需重建；不影响镜像/容器/卷"
+recovery = "无需操作，下次构建自动重建"
+patterns = [{ exact = ".docker/buildx" }]
 
 [[rules]]
 name = "Maven Repository"

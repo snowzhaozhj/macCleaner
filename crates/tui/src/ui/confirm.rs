@@ -42,16 +42,17 @@ pub fn draw(f: &mut Frame, app: &App) {
         Line::from(""),
     ];
 
-    // Risky 分区置顶、红色 ✕、全量（不截断）、展示真实后果 impact 与 recovery（R9）。
+    // Risky 分区置顶、红色 ✕、全量（不截断）、展示真实影响 impact 与 recovery（R9）。
     if has_risky {
-        let red = Style::default().fg(theme::c(theme::safety_color(SafetyLevel::Risky)));
+        let red = Style::default().fg(theme::safety_color(SafetyLevel::Risky));
+        let symbol = theme::safety_symbol(SafetyLevel::Risky);
         lines.push(Line::from(Span::styled(
-            format!("  {} 危险项（{} 个，可能不可逆）:", theme::safety_symbol(SafetyLevel::Risky), risky.len()),
+            format!("  {symbol} 危险项（{} 个，可能不可逆）:", risky.len()),
             red.add_modifier(Modifier::BOLD),
         )));
         for item in &risky {
             lines.push(Line::from(vec![
-                Span::styled("  ✕ ", red),
+                Span::styled(format!("  {symbol} "), red),
                 Span::styled(item.path.display().to_string(), red.add_modifier(Modifier::BOLD)),
                 Span::styled(
                     format!("  ({})", format_size(item.size, DECIMAL)),
@@ -59,7 +60,7 @@ pub fn draw(f: &mut Frame, app: &App) {
                 ),
             ]));
             if !item.impact.trim().is_empty() {
-                lines.push(Line::from(Span::styled(format!("      后果: {}", item.impact), red)));
+                lines.push(Line::from(Span::styled(format!("      影响: {}", item.impact), red)));
             }
             if !item.recovery.trim().is_empty() {
                 lines.push(Line::from(Span::styled(
@@ -111,7 +112,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     // 页脚：含 Risky 时用 type-to-confirm（Enter 无效，需输入 token）；否则单次 Enter 确认。
     if has_risky {
         lines.push(Line::from(Span::styled(
-            "  含危险项：请输入 delete 确认删除（Enter 无效）",
+            format!("  含危险项：请输入 {} 确认删除（Enter 无效）", crate::CONFIRM_TOKEN),
             Style::default().fg(theme::c(Color::Red)).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(vec![

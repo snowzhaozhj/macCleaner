@@ -980,8 +980,8 @@ fn handle_results_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers, _eve
 }
 
 /// 后台删除线程：把 (路径, 大小) 清单移入废纸篓，完成后 send `CleaningDone`。
-/// 含 Risky 项时需输入的确认 token（type-to-confirm，D4）。
-const CONFIRM_TOKEN: &str = "delete";
+/// 含 Risky 项时需输入的确认 token（type-to-confirm，D4）。确认框提示文案复用此常量避免漂移。
+pub const CONFIRM_TOKEN: &str = "delete";
 
 /// 执行已确认的删除：把确认项映射回 (path, size) 交给删除线程（KTD8：线程签名不变）。
 fn confirm_accept(app: &mut App, events: &EventHandler) {
@@ -1289,15 +1289,19 @@ fn handle_analyzer_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
                 let mut list = Vec::new();
                 collect_marked(tree_root, &app.marked, &mut list);
                 if !list.is_empty() {
-                    // 分析器项来自 DirNode，无规则元数据：默认 Safe、空证据（KTD8）。
+                    // 分析器项来自 DirNode，无规则元数据：按路径回查规则证据（evidence_for_path），
+                    // 使 Risky 路径（Docker 卷/Xcode Archives 等）经分析器删除时也触发 type-to-confirm；
+                    // 未命中任何规则的普通路径默认 Safe、空证据（KTD8）。
                     let items = list
                         .into_iter()
-                        .map(|(path, size)| crate::app::ConfirmItem {
-                            path,
-                            size,
-                            safety: mc_core::models::SafetyLevel::Safe,
-                            impact: String::new(),
-                            recovery: String::new(),
+                        .map(|(path, size)| {
+                            let (safety, impact, recovery) =
+                                mc_core::rules::evidence_for_path(&path).unwrap_or((
+                                    mc_core::models::SafetyLevel::Safe,
+                                    String::new(),
+                                    String::new(),
+                                ));
+                            crate::app::ConfirmItem { path, size, safety, impact, recovery }
                         })
                         .collect();
                     app.confirm_delete = Some(items);
@@ -1410,10 +1414,70 @@ fn handle_analyzer_live_key(
 
 #[cfg(test)]
 mod tests {
-    use super::collect_marked;
-    use mc_core::models::DirNode;
+    use super::{collect_marked, handle_key, CONFIRM_TOKEN};
+    use crate::app::{App, ConfirmItem};
+    use crate::event::EventHandler;
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use mc_core::models::{DirNode, SafetyLevel};
     use std::collections::HashSet;
     use std::path::PathBuf;
+
+    fn risky_confirm_app() -> App {
+        let mut app = App::new();
+        app.confirm_delete = Some(vec![ConfirmItem {
+            path: PathBuf::from("/x/docker_vms"),
+            size: 1,
+            safety: SafetyLevel::Risky,
+            impact: "卷内数据丢失".into(),
+            recovery: "不可恢复".into(),
+        }]);
+        app
+    }
+
+    fn press(app: &mut App, key: KeyCode) {
+        let events = EventHandler::new();
+        handle_key(
+            app,
+            key,
+            KeyModifiers::empty(),
+            &events,
+            &mut None,
+            &mut None,
+            &mut None,
+        );
+    }
+
+    #[test]
+    fn risky_confirm_enter_does_not_delete() {
+        // D4 安全关键：含 Risky 时 Enter/'y' 不得确认删除，只有输入 token 才行。
+        let mut app = risky_confirm_app();
+        press(&mut app, KeyCode::Enter);
+        assert!(app.confirm_delete.is_some(), "Risky 下 Enter 不应确认删除");
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.confirm_delete.is_some(), "Risky 下 'y' 不应确认删除（应作为输入字符）");
+    }
+
+    #[test]
+    fn risky_confirm_wrong_token_does_not_delete_and_esc_cancels() {
+        let mut app = risky_confirm_app();
+        for c in "del".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert!(app.confirm_delete.is_some(), "未输满 token 不应确认");
+        assert_eq!(app.confirm_input, "del");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.confirm_input, "de", "Backspace 应回删输入");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.confirm_delete.is_none(), "Esc 应取消");
+        assert_eq!(app.confirm_input, "", "取消应清空输入缓冲");
+    }
+
+    #[test]
+    fn confirm_token_is_ascii_lowercase() {
+        // 提示文案复用 CONFIRM_TOKEN；确保它是可直接输入的小写 ASCII。
+        assert_eq!(CONFIRM_TOKEN, CONFIRM_TOKEN.to_lowercase());
+        assert!(CONFIRM_TOKEN.chars().all(|c| c.is_ascii_lowercase()));
+    }
 
     #[test]
     fn collect_marked_prunes_marked_dir_and_recurses_unmarked() {

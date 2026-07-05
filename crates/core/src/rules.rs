@@ -157,6 +157,20 @@ pub fn all_rules() -> Vec<CleanRule> {
     rules
 }
 
+/// 为任意路径（如磁盘分析器中用户手动选中的路径）推断安全信息：命中某条规则的模式时
+/// 返回其 `(safety, impact, recovery)`，否则 `None`（视为 Safe、无证据）。
+///
+/// 用途：让分析器发起的删除也能对 Risky 路径（Docker 卷、Xcode Archives、AVD 等）触发
+/// type-to-confirm，而不是一律按 Safe 单键删除。
+pub fn evidence_for_path(path: &std::path::Path) -> Option<(SafetyLevel, String, String)> {
+    all_rules().into_iter().find_map(|rule| {
+        rule.patterns
+            .iter()
+            .any(|p| matches_pattern(p, path))
+            .then(|| (rule.safety, rule.impact.clone(), rule.recovery.clone()))
+    })
+}
+
 /// 判断给定路径是否匹配某个模式
 pub fn matches_pattern(pattern: &PathPattern, path: &std::path::Path) -> bool {
     match pattern {
@@ -256,8 +270,9 @@ mod tests {
         }
     }
 
+    // R4: 拆分 Android AVD / SDK Temp
     #[test]
-    fn android_avd_sdk_split(/* R4 */) {
+    fn android_avd_sdk_split() {
         let rules = purge_rules();
         let avd = rules.iter().find(|r| r.name == "Android AVD").expect("缺少 Android AVD");
         let sdk = rules.iter().find(|r| r.name == "Android SDK Temp").expect("缺少 Android SDK Temp");
@@ -265,16 +280,18 @@ mod tests {
         assert_eq!(sdk.safety, SafetyLevel::Safe, "SDK 临时文件应为 Safe");
     }
 
+    // R6: 每条规则 impact/recovery 非空
     #[test]
-    fn all_rules_evidence_non_empty(/* R6 */) {
+    fn all_rules_evidence_non_empty() {
         for rule in all_rules() {
             assert!(!rule.impact.trim().is_empty(), "规则 '{}' impact 不能为空", rule.name);
             assert!(!rule.recovery.trim().is_empty(), "规则 '{}' recovery 不能为空", rule.name);
         }
     }
 
+    // D1: .gradle 窄化为 .gradle/caches
     #[test]
-    fn gradle_narrowed_to_caches(/* D1 */) {
+    fn gradle_narrowed_to_caches() {
         // .gradle 必须窄化为 exact ~/.gradle/caches，不能整树 dir_name 匹配（否则删签名密钥/配置）。
         for rule in all_rules() {
             for p in &rule.patterns {
@@ -294,7 +311,34 @@ mod tests {
     }
 
     #[test]
-    fn dist_build_not_preselected(/* D2 */) {
+    fn docker_buildx_split_to_safe_cache() {
+        // Docker Data/vms 为 Risky（含卷）；buildx 缓存单列为 Safe，避免误标不可逆。
+        let rules = purge_rules();
+        let vms = rules.iter().find(|r| r.name == "Docker Desktop Data").expect("缺少 Docker Desktop Data");
+        assert_eq!(vms.safety, SafetyLevel::Risky);
+        assert!(
+            !vms.patterns.iter().any(|p| matches!(p, PathPattern::Exact(x) if x.to_string_lossy().contains("buildx"))),
+            "vms 规则不应再含 buildx"
+        );
+        let buildx = rules.iter().find(|r| r.name == "Docker buildx Cache").expect("缺少 Docker buildx Cache");
+        assert_eq!(buildx.safety, SafetyLevel::Safe, "buildx 应为 Safe 缓存");
+    }
+
+    #[test]
+    fn evidence_for_path_flags_risky_paths() {
+        // 分析器用它把 Risky 路径（如 Xcode Archives）识别出来以触发 type-to-confirm。
+        let archives = home().join("Library/Developer/Xcode/Archives/old.xcarchive");
+        let (safety, impact, recovery) =
+            evidence_for_path(&archives).expect("Archives 路径应命中规则");
+        assert_eq!(safety, SafetyLevel::Risky);
+        assert!(!impact.is_empty() && !recovery.is_empty());
+        // 未命中任何规则的普通路径返回 None（分析器据此按 Safe/空证据处理）。
+        assert!(evidence_for_path(&home().join("Documents/notes.txt")).is_none());
+    }
+
+    // D2: dist/build 默认不勾选
+    #[test]
+    fn dist_build_not_preselected() {
         for rule in purge_rules() {
             if rule.name == "dist/build" {
                 assert!(!rule.preselect, "dist/build 应默认不勾选");
@@ -304,8 +348,9 @@ mod tests {
         }
     }
 
+    // R5: 每条 dir_name 规则（除 __pycache__）都配置了项目根守卫
     #[test]
-    fn dirname_rules_have_guards(/* R5 */) {
+    fn dirname_rules_have_guards() {
         // 除 __pycache__ 外，每条 dir_name 规则都必须配置项目根守卫。
         for rule in all_rules() {
             let has_dirname = rule

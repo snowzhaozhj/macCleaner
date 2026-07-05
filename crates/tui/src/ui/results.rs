@@ -94,23 +94,15 @@ fn level_rubric(level: SafetyLevel) -> &'static str {
     }
 }
 
-fn safety_label(level: SafetyLevel) -> &'static str {
-    match level {
-        SafetyLevel::Safe => "安全",
-        SafetyLevel::Moderate => "中等",
-        SafetyLevel::Risky => "危险",
-    }
-}
-
 /// 渲染详情面板：颜色 + 形状符号 + 文字标签三通道并存，保证 `NO_COLOR` 或色盲下仍可辨。
 fn render_detail(f: &mut Frame, area: Rect, detail: &DetailView) {
     let lines: Vec<Line> = match detail {
         DetailView::Empty => vec![Line::from("")],
         DetailView::Level(level) => {
-            let style = Style::default().fg(theme::c(theme::safety_color(*level)));
+            let style = Style::default().fg(theme::safety_color(*level));
             vec![Line::from(vec![
                 Span::styled(
-                    format!("{} {}", theme::safety_symbol(*level), safety_label(*level)),
+                    format!("{} {}", theme::safety_symbol(*level), theme::safety_label(*level)),
                     style.add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
@@ -122,13 +114,13 @@ fn render_detail(f: &mut Frame, area: Rect, detail: &DetailView) {
             impact,
             recovery,
         } => {
-            let style = Style::default().fg(theme::c(theme::safety_color(*safety)));
+            let style = Style::default().fg(theme::safety_color(*safety));
             let head = Span::styled(
-                format!("{} {}", theme::safety_symbol(*safety), safety_label(*safety)),
+                format!("{} {}", theme::safety_symbol(*safety), theme::safety_label(*safety)),
                 style.add_modifier(Modifier::BOLD),
             );
             let impact_line = if impact.trim().is_empty() {
-                Line::from(vec![head, Span::raw("  无恢复信息")])
+                Line::from(vec![head, Span::raw("  影响: 无影响信息")])
             } else {
                 Line::from(vec![head, Span::raw(format!("  影响: {impact}"))])
             };

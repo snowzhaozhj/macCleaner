@@ -23,6 +23,15 @@ const LEFTOVER_SUBDIRS: &[&str] = &[
     "HTTPStorages",
 ];
 
+/// 可能存放不可再生用户数据的残留子目录（数据库、IndexedDB/localStorage、存档等）。
+/// 卸载惯例仍默认勾选这些项以彻底移除应用，但必须给出非空证据文案——避免"看不到依据却默认删"。
+const USER_DATA_SUBDIRS: &[&str] = &[
+    "Application Support",
+    "WebKit",
+    "HTTPStorages",
+    "Saved Application State",
+];
+
 impl AppResolver {
     /// 扫描 /Applications 和 ~/Applications 中的 .app 包，
     /// 读取 Info.plist 获取 bundle ID 和应用名
@@ -264,14 +273,15 @@ impl AppResolver {
                         }
                         Err(_) => 0,
                     };
-                    // D3：Application Support 可能存放应用的主用户数据（数据库、存档等）。
-                    // 保持默认勾选（符合卸载器"彻底移除"惯例），但必须给出非空证据文案，
-                    // 避免"看不到依据却默认删"。其余残留（Caches/Preferences 等）无附加文案。
+                    // D3：Application Support / WebKit / HTTPStorages / Saved Application State
+                    // 可能存放应用的主用户数据（数据库、IndexedDB/localStorage、存档等）。保持默认
+                    // 勾选（符合卸载器"彻底移除"惯例），但必须给出非空证据文案，避免"看不到依据却默认删"。
+                    // 其余残留（Caches/Preferences/Logs 等）无附加文案。
                     let item = ScanItem::new(path, size, SafetyLevel::Safe, format!("应用残留 ({subdir})"));
-                    let item = if *subdir == "Application Support" {
+                    let item = if USER_DATA_SUBDIRS.contains(subdir) {
                         item.with_evidence(
-                            "含应用数据（可能包括数据库、存档），删除后不可恢复".to_string(),
-                            "已移入废纸篓，可从废纸篓找回".to_string(),
+                            "可能含应用数据（数据库、缓存的文档/草稿、存档等）".to_string(),
+                            "默认移入废纸篓可找回；清空废纸篓或 --permanent 后不可恢复".to_string(),
                         )
                     } else {
                         item
