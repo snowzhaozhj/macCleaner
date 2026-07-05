@@ -43,10 +43,13 @@ pub fn safety_color(safety: SafetyLevel) -> Color {
 }
 
 /// 安全等级 → 形状字形（不依赖颜色的第二信息通道）。
+///
+/// 严重度**独占非三角家族** `● ◆ ✕`（圆=稳 / 菱=留意 / 叉=停），与导航展开符 `▶ ▼`
+/// 的三角家族分属两个视觉轴、永不混淆——这是"一个语义轴占一个视觉家族"的可访问性设计。
 pub fn safety_symbol(safety: SafetyLevel) -> &'static str {
     match safety {
         SafetyLevel::Safe => "●",
-        SafetyLevel::Moderate => "▲",
+        SafetyLevel::Moderate => "◆",
         SafetyLevel::Risky => "✕",
     }
 }

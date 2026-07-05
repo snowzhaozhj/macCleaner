@@ -77,7 +77,8 @@ fn render_children_list(
     }
 
     let parent_size = if node.size > 0 { node.size } else { 1 };
-    let bar_width = (area.width as usize).saturating_sub(50).max(10);
+    // 固定列预算：导航符 2 + 复选框 4 + 名称 24 + 大小 11 + 百分比 5 + 边距 ≈ 54。
+    let bar_width = (area.width as usize).saturating_sub(54).max(10);
 
     // Block 边框占 2 行（上下各 1）
     let visible_height = (area.height as usize).saturating_sub(2);
@@ -115,14 +116,10 @@ fn render_children_list(
             // 若也高亮会让首屏满屏黄、颜色沦为噪音（KTD8）。目录保持 accent 目录色（可下钻）。
             let is_large = child.is_file && child.size >= LARGE_FILE_THRESHOLD;
 
-            // 大文件加 `⚠ ` 前缀：颜色之外的第二通道（无障碍/NO_COLOR 下仍可辨）。
-            let icon = if is_large {
-                "⚠ "
-            } else if child.is_file {
-                "  "
-            } else {
-                "> "
-            };
+            // 导航符独占三角家族：目录可进入→`▶`，文件为叶子→留空（与 Results 的 ▶/▼ 同族同义）。
+            let chevron = if child.is_file { "  " } else { "▶ " };
+            // 选择统一为复选框（四功能一致的选择词汇）；marked 再叠 danger 色 + 删除线做强化。
+            let check = if is_marked { "[x] " } else { "[ ] " };
             let percent = if parent_size > 0 {
                 (child.size as f64 / parent_size as f64 * 100.0) as u16
             } else {
@@ -157,13 +154,19 @@ fn render_children_list(
                 name_style = name_style.add_modifier(Modifier::CROSSED_OUT);
             }
 
-            let mark = if is_marked { " [D]" } else { "" };
+            // 大文件 `⚠ ` 前缀移到名字列（KTD8 第二通道）——与导航符 `▶` 分列，互不占位。
+            let name_col = if is_large {
+                format!("⚠ {}", child.name)
+            } else {
+                child.name.clone()
+            };
 
             ListItem::new(Line::from(vec![
-                Span::styled(icon, name_style),
+                // 统一行左段：导航符 + 复选框（marked 时 name_style 已叠 danger + 删除线）。
+                Span::styled(format!("{chevron}{check}"), name_style),
                 // 名称列按**显示宽度**裁剪并右填充到 24 列（`{:<24}` 按 char 数填充会因 CJK
                 // 双宽错位，KTD9）。
-                Span::styled(text::fit_width(&child.name, 24), name_style),
+                Span::styled(text::fit_width(&name_col, 24), name_style),
                 Span::styled(
                     // {:>9}：humansize DECIMAL 最长 9 字符（如 `406.73 MB`），{:>8} 会被溢出
                     // 挤歪后续 %/体积条整行漂移 1 格（KTD9）。
@@ -175,7 +178,6 @@ fn render_children_list(
                     Style::default().fg(theme::ink_muted()),
                 ),
                 Span::styled(bar, bar_style),
-                Span::styled(mark, Style::default().fg(theme::danger())),
             ]))
         })
         .collect();

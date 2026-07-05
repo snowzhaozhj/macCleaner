@@ -129,11 +129,11 @@ pub fn flat_row_item(
                 theme::safety_label(dominant),
             );
 
+            // 分类头**不放安全符**：它紧挨展开符 ▶/▼ 会形成"三角撞三角"的视觉冲突，
+            // 且本组等级已由上方分区标题 + 名字安全色 + detail 文字标签三处表达（冗余）。
+            // 安全形状符只在「分区标题」与「文件项」出现（见符号轴解耦，theme::safety_symbol）。
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!(" {expand_icon} {} {check} ", theme::safety_symbol(dominant)),
-                    style,
-                ),
+                Span::styled(format!(" {expand_icon} {check} "), style),
                 Span::styled(cat.name.clone(), style.add_modifier(Modifier::BOLD)),
                 Span::styled(detail, Style::default().fg(theme::ink_muted())),
             ]))
