@@ -131,8 +131,8 @@ impl App {
 
     /// 构建扁平化的行列表，用于结果页渲染和交互
     ///
-    /// 按 `SafetyLevel` 分区（Safe → Moderate → Risky），组内按 `total_size` 降序排列。
-    /// 每个非空分区前插入一个 Separator 标题行。
+    /// 按 `SafetyLevel` 分区（Safe → Moderate → Risky），组内按分类发现(插入)顺序稳定排列
+    /// （扫描前后一致，避免完成瞬间重排跳变）。每个非空分区前插入一个 Separator 标题行。
     /// 当 `filter_query` 非空时：大小写不敏感子串匹配项名，强制展开分类只显示匹配项，
     /// 跳过无匹配的分类与分区。
     pub fn build_flat_rows(&self) -> Vec<FlatRow> {

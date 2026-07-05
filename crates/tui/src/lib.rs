@@ -739,14 +739,18 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
                 // 让用户看到"正在扫描哪里"而非静止的顶层名。渲染节流已限制刷新频率，
                 // 不会狂闪；相比只显示顶层名，深层路径更能传达"在动"。
                 let home = platform::get_home_dir();
-                let rel = path.strip_prefix(&home).unwrap_or(path.as_path());
-                let s = rel.to_string_lossy();
+                // home 之下的路径显示为 ~/…；不在 home 下的绝对路径（如 /Applications）
+                // 原样显示，避免误拼成 "~//Applications"。
+                let (prefix, s) = match path.strip_prefix(&home) {
+                    Ok(rel) => ("~/", rel.to_string_lossy()),
+                    Err(_) => ("", path.to_string_lossy()),
+                };
                 let char_count = s.chars().count();
                 let new_text = if char_count > 46 {
                     let tail: String = s.chars().skip(char_count - 43).collect();
                     format!("当前: …{tail}")
                 } else {
-                    format!("当前: ~/{s}")
+                    format!("当前: {prefix}{s}")
                 };
                 if *progress_text != new_text {
                     *progress_text = new_text;
@@ -1478,6 +1482,74 @@ mod tests {
         assert!(out.contains(&(PathBuf::from("/root/B/B1"), 200)));
         // A1 不应出现（A 已被剪枝，不下钻）
         assert!(!out.iter().any(|(p, _)| p == &PathBuf::from("/root/A/A1")));
+    }
+
+    #[test]
+    fn found_merges_repeated_category_path_and_counts_distinct_items() {
+        use super::{handle_progress, App, AppState};
+        use mc_core::models::SafetyLevel;
+        use mc_core::progress::ProgressEvent;
+
+        let mut app = App::new();
+        app.state = AppState::Scanning {
+            progress_text: String::new(),
+            found_count: 0,
+            found_size: 0,
+            rule_current: 0,
+            rule_total: 0,
+            rule_name: String::new(),
+        };
+
+        let found = |path: &str, size: u64| ProgressEvent::Found {
+            category: "缓存".to_string(),
+            path: PathBuf::from(path),
+            size,
+            safety: SafetyLevel::Safe,
+        };
+
+        // 两次同 (category, path) 的流式增量应合并到同一项、size 累加，且不新增计数
+        handle_progress(&mut app, found("/root", 10));
+        handle_progress(&mut app, found("/root", 5));
+        let cat = &app.scan_result.as_ref().unwrap().categories[0];
+        assert_eq!(cat.items.len(), 1, "同路径增量应合并为一项");
+        assert_eq!(cat.items[0].size, 15);
+        assert_eq!(cat.total_size, 15);
+        assert_eq!(cat.file_count, 1, "合并不新增计数");
+
+        // 不同路径 -> 新项，计数 +1
+        handle_progress(&mut app, found("/root2", 7));
+        let cat = &app.scan_result.as_ref().unwrap().categories[0];
+        assert_eq!(cat.items.len(), 2);
+        assert_eq!(cat.file_count, 2);
+        assert_eq!(cat.total_size, 22);
+
+        // Scanning 态的 found_count/found_size 与 scan_result 一致
+        let AppState::Scanning { found_count, found_size, .. } = app.state else {
+            panic!("应仍在 Scanning 态");
+        };
+        assert_eq!(found_count, 2);
+        assert_eq!(found_size, 22);
+    }
+
+    #[test]
+    fn found_ignored_outside_scanning_state() {
+        // 防污染守卫：非扫描态（如已返回 Menu）收到残留 Found 应被忽略，
+        // 不得重建 scan_result 让下一个命令看到上一个命令的检测结果。
+        use super::{handle_progress, App};
+        use mc_core::models::SafetyLevel;
+        use mc_core::progress::ProgressEvent;
+
+        let mut app = App::new(); // 默认 Menu 态
+        handle_progress(
+            &mut app,
+            ProgressEvent::Found {
+                category: "缓存".to_string(),
+                path: PathBuf::from("/root"),
+                size: 10,
+                safety: SafetyLevel::Safe,
+            },
+        );
+        assert!(app.scan_result.is_none(), "非扫描态应忽略残留 Found");
     }
 
     #[test]

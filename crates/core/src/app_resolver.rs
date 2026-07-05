@@ -77,8 +77,12 @@ impl AppResolver {
     pub fn scan_apps_streaming(reporter: &dyn ProgressReporter) {
         let home = platform::get_home_dir();
         let app_dirs = [PathBuf::from("/Applications"), home.join("Applications")];
+        Self::scan_apps_in_dirs(&app_dirs, reporter);
+    }
 
-        for dir in &app_dirs {
+    /// `scan_apps_streaming` 的可注入目录内核，供测试传入临时目录。
+    fn scan_apps_in_dirs(app_dirs: &[PathBuf], reporter: &dyn ProgressReporter) {
+        for dir in app_dirs {
             if !dir.exists() {
                 continue;
             }
@@ -367,6 +371,68 @@ mod tests {
         let info = AppResolver::read_app_info(&app_dir.clone()).unwrap();
         assert_eq!(info.name, "TestApp");
         assert!(info.bundle_id.is_none());
+    }
+
+    /// 记录事件、可配置取消的测试 reporter
+    struct RecReporter {
+        found: std::sync::Mutex<Vec<PathBuf>>,
+        complete: std::sync::atomic::AtomicBool,
+        cancelled: bool,
+    }
+    impl RecReporter {
+        fn new(cancelled: bool) -> Self {
+            Self {
+                found: std::sync::Mutex::new(Vec::new()),
+                complete: std::sync::atomic::AtomicBool::new(false),
+                cancelled,
+            }
+        }
+    }
+    impl ProgressReporter for RecReporter {
+        fn on_event(&self, event: ProgressEvent) {
+            match event {
+                ProgressEvent::Found { path, .. } => self.found.lock().unwrap().push(path),
+                ProgressEvent::Complete => {
+                    self.complete.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        }
+        fn is_cancelled(&self) -> bool {
+            self.cancelled
+        }
+    }
+
+    #[test]
+    fn scan_apps_in_dirs_emits_found_per_app_and_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("Foo.app")).unwrap();
+        fs::create_dir_all(dir.path().join("Bar.app")).unwrap();
+        fs::create_dir_all(dir.path().join("NotAnApp")).unwrap(); // 非 .app，应跳过
+
+        let rec = RecReporter::new(false);
+        AppResolver::scan_apps_in_dirs(&[dir.path().to_path_buf()], &rec);
+
+        assert_eq!(rec.found.lock().unwrap().len(), 2, "两个 .app 应各 Found 一次，非 .app 跳过");
+        assert!(
+            rec.complete.load(std::sync::atomic::Ordering::Relaxed),
+            "扫描结束应发送 Complete"
+        );
+    }
+
+    #[test]
+    fn scan_apps_in_dirs_respects_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("Foo.app")).unwrap();
+
+        let rec = RecReporter::new(true); // 一开始就取消
+        AppResolver::scan_apps_in_dirs(&[dir.path().to_path_buf()], &rec);
+
+        assert!(rec.found.lock().unwrap().is_empty(), "已取消应提前返回，不发 Found");
+        assert!(
+            !rec.complete.load(std::sync::atomic::Ordering::Relaxed),
+            "取消路径不发 Complete"
+        );
     }
 
     #[test]
