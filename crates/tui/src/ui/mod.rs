@@ -41,7 +41,6 @@ pub fn draw(f: &mut Frame, app: &App) {
 /// 在底部一行渲染瞬时状态提示，醒目底色，覆盖该行 footer
 fn draw_status_message(f: &mut Frame, msg: &str) {
     use ratatui::layout::Rect;
-    use ratatui::style::{Color, Modifier, Style};
     use ratatui::widgets::{Clear, Paragraph};
 
     let area = f.area();
@@ -56,12 +55,7 @@ fn draw_status_message(f: &mut Frame, msg: &str) {
     };
     f.render_widget(Clear, row);
     f.render_widget(
-        Paragraph::new(format!(" {msg}")).style(
-            Style::default()
-                .fg(crate::theme::c(Color::Black))
-                .bg(crate::theme::c(Color::Yellow))
-                .add_modifier(Modifier::BOLD),
-        ),
+        Paragraph::new(format!(" {msg}")).style(crate::theme::toast_style()),
         row,
     );
 }
@@ -69,7 +63,7 @@ fn draw_status_message(f: &mut Frame, msg: &str) {
 /// 居中的帮助覆盖层，内容来自 keymap 注册表（与 footer 同源）
 fn draw_help_overlay(f: &mut Frame, app: &App) {
     use ratatui::layout::Alignment;
-    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
@@ -81,10 +75,10 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
                 Span::styled(
                     format!("  {:<18}", h.keys),
                     Style::default()
-                        .fg(crate::theme::c(Color::Cyan))
+                        .fg(crate::theme::accent())
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(h.desc, Style::default().fg(crate::theme::c(Color::White))),
+                Span::styled(h.desc, Style::default().fg(crate::theme::ink())),
             ])
         })
         .collect();
@@ -100,7 +94,7 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
                 Block::default()
                     .title(" 帮助 (按任意键关闭) ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(crate::theme::c(Color::Cyan))),
+                    .border_style(Style::default().fg(crate::theme::accent())),
             ),
         area,
     );
@@ -109,7 +103,7 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
 /// 完成页面
 fn draw_done(f: &mut Frame, app: &App) {
     use ratatui::layout::{Constraint, Layout, Direction, Alignment};
-    use ratatui::style::{Color, Style};
+    use ratatui::style::Style;
     use ratatui::widgets::{Block, Borders, Paragraph};
 
     let chunks = Layout::default()
@@ -130,9 +124,9 @@ fn draw_done(f: &mut Frame, app: &App) {
             Block::default()
                 .title(" 完成 ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(crate::theme::c(Color::Green))),
+                .border_style(Style::default().fg(crate::theme::success())),
         )
-        .style(Style::default().fg(crate::theme::c(Color::Green)))
+        .style(Style::default().fg(crate::theme::success()))
         .alignment(Alignment::Center);
 
     f.render_widget(para, chunks[0]);

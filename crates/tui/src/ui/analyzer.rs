@@ -6,7 +6,7 @@ use mc_core::models::DirNode;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
@@ -70,7 +70,7 @@ fn render_children_list(
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::c(Color::Blue))),
+                .border_style(Style::default().fg(theme::accent_explore())),
         );
         f.render_widget(empty, area);
         return;
@@ -127,18 +127,19 @@ fn render_children_list(
                 "░".repeat(bar_width.saturating_sub(filled)),
             );
 
-            let name_color = theme::c(if is_marked {
-                Color::Red
+            // 名称色语义：待删=danger、超大文件=warning、普通文件=ink、目录=accent(可下钻)
+            let name_color = if is_marked {
+                theme::danger()
             } else if is_large {
-                Color::Yellow
+                theme::warning()
             } else if child.is_file {
-                Color::White
+                theme::ink()
             } else {
-                Color::Cyan
-            });
+                theme::accent()
+            };
 
             let mut name_style = Style::default().fg(name_color);
-            let mut bar_style = Style::default().fg(theme::c(Color::Blue));
+            let mut bar_style = Style::default().fg(theme::accent_explore());
             if is_cursor {
                 name_style = theme::cursor_highlight(name_style.add_modifier(Modifier::BOLD));
                 bar_style = theme::cursor_highlight(bar_style);
@@ -157,14 +158,14 @@ fn render_children_list(
                 ),
                 Span::styled(
                     format!(" {:>8} ", format_size(child.size, DECIMAL)),
-                    Style::default().fg(theme::c(Color::DarkGray)),
+                    Style::default().fg(theme::ink_muted()),
                 ),
                 Span::styled(
                     format!("{percent:>3}% "),
-                    Style::default().fg(theme::c(Color::DarkGray)),
+                    Style::default().fg(theme::ink_muted()),
                 ),
                 Span::styled(bar, bar_style),
-                Span::styled(mark, Style::default().fg(theme::c(Color::Red))),
+                Span::styled(mark, Style::default().fg(theme::danger())),
             ]))
         })
         .collect();
@@ -173,7 +174,7 @@ fn render_children_list(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::c(Color::Blue))),
+            .border_style(Style::default().fg(theme::accent_explore())),
     );
 
     // 使用相对索引：cursor 在窗口切片中的位置
@@ -207,22 +208,22 @@ pub fn draw(f: &mut Frame, app: &App) {
     // header 左侧：面包屑；右侧：总大小 | 子项 | 已标记
     let left = build_breadcrumb_spans(&breadcrumb_names);
     let mut right = vec![
-        Span::styled("总大小: ", Style::default().fg(theme::c(Color::DarkGray))),
+        Span::styled("总大小: ", Style::default().fg(theme::ink_muted())),
         Span::styled(
             format_size(node.size, DECIMAL),
             Style::default()
-                .fg(theme::c(Color::Green))
+                .fg(theme::success())
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("  |  {} 个子项", node.children.len()),
-            Style::default().fg(theme::c(Color::DarkGray)),
+            Style::default().fg(theme::ink_muted()),
         ),
     ];
     if !marked.is_empty() {
         right.push(Span::styled(
             format!("  |  已标记删除: {} 个", marked.len()),
-            Style::default().fg(theme::c(Color::Red)),
+            Style::default().fg(theme::danger()),
         ));
     }
     chrome::render_header(f, header_area, " 磁盘分析 ", left, right);
@@ -268,7 +269,7 @@ pub fn draw_live(f: &mut Frame, app: &App) {
     let spinner = chrome::spinner(app.tick);
     let mut right: Vec<Span> = vec![Span::styled(
         format!("{spinner} "),
-        Style::default().fg(theme::c(Color::Yellow)),
+        Style::default().fg(theme::activity()),
     )];
     if nav_path.is_empty() {
         right.push(Span::styled(
@@ -278,36 +279,36 @@ pub fn draw_live(f: &mut Frame, app: &App) {
                 format_size(total_size, DECIMAL),
             ),
             Style::default()
-                .fg(theme::c(Color::Yellow))
+                .fg(theme::activity())
                 .add_modifier(Modifier::BOLD),
         ));
     } else {
         right.push(Span::styled(
             "扫描中...  |  ",
             Style::default()
-                .fg(theme::c(Color::Yellow))
+                .fg(theme::activity())
                 .add_modifier(Modifier::BOLD),
         ));
     }
     right.push(Span::styled(
         "总大小: ",
-        Style::default().fg(theme::c(Color::DarkGray)),
+        Style::default().fg(theme::ink_muted()),
     ));
     right.push(Span::styled(
         format_size(node.size, DECIMAL),
         Style::default()
-            .fg(theme::c(Color::Green))
+            .fg(theme::success())
             .add_modifier(Modifier::BOLD),
     ));
     right.push(Span::styled(
         format!("  |  {} 个子项", node.children.len()),
-        Style::default().fg(theme::c(Color::DarkGray)),
+        Style::default().fg(theme::ink_muted()),
     ));
-    right.push(Span::styled("  (扫描中)", Style::default().fg(theme::c(Color::Yellow))));
+    right.push(Span::styled("  (扫描中)", Style::default().fg(theme::activity())));
     if !marked.is_empty() {
         right.push(Span::styled(
             format!("  |  已标记删除: {} 个", marked.len()),
-            Style::default().fg(theme::c(Color::Red)),
+            Style::default().fg(theme::danger()),
         ));
     }
     chrome::render_header(f, header_area, " 磁盘分析 ", left, right);
@@ -318,14 +319,14 @@ pub fn draw_live(f: &mut Frame, app: &App) {
             Line::from(""),
             Line::from(Span::styled(
                 "  正在扫描此目录...",
-                Style::default().fg(theme::c(Color::DarkGray)),
+                Style::default().fg(theme::ink_muted()),
             )),
         ])
         .block(
             Block::default()
                 .title(" 文件列表 (实时更新) ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::c(Color::Blue))),
+                .border_style(Style::default().fg(theme::accent_explore())),
         );
         f.render_widget(empty_hint, list_area);
     } else {
@@ -361,11 +362,11 @@ pub fn draw_sorting(f: &mut Frame, app: &App) {
             Block::default()
                 .title(" 磁盘分析 ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::c(Color::Cyan))),
+                .border_style(Style::default().fg(theme::accent())),
         )
         .style(
             Style::default()
-                .fg(theme::c(Color::Yellow))
+                .fg(theme::activity())
                 .add_modifier(Modifier::BOLD),
         )
         .alignment(ratatui::layout::Alignment::Center);
@@ -381,16 +382,16 @@ fn build_breadcrumb_spans(breadcrumb_names: &[String]) -> Vec<Span<'static>> {
         if i > 0 {
             breadcrumb_parts.push(Span::styled(
                 " / ",
-                Style::default().fg(theme::c(Color::DarkGray)),
+                Style::default().fg(theme::ink_muted()),
             ));
         }
         let is_last = i == breadcrumb_names.len() - 1;
         let style = if is_last {
             Style::default()
-                .fg(theme::c(Color::Cyan))
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(theme::c(Color::Cyan))
+            Style::default().fg(theme::accent())
         };
         breadcrumb_parts.push(Span::styled(name.clone(), style));
     }

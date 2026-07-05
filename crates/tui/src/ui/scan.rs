@@ -3,7 +3,7 @@ use crate::theme;
 use crate::ui::chrome;
 use humansize::{format_size, DECIMAL};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -67,35 +67,35 @@ fn render_scan_header(f: &mut Frame, app: &App, area: Rect) {
     let left = vec![
         Span::styled(
             format!("{spinner} "),
-            Style::default().fg(theme::c(Color::Yellow)),
+            Style::default().fg(theme::activity()),
         ),
-        Span::styled("扫描中: ", Style::default().fg(theme::c(Color::DarkGray))),
+        Span::styled("扫描中: ", Style::default().fg(theme::ink_muted())),
         Span::styled(
             progress_text.to_string(),
-            Style::default().fg(theme::c(Color::White)),
+            Style::default().fg(theme::ink()),
         ),
     ];
 
     let mut right = vec![
-        Span::styled("已发现 ", Style::default().fg(theme::c(Color::DarkGray))),
+        Span::styled("已发现 ", Style::default().fg(theme::ink_muted())),
         Span::styled(
             format!("{found_count} 项"),
             Style::default()
-                .fg(theme::c(Color::Cyan))
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  |  ", Style::default().fg(theme::c(Color::DarkGray))),
+        Span::styled("  |  ", Style::default().fg(theme::ink_muted())),
         Span::styled(
             format_size(found_size, DECIMAL),
             Style::default()
-                .fg(theme::c(Color::Green))
+                .fg(theme::success())
                 .add_modifier(Modifier::BOLD),
         ),
     ];
     if rule_total > 0 {
         right.push(Span::styled(
             format!("  |  [{rule_current}/{rule_total}] {rule_name}"),
-            Style::default().fg(theme::c(Color::Yellow)),
+            Style::default().fg(theme::activity()),
         ));
     }
 
@@ -108,14 +108,14 @@ fn render_scanning_placeholder(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(Span::styled(
             "  正在扫描，请稍候…",
-            Style::default().fg(theme::c(Color::DarkGray)),
+            Style::default().fg(theme::ink_muted()),
         )),
     ])
     .block(
         Block::default()
             .title(SCAN_LIST_TITLE)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::c(Color::Cyan))),
+            .border_style(Style::default().fg(theme::accent())),
     );
     f.render_widget(para, area);
 }
@@ -133,7 +133,7 @@ pub fn draw_cleaning(f: &mut Frame, app: &App) {
     let title = Paragraph::new(" 清理中...")
         .style(
             Style::default()
-                .fg(theme::c(Color::Yellow))
+                .fg(theme::activity())
                 .add_modifier(Modifier::BOLD),
         )
         .block(Block::default().borders(Borders::ALL));
@@ -151,11 +151,11 @@ pub fn draw_cleaning(f: &mut Frame, app: &App) {
         Line::from(vec![
             Span::styled(
                 format!("  {spinner} "),
-                Style::default().fg(theme::c(Color::Yellow)),
+                Style::default().fg(theme::activity()),
             ),
             Span::styled(
                 truncate_path(progress_text, (chunks[1].width as usize).saturating_sub(10)),
-                Style::default().fg(theme::c(Color::White)),
+                Style::default().fg(theme::ink()),
             ),
         ]),
     ])
@@ -163,7 +163,7 @@ pub fn draw_cleaning(f: &mut Frame, app: &App) {
         Block::default()
             .title(" 清理进度 ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::c(Color::Yellow))),
+            .border_style(Style::default().fg(theme::activity())),
     );
 
     f.render_widget(info, chunks[1]);
