@@ -771,35 +771,50 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
             if category == "__analyze_tree__" {
                 return;
             }
+            use mc_core::models::{CategoryGroup, ScanItem, ScanResult};
+
+            if app.scan_result.is_none() {
+                app.scan_result = Some(ScanResult::default());
+            }
+
+            // Clean 流式上报同一 (category, root.path) 的增量，此处按 path 合并到既有聚合项，
+            // 避免重复插入。merged=true 表示只是给既有项累加 size（不新增计数）。
+            let mut merged = false;
+            if let Some(result) = app.scan_result.as_mut() {
+                if let Some(cat) = result.categories.iter_mut().find(|c| c.name == category) {
+                    if let Some(existing) = cat.items.iter_mut().find(|it| it.path == path) {
+                        existing.size += size;
+                        cat.total_size += size;
+                        merged = true;
+                    } else {
+                        cat.file_count += 1;
+                        cat.total_size += size;
+                        cat.items
+                            .push(ScanItem::new(path, size, safety, category.clone()));
+                    }
+                } else {
+                    result.categories.push(CategoryGroup::new(
+                        category.clone(),
+                        vec![ScanItem::new(path, size, safety, category.clone())],
+                    ));
+                    app.expanded.push(false);
+                }
+                result.total_size += size;
+                if !merged {
+                    result.file_count += 1;
+                }
+            }
+
             if let AppState::Scanning {
                 ref mut found_count,
                 ref mut found_size,
                 ..
             } = app.state
             {
-                *found_count += 1;
                 *found_size += size;
-            }
-
-            use mc_core::models::{CategoryGroup, ScanItem, ScanResult};
-            let item = ScanItem::new(path, size, safety, category.clone());
-
-            if app.scan_result.is_none() {
-                app.scan_result = Some(ScanResult::default());
-            }
-            if let Some(ref mut result) = app.scan_result {
-                if let Some(cat) = result.categories.iter_mut().find(|c| c.name == category) {
-                    cat.file_count += 1;
-                    cat.total_size += size;
-                    cat.items.push(item);
-                } else {
-                    result
-                        .categories
-                        .push(CategoryGroup::new(category, vec![item]));
-                    app.expanded.push(false);
+                if !merged {
+                    *found_count += 1;
                 }
-                result.file_count += 1;
-                result.total_size += size;
             }
         }
         ProgressEvent::CategoryDone {
