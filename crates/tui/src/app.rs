@@ -244,16 +244,17 @@ impl App {
             return;
         };
         let cat_count = result.categories.len();
-        // 默认预选安全项（沿用旧的 selected=Safe 默认，落到统一标记集）
-        let safe_paths: HashSet<PathBuf> = result
+        // 默认预选：直接采纳各项已计算的 selected（= safety != Risky && rule.preselect）。
+        // 由此 Risky 项与 preselect=false 的项（如 dist/build）默认不勾选。
+        let default_paths: HashSet<PathBuf> = result
             .categories
             .iter()
             .flat_map(|c| c.items.iter())
-            .filter(|i| i.safety == SafetyLevel::Safe)
+            .filter(|i| i.selected)
             .map(|i| i.path.clone())
             .collect();
 
-        self.marked = safe_paths;
+        self.marked = default_paths;
 
         // 保留扫描期间的展开态/光标，避免扫描完成瞬间"展开态跳变、列表回弹"。
         // resize 仅防御（Found 处理已维持 expanded.len()==categories.len() 不变式）。
@@ -344,14 +345,15 @@ impl App {
         self.skip_separator_backward(&rows);
     }
 
-    /// 全选安全级别的项目（加入统一标记集）
+    /// 全选所有非 Risky 项（`a` 键）。手动全选会覆盖 preselect=false（如 dist/build 也被选中），
+    /// 但 Risky 项不纳入——需用户逐项确认。
     pub fn select_all_safe(&mut self) {
         if let Some(result) = &self.scan_result {
             let paths: Vec<PathBuf> = result
                 .categories
                 .iter()
                 .flat_map(|c| c.items.iter())
-                .filter(|i| i.safety == SafetyLevel::Safe)
+                .filter(|i| i.safety != SafetyLevel::Risky)
                 .map(|i| i.path.clone())
                 .collect();
             self.marked.extend(paths);
@@ -523,6 +525,44 @@ mod tests {
         app.scan_result = Some(ScanResult::from_categories(vec![cat]));
         app.expanded = vec![true];
         app
+    }
+
+    /// 构造混合安全级别的 App（Safe / Moderate / Risky / preselect=false 各一）。
+    fn app_mixed_safety() -> App {
+        let items = vec![
+            ScanItem::new(PathBuf::from("/x/cache"), 10, SafetyLevel::Safe, "c".into()),
+            ScanItem::new(PathBuf::from("/x/node_modules"), 20, SafetyLevel::Moderate, "c".into()),
+            ScanItem::new(PathBuf::from("/x/docker"), 30, SafetyLevel::Risky, "c".into()),
+            ScanItem::new(PathBuf::from("/x/build"), 40, SafetyLevel::Moderate, "c".into())
+                .with_preselect(false),
+        ];
+        let cat = CategoryGroup::new("c".into(), items);
+        let mut app = App::new();
+        app.scan_result = Some(ScanResult::from_categories(vec![cat]));
+        app.expanded = vec![true];
+        app
+    }
+
+    #[test]
+    fn init_results_preselects_non_risky_except_preselect_false() {
+        // U4/D2：默认勾选 Safe + Moderate（preselect=true），不勾 Risky 与 preselect=false 的 build。
+        let mut app = app_mixed_safety();
+        app.init_results();
+        assert!(app.marked.contains(&PathBuf::from("/x/cache")), "Safe 应勾选");
+        assert!(app.marked.contains(&PathBuf::from("/x/node_modules")), "Moderate 应勾选");
+        assert!(!app.marked.contains(&PathBuf::from("/x/docker")), "Risky 不应勾选");
+        assert!(!app.marked.contains(&PathBuf::from("/x/build")), "preselect=false 不应勾选");
+    }
+
+    #[test]
+    fn select_all_safe_includes_moderate_and_preselect_false_but_not_risky() {
+        // `a` 键手动全选：覆盖 preselect=false（build 也选中），但仍排除 Risky。
+        let mut app = app_mixed_safety();
+        app.select_all_safe();
+        assert!(app.marked.contains(&PathBuf::from("/x/cache")));
+        assert!(app.marked.contains(&PathBuf::from("/x/node_modules")));
+        assert!(app.marked.contains(&PathBuf::from("/x/build")), "手动全选应含 build");
+        assert!(!app.marked.contains(&PathBuf::from("/x/docker")), "Risky 仍不选");
     }
 
     #[test]
