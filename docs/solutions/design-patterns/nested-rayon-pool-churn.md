@@ -81,9 +81,33 @@ dir_size_pool(4).install(|| dirs.par_iter().map(|d| dir_size(d)))
   而不是回退到 `RayonNewPool`。
 - 若外层**没有**并行（单任务场景），内层用池并行是对的——本坑特指"外层已并行、内层再建池"的嵌套。
 
+## 续篇：U6 消了 churn，但留下"过度订阅自旋"（2026-07-05 后续探测）
+
+对 `purge ~`（全盘，非 `~/workspace`）全程 `sample` 发现：U6 后仍有 **~25% on-CPU 时间在
+`sched_yield`（`swtch_pri`）自旋**，最大一簇 31869 样本在**主线程** `cthread_yield→swtch_pri`。根因是
+**过度订阅**，不是 churn：
+
+- 默认 `WALK_THREADS=0` → 剪枝遍历走 `RayonDefaultPool` = **rayon 全局池 = num_cpus 线程**（本机 10 核 = 10 线程），
+  加 `dir_size_pool` 4 线程 + 主线程 steal-spin。macOS I/O-bound 扫描下，idle worker 自旋等活。
+- U6 把 `dir_size` 改串行消了建池 churn，但把成本转成了 **straggler 自旋**：一个巨型 node_modules 时，
+  外层池其余 worker 无活可偷 → `sched_yield` 空转（早期采样见 4 线程 98% 在 swtch_pri）。
+
+**对标 dua-cli**（本项目并发基准，`/Users/zhaohejie/workspace/explore/dua-cli`）：
+`options.rs` 明确写 *"on macOS too many threads are bad, 3 is best on M4"* 默认 3 线程；
+`main.rs` 注释 *"avoid using the global rayon pool, it will keep a lot of threads alive"* → threads=0 时
+**刻意避开全局池**，改用 3 线程持久 `RayonExistingPool { busy_timeout: None }`。**我们默认恰好踩了它避开的坑。**
+
+**未验证的候选修法**（需受控 A/B，勿盲改）：用单个 3–4 线程**持久**池（对齐 dua），剪枝遍历不走 10 线程全局池。
+注意：**朴素减线程数已被实测证伪**——`MC_DIRSIZE_THREADS=2` 给 232%/97s（比默认 225%/86s 更差）、
+`MC_WALK_THREADS=3` 给 218%/98s（CPU 微降墙钟更长），因为最大自旋在主线程等池，减 worker 只让池更慢、主线程等更久。
+正解是"小而持久的池 + 合适的 parking"，不是简单调小数字。衡量收益要看 **profiler 的 swtch_pri 样本占比**，
+不要看墙钟（被 EDR 的 close 噪声淹没，见 [[edr-syscall-tax-distorts-cpu-measurement]]）。
+
 ## Takeaways
 
 - **诊断信号**：CPU% 远超核数 + sys 时间畸高 + 墙钟并不更快 = 强烈提示线程过度订阅 / 池 churn，而非有效并行。
+- **churn ≠ 过度订阅**：消了"每目录建池"（churn）不等于消了"太多线程空转"（过度订阅）；两者都表现为高 sys，
+  但前者靠"内层串行/复用"修，后者靠"限制池大小 + 持久化"修。
 - **测量前提**：CPU/并发结论只在 **release** 下可信（LTO + opt-level=3）；用**合成固定目录树**（tempfile）而非真实 home 做基准，才能跨配置复现；`MC_WALK_THREADS`/`MC_DIRSIZE_THREADS` env 旋钮支持线程数扫参。
 - **并行只加一层**：嵌套并行要么共享一个池（且避免同池自锁），要么内层串行让外层负责并行；切忌"每个元素新建一个池"。
 - 相关：`docs/plans/2026-07-05-009-perf-scan-cpu-optimization-plan.md`（本次计划与完整测量）、`docs/solutions/tooling-decisions/rust-workspace-pedantic-clippy-and-release-profile.md`（release 测量前提）。
