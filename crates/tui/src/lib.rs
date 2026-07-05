@@ -390,6 +390,12 @@ fn handle_key(
                         app.toggle_expand(*cat_idx);
                     }
                 }
+                // 扫描中按 Space/x 给提示（对齐 AnalyzingLive 的反馈一致性，KTD9 #5），
+                // 而非静默——标记/删除须待扫描完成进入 Results 后再操作。
+                KeyCode::Char(' ' | 'x') => {
+                    app.status_message =
+                        Some("扫描进行中不可标记/删除，完成后在结果页操作".to_string());
+                }
                 _ => {}
             }
         }
@@ -771,6 +777,8 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
                     // 重排会打乱 expanded/marked 的按 cat_idx 对齐，造成完成瞬间展开态跳变。
                 }
                 app.init_results();
+                // 进入 Results 时清除扫描态残留提示（如 Scanning 态按 Space 的 toast，KTD7）。
+                app.status_message = None;
                 app.state = AppState::Results;
             }
         }
@@ -787,13 +795,11 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
                 // 分析器发起的删除：仅剪除成功删除的节点并原地返回，不拆树回菜单
                 restore_analyzer_after_delete(app, ret, freed, count, &deleted_paths);
             } else {
-                app.state = AppState::Done {
-                    message: format!(
-                        "清理完成！已清理 {} 个文件，释放 {}",
-                        count,
-                        format_size(freed, DECIMAL)
-                    ),
-                };
+                // Results 路径：由暂存待删清单派生成功/失败明细 + 分类小结，Done 屏完整复述（KTD6）。
+                let request = std::mem::take(&mut app.clean_request);
+                app.done_report =
+                    Some(app::DoneReport::from_request(&request, freed, &deleted_paths));
+                app.state = AppState::Done { message: String::new() };
             }
         }
         ProgressEvent::Error(msg) => {
@@ -857,6 +863,9 @@ fn transition_to_sorting(
     tree_builder: &mut Option<IncrementalTreeBuilder>,
     sort_rx: &mut Option<Receiver<DirNode>>,
 ) {
+    // 进入新 AppState 时主动清除瞬时提示：AnalyzingLive 的"扫描进行中不可标记/删除"toast
+    // 不应残留到 Sorting/Analyzing（KTD7）。放在转换点而非按键处，故静态态提示仍走"下次按键清除"。
+    app.status_message = None;
     if let AppState::AnalyzingLive { .. } = &app.state {
         let old = std::mem::replace(&mut app.state, AppState::Menu);
         if let AppState::AnalyzingLive { tree_root, .. } = old {
@@ -1004,12 +1013,16 @@ pub const CONFIRM_TOKEN: &str = "delete";
 /// 执行已确认的删除：把确认项映射回 (path, size) 交给删除线程（KTD8：线程签名不变）。
 fn confirm_accept(app: &mut App, events: &EventHandler) {
     app.confirm_input.clear();
+    app.confirm_scroll = 0;
     if let Some(list) = app.confirm_delete.take() {
-        let items: Vec<(PathBuf, u64)> = list.into_iter().map(|i| (i.path, i.size)).collect();
+        let items: Vec<(PathBuf, u64)> = list.iter().map(|i| (i.path.clone(), i.size)).collect();
         // 分析器发起的删除：删后原地留在树内（暂存树剪枝恢复）；其余（Results）：删后走 Done → 菜单。
         if matches!(app.state, AppState::Analyzing { .. }) {
+            app.clean_request = Vec::new();
             start_cleaning_from_analyzer(app, items, events);
         } else {
+            // 暂存完整待删清单，供 Done 屏计算成功/失败明细与分类小结（KTD6）。
+            app.clean_request = list;
             start_cleaning(app, items, events);
         }
     }

@@ -23,6 +23,23 @@ pub fn render_flat_list(f: &mut Frame, app: &App, area: Rect, title: &str) {
         return;
     };
     let flat_rows = app.build_flat_rows();
+
+    // 过滤无匹配：列表区显示占位行而非全空白（KTD9），避免"输错过滤词却像列表被清空"。
+    if flat_rows.is_empty() && !app.filter_query.is_empty() {
+        use ratatui::widgets::Paragraph;
+        let placeholder = Paragraph::new(Line::from(Span::styled(
+            "  无匹配项（Esc 清除过滤）",
+            Style::default().fg(theme::ink_muted()),
+        )))
+        .block(
+            Block::default()
+                .title(title.to_string())
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::accent())),
+        );
+        f.render_widget(placeholder, area);
+        return;
+    }
     // 复刻 ratatui ListState(offset=0) 的默认滚动：光标在第一屏时顶到 0，
     // 超出时置于窗口末行。每帧从 cursor 计算，无独立滚动状态。
     let visible_height = (area.height as usize).saturating_sub(2);
@@ -105,7 +122,8 @@ pub fn flat_row_item(
             }
 
             let detail = format!(
-                "  ({} 个文件, {}, {})",
+                // "项"而非"个文件"：分类项可能是目录（如 node_modules），称"文件"失真（KTD9）。
+                "  ({} 项, {}, {})",
                 cat.file_count,
                 format_size(cat.total_size, DECIMAL),
                 theme::safety_label(dominant),

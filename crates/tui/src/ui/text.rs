@@ -7,6 +7,8 @@
 //! - `abbreviate_home` / `ellipsize_path`：home 前缀缩写为 `~` 后再中段省略；
 //! - `wrap_by_width`：按显示宽度贪心换行（Risky 后果句在确认框内 wrap 用）。
 
+use ratatui::style::Style;
+use ratatui::text::Span;
 use std::path::Path;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -77,6 +79,15 @@ pub fn truncate_end(s: &str, max_width: usize) -> String {
     format!("{head}…")
 }
 
+/// 把 `s` 裁剪/右填充到恰好 `width` 显示宽度：超宽尾部截断补 `…`，不足右补空格。
+/// 用于表格列对齐（`{:<N}` 按 char 数填充会因 CJK 双宽错位，KTD9）。
+#[must_use]
+pub fn fit_width(s: &str, width: usize) -> String {
+    let t = truncate_end(s, width);
+    let pad = width.saturating_sub(display_width(&t));
+    format!("{t}{}", " ".repeat(pad))
+}
+
 /// 把 home 前缀缩写为 `~`（不在 home 下的绝对路径原样返回）。
 #[must_use]
 pub fn abbreviate_home(path: &Path) -> String {
@@ -92,6 +103,66 @@ pub fn abbreviate_home(path: &Path) -> String {
 #[must_use]
 pub fn ellipsize_path(path: &Path, max_width: usize) -> String {
     ellipsize_middle(&abbreviate_home(path), max_width)
+}
+
+/// 对一串 `Span`（如面包屑：根 / … / 当前层）按显示宽度中段省略，保头保尾、
+/// 保留各 span 的样式，中间插入 `…`。用于 header 左区：既加省略号又保证最深层段可见
+/// （尾部预算优先保留末段），对齐 DESIGN.md §5.2（KTD5 header + 面包屑）。
+#[must_use]
+pub fn ellipsize_spans_middle(spans: &[Span<'_>], max_width: usize, ellipsis_style: Style) -> Vec<Span<'static>> {
+    let total: usize = spans.iter().map(|s| display_width(s.content.as_ref())).sum();
+    let owned = |s: &Span<'_>| Span::styled(s.content.as_ref().to_string(), s.style);
+    if total <= max_width {
+        return spans.iter().map(owned).collect();
+    }
+    if max_width <= 1 {
+        return vec![Span::styled("…".to_string(), ellipsis_style)];
+    }
+    let budget = max_width - 1;
+    let head_budget = budget / 2;
+    let tail_budget = budget - head_budget;
+
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for s in spans {
+        if used >= head_budget {
+            break;
+        }
+        let w = display_width(s.content.as_ref());
+        if used + w <= head_budget {
+            out.push(owned(s));
+            used += w;
+        } else {
+            let part = take_prefix(s.content.as_ref(), head_budget - used);
+            if !part.is_empty() {
+                out.push(Span::styled(part, s.style));
+            }
+            break;
+        }
+    }
+    out.push(Span::styled("…".to_string(), ellipsis_style));
+
+    let mut tail: Vec<Span<'static>> = Vec::new();
+    let mut used_t = 0;
+    for s in spans.iter().rev() {
+        if used_t >= tail_budget {
+            break;
+        }
+        let w = display_width(s.content.as_ref());
+        if used_t + w <= tail_budget {
+            tail.push(owned(s));
+            used_t += w;
+        } else {
+            let part = take_suffix(s.content.as_ref(), tail_budget - used_t);
+            if !part.is_empty() {
+                tail.push(Span::styled(part, s.style));
+            }
+            break;
+        }
+    }
+    tail.reverse();
+    out.extend(tail);
+    out
 }
 
 /// 按显示宽度贪心换行（无空格的 CJK 句子按字符折行）。返回每行字符串。

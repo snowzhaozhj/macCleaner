@@ -97,6 +97,11 @@ pub struct App {
     pub confirm_input: String,
     /// 确认框清单区的滚动偏移（可见行起点）；打开/关闭确认框时归零（KTD3）。
     pub confirm_scroll: usize,
+    /// Results 发起删除时暂存的完整待删清单（含 category/size），供 Done 屏计算成功/失败
+    /// 明细与分类小结（KTD6）。分析器路径走 `analyzer_return`，不用此字段。
+    pub clean_request: Vec<ConfirmItem>,
+    /// Done 屏的结构化清理报告；None 时 Done 退回单行 message（空扫描/错误）。
+    pub done_report: Option<DoneReport>,
     /// 从磁盘分析器发起删除时暂存的树与导航状态；删除在后台线程完成后据此
     /// **剪除已删节点并原地返回分析器**，而非拆树回菜单（修复"删除后莫名退出"）。
     pub analyzer_return: Option<AnalyzerReturn>,
@@ -128,6 +133,8 @@ impl App {
             confirm_delete: None,
             confirm_input: String::new(),
             confirm_scroll: 0,
+            clean_request: Vec::new(),
+            done_report: None,
             analyzer_return: None,
             status_message: None,
             pending_leave: false,
@@ -225,6 +232,7 @@ impl App {
             FlatRow::Item { cat_idx, item_idx } => {
                 let item = &result.categories[*cat_idx].items[*item_idx];
                 DetailView::Item {
+                    path: item.path.clone(),
                     safety: item.safety,
                     impact: item.impact.clone(),
                     recovery: item.recovery.clone(),
@@ -528,6 +536,8 @@ impl App {
         self.confirm_delete = None;
         self.confirm_input.clear();
         self.confirm_scroll = 0;
+        self.clean_request = Vec::new();
+        self.done_report = None;
         self.analyzer_return = None;
         self.status_message = None;
         self.pending_leave = false;
@@ -602,6 +612,49 @@ pub struct ConfirmItem {
     pub recovery: String,
 }
 
+/// Done 屏的结构化清理报告（KTD6）：成功/失败明细 + 分类小结，取代旧的单行文案。
+/// 从"暂存的待删清单"与"CleaningDone 回报的成功路径"派生，不新增冗余存储。
+#[derive(Debug, Clone)]
+pub struct DoneReport {
+    /// 实际释放字节（移入废纸篓的成功项之和）
+    pub freed: u64,
+    /// 成功项数
+    pub succeeded: usize,
+    /// 失败项路径（请求删除但未出现在成功清单中的项，权限/占用/SIP 等）
+    pub failed_paths: Vec<PathBuf>,
+    /// 成功项按分类小结：(分类名, 项数, 大小)，按发现顺序稳定
+    pub categories: Vec<(String, usize, u64)>,
+}
+
+impl DoneReport {
+    /// 由暂存待删清单 `request` 与成功路径 `deleted` 派生报告。
+    pub fn from_request(request: &[ConfirmItem], freed: u64, deleted: &[PathBuf]) -> Self {
+        let deleted_set: HashSet<&PathBuf> = deleted.iter().collect();
+        let failed_paths: Vec<PathBuf> = request
+            .iter()
+            .filter(|i| !deleted_set.contains(&i.path))
+            .map(|i| i.path.clone())
+            .collect();
+        // 分类小结：仅统计成功项，保持首次出现顺序。
+        let mut categories: Vec<(String, usize, u64)> = Vec::new();
+        for item in request.iter().filter(|i| deleted_set.contains(&i.path)) {
+            let label = if item.category.is_empty() { "待删项" } else { item.category.as_str() };
+            if let Some(entry) = categories.iter_mut().find(|(name, _, _)| name == label) {
+                entry.1 += 1;
+                entry.2 += item.size;
+            } else {
+                categories.push((label.to_string(), 1, item.size));
+            }
+        }
+        Self {
+            freed,
+            succeeded: deleted.len(),
+            failed_paths,
+            categories,
+        }
+    }
+}
+
 /// 结果页详情面板内容（U5）：随光标位置给出可读说明。
 #[derive(Debug, Clone)]
 pub enum DetailView {
@@ -609,8 +662,9 @@ pub enum DetailView {
     Empty,
     /// 光标在分区/分类行：展示该等级的 rubric 一句话
     Level(SafetyLevel),
-    /// 光标在文件项：展示该项的影响与恢复方式（evidence 为空则显示占位）
+    /// 光标在文件项：展示该项完整路径 + 影响与恢复方式（evidence 为空则显示占位）
     Item {
+        path: PathBuf,
         safety: SafetyLevel,
         impact: String,
         recovery: String,
@@ -706,7 +760,7 @@ mod tests {
             .expect("应有 Item 行");
         app.result_cursor = item_idx;
         match app.current_detail() {
-            DetailView::Item { impact, recovery, safety } => {
+            DetailView::Item { impact, recovery, safety, .. } => {
                 assert_eq!(safety, SafetyLevel::Moderate);
                 assert_eq!(impact, "依赖被清空");
                 assert_eq!(recovery, "npm install");

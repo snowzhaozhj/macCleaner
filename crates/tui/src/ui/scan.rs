@@ -30,7 +30,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         render_scanning_placeholder(f, list_area);
     }
 
-    chrome::render_footer(f, footer_area, &crate::keymap::footer_line(&app.state));
+    chrome::render_footer(f, footer_area, &crate::keymap::footer_line(&app.state, footer_area.width as usize));
 }
 
 /// 顶部 header（与 Analyze 一致）：左侧 spinner + 当前扫描路径；右侧已发现项/大小/规则进度。
@@ -99,7 +99,7 @@ fn render_scan_header(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    chrome::render_header(f, area, cmd_name, left, right);
+    chrome::render_header(f, area, cmd_name, &left, right);
 }
 
 /// 尚无结果时的列表占位（与结果列表同样的边框/位置，切换无跳变）。
