@@ -30,7 +30,7 @@ pub fn spinner(tick: u64) -> &'static str {
 /// "面包屑盒 + 目录信息盒"两个盒子，回收竖向空间。
 /// 右侧统计按其实际显示宽度分得独立子区，左侧占剩余区，
 /// 二者不重叠——窄终端下左侧面包屑在自身区内截断，右侧统计完整保留。
-pub fn render_header(f: &mut Frame, area: Rect, title: &str, left: Vec<Span<'_>>, right: Vec<Span<'_>>) {
+pub fn render_header(f: &mut Frame, area: Rect, title: &str, left: &[Span<'_>], right: Vec<Span<'_>>) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -41,12 +41,21 @@ pub fn render_header(f: &mut Frame, area: Rect, title: &str, left: Vec<Span<'_>>
         return;
     }
 
-    let left_line = Line::from(left);
     let right_line = Line::from(right);
 
     // 右侧按显示宽度（含 CJK 双宽）分配子区，左侧取剩余，避免叠加覆盖
     let right_w = u16::try_from(right_line.width()).unwrap_or(u16::MAX).min(inner.width);
     let left_w = inner.width - right_w;
+
+    // 左区截断保证与右区 ≥1 空格间隔、截断处以 `…` 结尾（按显示宽度，防 CJK 半字与粘连）。
+    // 面包屑经中段省略保留最深层段可见（KTD5）。
+    let left_avail = (left_w as usize).saturating_sub(1);
+    let left_spans = crate::ui::text::ellipsize_spans_middle(
+        left,
+        left_avail,
+        Style::default().fg(crate::theme::ink_muted()),
+    );
+    let left_line = Line::from(left_spans);
 
     let left_rect = Rect { x: inner.x, width: left_w, ..inner };
     let right_rect = Rect { x: inner.x + left_w, width: right_w, ..inner };

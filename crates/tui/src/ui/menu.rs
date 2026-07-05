@@ -79,5 +79,5 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_stateful_widget(menu, chunks[1], &mut state);
 
     // 底部提示
-    chrome::render_footer(f, chunks[2], &crate::keymap::footer_line(&app.state));
+    chrome::render_footer(f, chunks[2], &crate::keymap::footer_line(&app.state, chunks[2].width as usize));
 }

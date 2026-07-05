@@ -1,6 +1,6 @@
 use crate::app::{App, DetailView};
 use crate::theme;
-use crate::ui::chrome;
+use crate::ui::{chrome, text};
 use humansize::{format_size, DECIMAL};
 use mc_core::models::SafetyLevel;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -10,7 +10,8 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 /// 详情面板高度（含上下边框）；列表可用高度不足时折叠隐藏。
-const DETAIL_HEIGHT: u16 = 4;
+/// 5 = 边框 2 + 内容 3（路径 / 影响 / 恢复）——Item 详情顶部新增完整路径行（KTD9 #6）。
+const DETAIL_HEIGHT: u16 = 5;
 
 pub fn draw(f: &mut Frame, app: &App) {
     // 复用共享的 [header(3), body(Min), footer(1)]，再把 body 细分为 列表 + 详情面板，
@@ -30,7 +31,8 @@ pub fn draw(f: &mut Frame, app: &App) {
             Style::default().fg(theme::ink_muted()),
         ),
         Span::styled(
-            format!("{total_count} 个文件, {}", format_size(total_size, DECIMAL)),
+            // "项"而非"个文件"：Purge/Uninstall 的项多为目录/应用，称"文件"失真（KTD9）。
+            format!("{total_count} 项, {}", format_size(total_size, DECIMAL)),
             Style::default().fg(theme::accent()),
         ),
     ];
@@ -43,7 +45,7 @@ pub fn draw(f: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
     ];
-    chrome::render_header(f, header_area, " 扫描结果 ", left, right);
+    chrome::render_header(f, header_area, " 扫描结果 ", &left, right);
 
     crate::ui::rows::render_flat_list(f, app, list_area, " 分类列表 ");
 
@@ -59,16 +61,19 @@ pub fn draw(f: &mut Frame, app: &App) {
             &format!(" 过滤: {}▏  (Enter 确认 | Esc 清除)", app.filter_query),
         );
     } else if app.filter_query.is_empty() {
-        chrome::render_footer(f, footer_area, &crate::keymap::footer_line(&app.state));
-    } else {
         chrome::render_footer(
             f,
             footer_area,
-            &format!(
-                " 过滤中: \"{}\"  (Esc 清除) | {}",
-                app.filter_query,
-                crate::keymap::footer_line(&app.state)
-            ),
+            &crate::keymap::footer_line(&app.state, footer_area.width as usize),
+        );
+    } else {
+        // 过滤态前缀占用宽度，footer_line 预算相应扣减，保证 x/? 仍可见。
+        let prefix = format!(" 过滤中: \"{}\"  (Esc 清除) | ", app.filter_query);
+        let budget = (footer_area.width as usize).saturating_sub(crate::ui::text::display_width(&prefix));
+        chrome::render_footer(
+            f,
+            footer_area,
+            &format!("{prefix}{}", crate::keymap::footer_line(&app.state, budget)),
         );
     }
 }
@@ -110,11 +115,18 @@ fn render_detail(f: &mut Frame, area: Rect, detail: &DetailView) {
             ])]
         }
         DetailView::Item {
+            path,
             safety,
             impact,
             recovery,
         } => {
             let style = Style::default().fg(theme::safety_color(*safety));
+            // 顶部完整路径行（muted，中段省略）——顺带消解同名条目无法区分的残余困惑（KTD9 #6）。
+            let path_w = (area.width as usize).saturating_sub(2);
+            let path_line = Line::from(Span::styled(
+                text::ellipsize_path(path, path_w),
+                Style::default().fg(theme::ink_muted()),
+            ));
             let head = Span::styled(
                 format!("{} {}", theme::safety_symbol(*safety), theme::safety_label(*safety)),
                 style.add_modifier(Modifier::BOLD),
@@ -129,7 +141,7 @@ fn render_detail(f: &mut Frame, area: Rect, detail: &DetailView) {
             } else {
                 format!("恢复: {recovery}")
             };
-            vec![impact_line, Line::from(recovery_text)]
+            vec![path_line, impact_line, Line::from(recovery_text)]
         }
     };
 

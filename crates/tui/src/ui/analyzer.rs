@@ -1,6 +1,6 @@
 use crate::app::{App, AppState};
 use crate::theme;
-use crate::ui::chrome;
+use crate::ui::{chrome, text};
 use humansize::{format_size, DECIMAL};
 use mc_core::models::DirNode;
 use std::collections::HashSet;
@@ -77,7 +77,8 @@ fn render_children_list(
     }
 
     let parent_size = if node.size > 0 { node.size } else { 1 };
-    let bar_width = (area.width as usize).saturating_sub(50).max(10);
+    // 固定列预算：导航符 2 + 复选框 4 + 名称 24 + 大小 11 + 百分比 5 + 边距 ≈ 54。
+    let bar_width = (area.width as usize).saturating_sub(54).max(10);
 
     // Block 边框占 2 行（上下各 1）
     let visible_height = (area.height as usize).saturating_sub(2);
@@ -111,9 +112,14 @@ fn render_children_list(
             let child = &node.children[order[abs_idx]];
             let is_cursor = abs_idx == cursor;
             let is_marked = marked.contains(&child.path);
-            let is_large = child.size >= LARGE_FILE_THRESHOLD;
+            // 大文件高亮**只作用于文件**：目录天然大（体积降序下首屏几乎全 ≥100MiB），
+            // 若也高亮会让首屏满屏黄、颜色沦为噪音（KTD8）。目录保持 accent 目录色（可下钻）。
+            let is_large = child.is_file && child.size >= LARGE_FILE_THRESHOLD;
 
-            let icon = if child.is_file { "  " } else { "> " };
+            // 导航符独占三角家族：目录可进入→`▶`，文件为叶子→留空（与 Results 的 ▶/▼ 同族同义）。
+            let chevron = if child.is_file { "  " } else { "▶ " };
+            // 选择统一为复选框（四功能一致的选择词汇）；marked 再叠 danger 色 + 删除线做强化。
+            let check = if is_marked { "[x] " } else { "[ ] " };
             let percent = if parent_size > 0 {
                 (child.size as f64 / parent_size as f64 * 100.0) as u16
             } else {
@@ -148,16 +154,23 @@ fn render_children_list(
                 name_style = name_style.add_modifier(Modifier::CROSSED_OUT);
             }
 
-            let mark = if is_marked { " [D]" } else { "" };
+            // 大文件 `⚠ ` 前缀移到名字列（KTD8 第二通道）——与导航符 `▶` 分列，互不占位。
+            let name_col = if is_large {
+                format!("⚠ {}", child.name)
+            } else {
+                child.name.clone()
+            };
 
             ListItem::new(Line::from(vec![
-                Span::styled(icon, name_style),
+                // 统一行左段：导航符 + 复选框（marked 时 name_style 已叠 danger + 删除线）。
+                Span::styled(format!("{chevron}{check}"), name_style),
+                // 名称列按**显示宽度**裁剪并右填充到 24 列（`{:<24}` 按 char 数填充会因 CJK
+                // 双宽错位，KTD9）。
+                Span::styled(text::fit_width(&name_col, 24), name_style),
                 Span::styled(
-                    format!("{:<24}", truncate_name(&child.name, 24)),
-                    name_style,
-                ),
-                Span::styled(
-                    format!(" {:>8} ", format_size(child.size, DECIMAL)),
+                    // {:>9}：humansize DECIMAL 最长 9 字符（如 `406.73 MB`），{:>8} 会被溢出
+                    // 挤歪后续 %/体积条整行漂移 1 格（KTD9）。
+                    format!(" {:>9} ", format_size(child.size, DECIMAL)),
                     Style::default().fg(theme::ink_muted()),
                 ),
                 Span::styled(
@@ -165,7 +178,6 @@ fn render_children_list(
                     Style::default().fg(theme::ink_muted()),
                 ),
                 Span::styled(bar, bar_style),
-                Span::styled(mark, Style::default().fg(theme::danger())),
             ]))
         })
         .collect();
@@ -222,11 +234,11 @@ pub fn draw(f: &mut Frame, app: &App) {
     ];
     if !marked.is_empty() {
         right.push(Span::styled(
-            format!("  |  已标记删除: {} 个", marked.len()),
+            format!("  |  已标记删除: {} 项", marked.len()),
             Style::default().fg(theme::danger()),
         ));
     }
-    chrome::render_header(f, header_area, " 磁盘分析 ", left, right);
+    chrome::render_header(f, header_area, " 磁盘分析 ", &left, right);
 
     render_children_list(
         f,
@@ -238,7 +250,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         false,
     );
 
-    chrome::render_footer(f, footer_area, &crate::keymap::footer_line(&app.state));
+    chrome::render_footer(f, footer_area, &crate::keymap::footer_line(&app.state, footer_area.width as usize));
 }
 
 /// `AnalyzingLive` 状态渲染：增量构建中的可导航界面
@@ -307,11 +319,11 @@ pub fn draw_live(f: &mut Frame, app: &App) {
     right.push(Span::styled("  (扫描中)", Style::default().fg(theme::activity())));
     if !marked.is_empty() {
         right.push(Span::styled(
-            format!("  |  已标记删除: {} 个", marked.len()),
+            format!("  |  已标记删除: {} 项", marked.len()),
             Style::default().fg(theme::danger()),
         ));
     }
-    chrome::render_header(f, header_area, " 磁盘分析 ", left, right);
+    chrome::render_header(f, header_area, " 磁盘分析 ", &left, right);
 
     // 子项列表或空目录提示
     if node.children.is_empty() {
@@ -341,7 +353,7 @@ pub fn draw_live(f: &mut Frame, app: &App) {
         );
     }
 
-    chrome::render_footer(f, footer_area, &crate::keymap::footer_line(&app.state));
+    chrome::render_footer(f, footer_area, &crate::keymap::footer_line(&app.state, footer_area.width as usize));
 }
 
 /// Sorting 过渡状态渲染：居中显示 spinner + "正在排序..."
@@ -372,7 +384,7 @@ pub fn draw_sorting(f: &mut Frame, app: &App) {
         .alignment(ratatui::layout::Alignment::Center);
     f.render_widget(para, chunks[0]);
 
-    chrome::render_footer(f, chunks[1], &crate::keymap::footer_line(&app.state));
+    chrome::render_footer(f, chunks[1], &crate::keymap::footer_line(&app.state, chunks[1].width as usize));
 }
 
 /// 构建面包屑导航 span 列表（供 header 左侧使用）
@@ -396,18 +408,6 @@ fn build_breadcrumb_spans(breadcrumb_names: &[String]) -> Vec<Span<'static>> {
         breadcrumb_parts.push(Span::styled(name.clone(), style));
     }
     breadcrumb_parts
-}
-
-fn truncate_name(name: &str, max_len: usize) -> String {
-    let char_count = name.chars().count();
-    if char_count <= max_len {
-        name.to_string()
-    } else if max_len > 3 {
-        let prefix: String = name.chars().take(max_len - 3).collect();
-        format!("{prefix}...")
-    } else {
-        name.chars().take(max_len).collect()
-    }
 }
 
 #[cfg(test)]

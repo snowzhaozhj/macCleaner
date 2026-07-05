@@ -23,6 +23,23 @@ pub fn render_flat_list(f: &mut Frame, app: &App, area: Rect, title: &str) {
         return;
     };
     let flat_rows = app.build_flat_rows();
+
+    // 过滤无匹配：列表区显示占位行而非全空白（KTD9），避免"输错过滤词却像列表被清空"。
+    if flat_rows.is_empty() && !app.filter_query.is_empty() {
+        use ratatui::widgets::Paragraph;
+        let placeholder = Paragraph::new(Line::from(Span::styled(
+            "  无匹配项（Esc 清除过滤）",
+            Style::default().fg(theme::ink_muted()),
+        )))
+        .block(
+            Block::default()
+                .title(title.to_string())
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::accent())),
+        );
+        f.render_widget(placeholder, area);
+        return;
+    }
     // 复刻 ratatui ListState(offset=0) 的默认滚动：光标在第一屏时顶到 0，
     // 超出时置于窗口末行。每帧从 cursor 计算，无独立滚动状态。
     let visible_height = (area.height as usize).saturating_sub(2);
@@ -105,17 +122,18 @@ pub fn flat_row_item(
             }
 
             let detail = format!(
-                "  ({} 个文件, {}, {})",
+                // "项"而非"个文件"：分类项可能是目录（如 node_modules），称"文件"失真（KTD9）。
+                "  ({} 项, {}, {})",
                 cat.file_count,
                 format_size(cat.total_size, DECIMAL),
                 theme::safety_label(dominant),
             );
 
+            // 分类头**不放安全符**：它紧挨展开符 ▶/▼ 会形成"三角撞三角"的视觉冲突，
+            // 且本组等级已由上方分区标题 + 名字安全色 + detail 文字标签三处表达（冗余）。
+            // 安全形状符只在「分区标题」与「文件项」出现（见符号轴解耦，theme::safety_symbol）。
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!(" {expand_icon} {} {check} ", theme::safety_symbol(dominant)),
-                    style,
-                ),
+                Span::styled(format!(" {expand_icon} {check} "), style),
                 Span::styled(cat.name.clone(), style.add_modifier(Modifier::BOLD)),
                 Span::styled(detail, Style::default().fg(theme::ink_muted())),
             ]))

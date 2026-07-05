@@ -95,6 +95,13 @@ pub struct App {
     pub confirm_delete: Option<Vec<ConfirmItem>>,
     /// 含 Risky 项时的 type-to-confirm 输入缓冲（D4）。
     pub confirm_input: String,
+    /// 确认框清单区的滚动偏移（可见行起点）；打开/关闭确认框时归零（KTD3）。
+    pub confirm_scroll: usize,
+    /// Results 发起删除时暂存的完整待删清单（含 category/size），供 Done 屏计算成功/失败
+    /// 明细与分类小结（KTD6）。分析器路径走 `analyzer_return`，不用此字段。
+    pub clean_request: Vec<ConfirmItem>,
+    /// Done 屏的结构化清理报告；None 时 Done 退回单行 message（空扫描/错误）。
+    pub done_report: Option<DoneReport>,
     /// 从磁盘分析器发起删除时暂存的树与导航状态；删除在后台线程完成后据此
     /// **剪除已删节点并原地返回分析器**，而非拆树回菜单（修复"删除后莫名退出"）。
     pub analyzer_return: Option<AnalyzerReturn>,
@@ -125,6 +132,9 @@ impl App {
             marked: HashSet::new(),
             confirm_delete: None,
             confirm_input: String::new(),
+            confirm_scroll: 0,
+            clean_request: Vec::new(),
+            done_report: None,
             analyzer_return: None,
             status_message: None,
             pending_leave: false,
@@ -222,6 +232,7 @@ impl App {
             FlatRow::Item { cat_idx, item_idx } => {
                 let item = &result.categories[*cat_idx].items[*item_idx];
                 DetailView::Item {
+                    path: item.path.clone(),
                     safety: item.safety,
                     impact: item.impact.clone(),
                     recovery: item.recovery.clone(),
@@ -472,6 +483,7 @@ impl App {
                             path: item.path.clone(),
                             size: item.size,
                             safety: item.safety,
+                            category: item.category.clone(),
                             impact: item.impact.clone(),
                             recovery: item.recovery.clone(),
                         });
@@ -522,9 +534,48 @@ impl App {
         self.filter_query.clear();
         self.marked.clear();
         self.confirm_delete = None;
+        self.confirm_input.clear();
+        self.confirm_scroll = 0;
+        self.clean_request = Vec::new();
+        self.done_report = None;
         self.analyzer_return = None;
         self.status_message = None;
         self.pending_leave = false;
+    }
+
+    /// KTD2 诚实披露：勾选父目录会连带其中**未勾选**的子项一并删除（size 归属已扣除、
+    /// 物理包含无法扣除）。为确认框每个"含未勾选子项"的待删父项生成一条 ⚠ 警示文案。
+    /// 仅 Results 模式（有 `scan_result`）适用；分析器 `collect_marked` 已剪除标记目录的子项。
+    pub fn unmarked_child_disclosures(&self) -> Vec<String> {
+        let (Some(list), Some(result)) = (&self.confirm_delete, &self.scan_result) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for p in list {
+            let mut count = 0usize;
+            let mut example: Option<&str> = None;
+            for cat in &result.categories {
+                for item in &cat.items {
+                    if item.path != p.path
+                        && item.path.starts_with(&p.path)
+                        && !self.marked.contains(&item.path)
+                    {
+                        count += 1;
+                        if example.is_none() {
+                            example = Some(cat.name.as_str());
+                        }
+                    }
+                }
+            }
+            if count > 0 {
+                let parent = if p.category.is_empty() { "该项" } else { p.category.as_str() };
+                let ex = example.unwrap_or("其他分类");
+                out.push(format!(
+                    "⚠ {parent} 包含 {count} 个未勾选的子项（如 {ex}），将一并删除"
+                ));
+            }
+        }
+        out
     }
 }
 
@@ -549,14 +600,59 @@ pub enum FlatRow {
     Item { cat_idx: usize, item_idx: usize },
 }
 
-/// 删除确认框的单项：携带 safety/impact/recovery 以支持 Risky 强调与证据展示（U7/R9）。
+/// 删除确认框的单项：携带 safety/impact/recovery 以支持 Risky 强调与证据展示（U7/R9），
+/// 并携带 category 以支持非 Risky 项按分类汇总（KTD3）。分析器发起的删除无规则分类，category 为空。
 #[derive(Debug, Clone)]
 pub struct ConfirmItem {
     pub path: PathBuf,
     pub size: u64,
     pub safety: SafetyLevel,
+    pub category: String,
     pub impact: String,
     pub recovery: String,
+}
+
+/// Done 屏的结构化清理报告（KTD6）：成功/失败明细 + 分类小结，取代旧的单行文案。
+/// 从"暂存的待删清单"与"CleaningDone 回报的成功路径"派生，不新增冗余存储。
+#[derive(Debug, Clone)]
+pub struct DoneReport {
+    /// 实际释放字节（移入废纸篓的成功项之和）
+    pub freed: u64,
+    /// 成功项数
+    pub succeeded: usize,
+    /// 失败项路径（请求删除但未出现在成功清单中的项，权限/占用/SIP 等）
+    pub failed_paths: Vec<PathBuf>,
+    /// 成功项按分类小结：(分类名, 项数, 大小)，按发现顺序稳定
+    pub categories: Vec<(String, usize, u64)>,
+}
+
+impl DoneReport {
+    /// 由暂存待删清单 `request` 与成功路径 `deleted` 派生报告。
+    pub fn from_request(request: &[ConfirmItem], freed: u64, deleted: &[PathBuf]) -> Self {
+        let deleted_set: HashSet<&PathBuf> = deleted.iter().collect();
+        let failed_paths: Vec<PathBuf> = request
+            .iter()
+            .filter(|i| !deleted_set.contains(&i.path))
+            .map(|i| i.path.clone())
+            .collect();
+        // 分类小结：仅统计成功项，保持首次出现顺序。
+        let mut categories: Vec<(String, usize, u64)> = Vec::new();
+        for item in request.iter().filter(|i| deleted_set.contains(&i.path)) {
+            let label = if item.category.is_empty() { "待删项" } else { item.category.as_str() };
+            if let Some(entry) = categories.iter_mut().find(|(name, _, _)| name == label) {
+                entry.1 += 1;
+                entry.2 += item.size;
+            } else {
+                categories.push((label.to_string(), 1, item.size));
+            }
+        }
+        Self {
+            freed,
+            succeeded: deleted.len(),
+            failed_paths,
+            categories,
+        }
+    }
 }
 
 /// 结果页详情面板内容（U5）：随光标位置给出可读说明。
@@ -566,8 +662,9 @@ pub enum DetailView {
     Empty,
     /// 光标在分区/分类行：展示该等级的 rubric 一句话
     Level(SafetyLevel),
-    /// 光标在文件项：展示该项的影响与恢复方式（evidence 为空则显示占位）
+    /// 光标在文件项：展示该项完整路径 + 影响与恢复方式（evidence 为空则显示占位）
     Item {
+        path: PathBuf,
         safety: SafetyLevel,
         impact: String,
         recovery: String,
@@ -639,6 +736,7 @@ mod tests {
             path: PathBuf::from("/x/nm"),
             size: 1,
             safety: SafetyLevel::Moderate,
+            category: "c".into(),
             impact: String::new(),
             recovery: String::new(),
         }]);
@@ -662,7 +760,7 @@ mod tests {
             .expect("应有 Item 行");
         app.result_cursor = item_idx;
         match app.current_detail() {
-            DetailView::Item { impact, recovery, safety } => {
+            DetailView::Item { impact, recovery, safety, .. } => {
                 assert_eq!(safety, SafetyLevel::Moderate);
                 assert_eq!(impact, "依赖被清空");
                 assert_eq!(recovery, "npm install");

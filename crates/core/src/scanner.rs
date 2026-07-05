@@ -83,17 +83,6 @@ impl Meta {
         }
     }
 
-    /// 兜底元数据（分类名未在映射中找到时使用；正常不应触发）。
-    fn fallback(category: String) -> Self {
-        Self {
-            safety: SafetyLevel::Safe,
-            category,
-            impact: String::new(),
-            recovery: String::new(),
-            preselect: true,
-        }
-    }
-
     fn into_item(self, path: PathBuf, size: u64) -> ScanItem {
         ScanItem::new(path, size, self.safety, self.category)
             .with_evidence(self.impact, self.recovery)
@@ -208,27 +197,21 @@ impl Scanner {
                     prefetch_metadata(children);
                 });
 
-            // 预计算本根下各 category 的 safety，用于流式上报 Found。
-            // 按 category 名索引依赖"同名分类 safety 唯一"这一不变式（clean/purge 规则表当前成立）；
-            // 若未来某分类在同根下映射到两种 safety，debug 构建会在此断言失败以提醒改用更精确的键。
-            let mut cat_meta: HashMap<String, Meta> = HashMap::new();
-            cat_meta.insert(root.meta.category.clone(), root.meta.clone());
-            for (_, m) in &root.children {
-                debug_assert!(
-                    cat_meta
-                        .get(&m.category)
-                        .is_none_or(|prev| prev.safety == m.safety),
-                    "分类 {:?} 在同根下出现两种 safety，按名索引会丢失其一",
-                    m.category
-                );
-                cat_meta.insert(m.category.clone(), m.clone());
+            // 预计算本根下各**匹配基路径**的 meta，用于流式上报 Found。
+            // 键必须是删除粒度的键（路径 PathBuf），不能是展示粒度的键（分类名）——
+            // 否则同根下的子规则（如"浏览器缓存"，其基路径是 ~/Library/Caches/Google/Chrome）
+            // 会顶着根路径 emit，导致 TUI 出现两个同 PathBuf 的条目、勾选耦合、计数失真（P0）。
+            let mut base_meta: HashMap<PathBuf, Meta> = HashMap::new();
+            base_meta.insert(root.path.clone(), root.meta.clone());
+            for (child_path, m) in &root.children {
+                base_meta.insert(child_path.clone(), m.clone());
             }
 
             let mut batch_count: usize = 0;
-            // 每个规则的大小累加器：(category, 累计 size)
-            let mut size_by_category: HashMap<String, u64> = HashMap::new();
+            // 每个基路径的大小累加器：(base_path, 累计 size)
+            let mut size_by_base: HashMap<PathBuf, u64> = HashMap::new();
             // 已流式上报的累计 size，用于计算增量（delta）
-            let mut emitted_by_category: HashMap<String, u64> = HashMap::new();
+            let mut emitted_by_base: HashMap<PathBuf, u64> = HashMap::new();
 
             for entry in walker {
                 let entry = match entry {
@@ -245,17 +228,18 @@ impl Scanner {
 
                 batch_count += 1;
 
-                // 最长前缀匹配：文件归入最具体的子规则，否则归入根规则
-                let meta = root
+                // 最长前缀匹配：文件归入最具体的子规则（连同其基路径），否则归入根规则。
+                // size 累加到**基路径**而非分类名——流式 Found 才能挂在真实子路径上。
+                let (base, meta) = root
                     .children
                     .iter()
                     .rev()
                     .find(|(child_path, _)| path.starts_with(child_path))
-                    .map_or_else(|| root.meta.clone(), |(_, m)| m.clone());
+                    .map_or_else(|| (&root.path, &root.meta), |(p, m)| (p, m));
 
-                *size_by_category.entry(meta.category.clone()).or_insert(0) += size;
+                *size_by_base.entry(base.clone()).or_insert(0) += size;
 
-                let item = meta.into_item(path.clone(), size);
+                let item = meta.clone().into_item(path.clone(), size);
                 category_map
                     .entry(item.category.clone())
                     .or_default()
@@ -268,24 +252,17 @@ impl Scanner {
                         break;
                     }
                     reporter.on_event(ProgressEvent::Scanning { path });
-                    flush_category_deltas(
+                    flush_base_deltas(
                         reporter,
-                        &root.path,
-                        &size_by_category,
-                        &mut emitted_by_category,
-                        &cat_meta,
+                        &size_by_base,
+                        &mut emitted_by_base,
+                        &base_meta,
                     );
                 }
             }
 
             // 收尾：上报剩余增量（不足 200 的尾巴）
-            flush_category_deltas(
-                reporter,
-                &root.path,
-                &size_by_category,
-                &mut emitted_by_category,
-                &cat_meta,
-            );
+            flush_base_deltas(reporter, &size_by_base, &mut emitted_by_base, &base_meta);
         }
 
         let result = build_scan_result(category_map, reporter);
@@ -484,30 +461,28 @@ fn build_scan_result(
     result
 }
 
-/// 上报各分类相对上次已报 size 的增量（delta），驱动 TUI 列表边扫边填充。
+/// 上报各**基路径**相对上次已报 size 的增量（delta），驱动 TUI 列表边扫边填充。
 /// TUI 侧对同一 `(category, path)` 的重复 `Found` 会合并累加，故此处发 delta 即可，
-/// 累加后各分类聚合项的大小与最终一次性上报完全一致。
-fn flush_category_deltas(
+/// 累加后各聚合项的大小与最终一次性上报完全一致。以基路径为键（而非分类名）保证
+/// 同根下的子规则挂在其真实子路径上，条目独立可勾可删（P0 修）。
+fn flush_base_deltas(
     reporter: &dyn ProgressReporter,
-    root_path: &Path,
-    size_by_category: &HashMap<String, u64>,
-    emitted: &mut HashMap<String, u64>,
-    cat_meta: &HashMap<String, Meta>,
+    size_by_base: &HashMap<PathBuf, u64>,
+    emitted: &mut HashMap<PathBuf, u64>,
+    base_meta: &HashMap<PathBuf, Meta>,
 ) {
-    for (category, &cum) in size_by_category {
-        let last = emitted.get(category).copied();
+    for (base, &cum) in size_by_base {
+        let last = emitted.get(base).copied();
         // 已上报过且无新增（cum 单调不减，等于即无增量）则跳过；但**首次**出现即使当前
         // 累计为 0 也上报一条 size=0 的 Found 建项，让"全零大小分类"也能出现在 TUI（与 CLI 一致）。
         if last == Some(cum) {
             continue;
         }
         let delta = cum - last.unwrap_or(0);
-        let meta = cat_meta
-            .get(category)
-            .cloned()
-            .unwrap_or_else(|| Meta::fallback(category.clone()));
-        reporter.on_event(meta.found(root_path.to_path_buf(), delta));
-        emitted.insert(category.clone(), cum);
+        // 不变式：size_by_base 的键均来自 base_meta（root.path 或 child_path），故必然命中。
+        let meta = &base_meta[base];
+        reporter.on_event(meta.found(base.clone(), delta));
+        emitted.insert(base.clone(), cum);
     }
 }
 
@@ -565,6 +540,7 @@ fn build_dir_size_pool() -> rayon::ThreadPool {
 mod tests {
     use super::*;
     use crate::progress::{ProgressEvent, ProgressReporter};
+    use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
@@ -722,16 +698,24 @@ mod tests {
         );
     }
 
-    /// 累加每个分类收到的 Found size（用于验证流式 delta 的求和正确性）
+    /// 累加每个分类收到的 Found size（验证流式 delta 求和正确性）
+    /// + 记录每个分类收到的 Found 路径集合（验证 P0：子规则挂在真实子路径上）
     struct SizeReporter {
         found: Arc<Mutex<HashMap<String, u64>>>,
+        found_paths: Arc<Mutex<HashMap<String, HashSet<PathBuf>>>>,
         found_events: Arc<Mutex<usize>>,
     }
 
     impl ProgressReporter for SizeReporter {
         fn on_event(&self, event: ProgressEvent) {
-            if let ProgressEvent::Found { category, size, .. } = event {
-                *self.found.lock().unwrap().entry(category).or_insert(0) += size;
+            if let ProgressEvent::Found { category, path, size, .. } = event {
+                *self.found.lock().unwrap().entry(category.clone()).or_insert(0) += size;
+                self.found_paths
+                    .lock()
+                    .unwrap()
+                    .entry(category)
+                    .or_default()
+                    .insert(path);
                 *self.found_events.lock().unwrap() += 1;
             }
         }
@@ -767,6 +751,7 @@ mod tests {
         let found_events = Arc::new(Mutex::new(0usize));
         let reporter = SizeReporter {
             found: found.clone(),
+            found_paths: Arc::new(Mutex::new(HashMap::new())),
             found_events: found_events.clone(),
         };
 
@@ -790,8 +775,9 @@ mod tests {
 
     #[test]
     fn scan_clean_streams_multiple_categories_under_one_root() {
-        // 根规则 + 最长前缀子规则：两个分类都以 path=root.path 流式 emit Found。
-        // 验证 TUI 侧按 (category, path) 合并时不会把不同分类混淆，各自求和独立正确。
+        // 根规则 + 最长前缀子规则：根分类以 path=root、子分类以 path=sub 流式 emit Found
+        // （P0 修：子规则挂在其真实基路径而非顶着根路径）。验证 (1) 各分类 size 求和独立正确、
+        // (2) 各分类 Found 路径集合恰为其基路径——后者是"同一 PathBuf 跨分类重复聚合"的回归测试。
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("cache");
         let sub = root.join("sub");
@@ -838,9 +824,11 @@ mod tests {
         ];
 
         let found = Arc::new(Mutex::new(HashMap::new()));
+        let found_paths = Arc::new(Mutex::new(HashMap::new()));
         let found_events = Arc::new(Mutex::new(0usize));
         let reporter = SizeReporter {
             found: found.clone(),
+            found_paths: found_paths.clone(),
             found_events: found_events.clone(),
         };
 
@@ -858,6 +846,19 @@ mod tests {
             "子分类流式 delta 求和应等于其真实大小（最长前缀归类）"
         );
         assert_eq!(result.total_size, root_expected + sub_expected);
+
+        // P0 回归：每个分类的 Found 路径集合恰为其基路径，二者不共享 PathBuf。
+        let paths = found_paths.lock().unwrap();
+        assert_eq!(
+            paths.get("根缓存"),
+            Some(&HashSet::from([root.clone()])),
+            "根分类 Found 应只挂在 root 基路径上"
+        );
+        assert_eq!(
+            paths.get("子缓存"),
+            Some(&HashSet::from([sub.clone()])),
+            "子分类 Found 应挂在其真实子路径 sub 上（而非顶着 root）"
+        );
     }
 
     #[test]
