@@ -1,0 +1,55 @@
+# Release：在推送 v* tag 时构建 release 二进制、生成 SHA256 校验和，
+# 并用 GitHub 官方 action 产出 SLSA build provenance attestation
+# （证明「这个二进制确实由本仓库这条 workflow 构建」，供下游验真）。
+# 用 macOS runner——mc 是 Mac 工具，需在 macOS 上产出可运行的二进制。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # 创建 release、上传产物
+  id-token: write # attest-build-provenance 签发 OIDC token 所需
+  attestations: write # 写入 build provenance attestation
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 构建 release 二进制
+        run: cargo build --release -p mc
+
+      # 打包二进制 + 生成 SHA256 校验和（下游可据此核对下载完整性）。
+      - name: 打包与校验和
+        id: package
+        run: |
+          mkdir -p dist
+          BIN=target/release/mc
+          TARBALL="mc-${GITHUB_REF_NAME}-macos.tar.gz"
+          tar -czf "dist/${TARBALL}" -C target/release mc
+          cd dist
+          shasum -a 256 "${TARBALL}" > "${TARBALL}.sha256"
+          echo "tarball=dist/${TARBALL}" >> "$GITHUB_OUTPUT"
+
+      # 对二进制产物签发 SLSA build provenance attestation。
+      - name: 生成 build provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: ${{ steps.package.outputs.tarball }}
+
+      - name: 发布 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
