@@ -306,6 +306,16 @@ mod tests {
     use super::*;
     use crate::models::SafetyLevel;
 
+    /// 内置规则全集（clean + purge），**不含**用户叠加规则。内置契约测试验证的是
+    /// 「内置规则的不变量」，不能用 `all_rules()`——那会在测试机存在
+    /// `~/.config/mc/rules.toml` 时被用户规则污染（环境依赖、脆弱）。这不是放宽契约
+    /// （rubric 断言本身不变），只是把被遍历的集合收窄回内置。
+    fn builtin_rules() -> Vec<CleanRule> {
+        let mut r = clean_rules();
+        r.extend(purge_rules());
+        r
+    }
+
     #[test]
     fn clean_rules_all_safe() {
         for rule in clean_rules() {
@@ -402,7 +412,7 @@ mod tests {
     // R6: 每条规则 impact/recovery 非空
     #[test]
     fn all_rules_evidence_non_empty() {
-        for rule in all_rules() {
+        for rule in builtin_rules() {
             assert!(!rule.impact.trim().is_empty(), "规则 '{}' impact 不能为空", rule.name);
             assert!(!rule.recovery.trim().is_empty(), "规则 '{}' recovery 不能为空", rule.name);
         }
@@ -412,7 +422,7 @@ mod tests {
     #[test]
     fn gradle_narrowed_to_caches() {
         // .gradle 必须窄化为 exact ~/.gradle/caches，不能整树 dir_name 匹配（否则删签名密钥/配置）。
-        for rule in all_rules() {
+        for rule in builtin_rules() {
             for p in &rule.patterns {
                 if let PathPattern::DirName(name) = p {
                     assert_ne!(name, ".gradle", "不应存在 dir_name '.gradle' 整树规则");
@@ -471,7 +481,7 @@ mod tests {
     #[test]
     fn dirname_rules_have_guards() {
         // 除 __pycache__ 外，每条 dir_name 规则都必须配置项目根守卫。
-        for rule in all_rules() {
+        for rule in builtin_rules() {
             let has_dirname = rule
                 .patterns
                 .iter()
@@ -539,7 +549,7 @@ mod tests {
     #[test]
     fn no_rules_reference_user_data_paths() {
         let forbidden = ["Documents", "Desktop", "Downloads"];
-        for rule in all_rules() {
+        for rule in builtin_rules() {
             for pattern in &rule.patterns {
                 if let PathPattern::Exact(p) = pattern {
                     let path_str = p.to_string_lossy();
@@ -557,16 +567,31 @@ mod tests {
     }
 
     #[test]
-    fn all_rules_combines_clean_and_purge() {
-        let clean_count = clean_rules().len();
-        let purge_count = purge_rules().len();
-        let all_count = all_rules().len();
-        assert_eq!(all_count, clean_count + purge_count);
+    fn all_rules_prefixes_builtin() {
+        // `all_rules()` = clean + purge + user（用户规则 append 在末尾）。为环境非依赖，
+        // 只验证「内置全集是 all_rules() 的前缀」：前 N 条与内置全集逐条同名。测试机若真有
+        // `~/.config/mc/rules.toml`，也只会在末尾多出用户规则，本断言仍成立。
+        let clean = clean_rules();
+        let purge = purge_rules();
+        let builtin_len = clean.len() + purge.len();
+        let all = all_rules();
+        assert!(all.len() >= builtin_len, "all_rules 至少含全部内置规则");
+        let builtin_names: Vec<&str> = clean
+            .iter()
+            .chain(purge.iter())
+            .map(|r| r.name.as_str())
+            .collect();
+        let all_prefix_names: Vec<&str> =
+            all.iter().take(builtin_len).map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            all_prefix_names, builtin_names,
+            "all_rules() 前缀应逐条等于 clean+purge 内置全集"
+        );
     }
 
     #[test]
     fn no_duplicate_rule_names() {
-        let rules = all_rules();
+        let rules = builtin_rules();
         let mut seen = std::collections::HashSet::new();
         for rule in &rules {
             assert!(
@@ -579,7 +604,7 @@ mod tests {
 
     #[test]
     fn no_empty_patterns() {
-        for rule in all_rules() {
+        for rule in builtin_rules() {
             assert!(
                 !rule.patterns.is_empty(),
                 "规则 '{}' 的 patterns 不能为空",
