@@ -157,10 +157,16 @@ impl Scanner {
                     prefetch_metadata(children);
                 });
 
-            // 预计算本根下各 category 的 safety，用于流式上报 Found
+            // 预计算本根下各 category 的 safety，用于流式上报 Found。
+            // 按 category 名索引依赖"同名分类 safety 唯一"这一不变式（clean/purge 规则表当前成立）；
+            // 若未来某分类在同根下映射到两种 safety，debug 构建会在此断言失败以提醒改用更精确的键。
             let mut cat_safety: HashMap<String, SafetyLevel> = HashMap::new();
             cat_safety.insert(root.category.clone(), root.safety);
             for (_, s, c) in &root.children {
+                debug_assert!(
+                    cat_safety.get(c).is_none_or(|prev| *prev == *s),
+                    "分类 {c:?} 在同根下出现两种 safety，按名索引会丢失其一"
+                );
                 cat_safety.insert(c.clone(), *s);
             }
 
@@ -447,10 +453,13 @@ fn flush_category_deltas(
     cat_safety: &HashMap<String, SafetyLevel>,
 ) {
     for (category, &cum) in size_by_category {
-        let last = emitted.get(category).copied().unwrap_or(0);
-        if cum <= last {
+        let last = emitted.get(category).copied();
+        // 已上报过且无新增（cum 单调不减，等于即无增量）则跳过；但**首次**出现即使当前
+        // 累计为 0 也上报一条 size=0 的 Found 建项，让"全零大小分类"也能出现在 TUI（与 CLI 一致）。
+        if last == Some(cum) {
             continue;
         }
+        let delta = cum - last.unwrap_or(0);
         let safety = cat_safety
             .get(category)
             .copied()
@@ -458,7 +467,7 @@ fn flush_category_deltas(
         reporter.on_event(ProgressEvent::Found {
             category: category.clone(),
             path: root_path.to_path_buf(),
-            size: cum - last,
+            size: delta,
             safety,
         });
         emitted.insert(category.clone(), cum);

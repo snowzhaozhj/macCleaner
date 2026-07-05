@@ -43,25 +43,25 @@ fn render_scan_header(f: &mut Frame, app: &App, area: Rect) {
         None => " 扫描 ",
     };
 
-    let (progress_text, found_count, found_size, rule_current, rule_total, rule_name) =
-        match &app.state {
-            AppState::Scanning {
-                progress_text,
-                found_count,
-                found_size,
-                rule_current,
-                rule_total,
-                rule_name,
-            } => (
-                progress_text.as_str(),
-                *found_count,
-                *found_size,
-                *rule_current,
-                *rule_total,
-                rule_name.as_str(),
-            ),
-            _ => ("", 0, 0, 0, 0, ""),
-        };
+    let (progress_text, rule_current, rule_total, rule_name) = match &app.state {
+        AppState::Scanning {
+            progress_text,
+            rule_current,
+            rule_total,
+            rule_name,
+        } => (
+            progress_text.as_str(),
+            *rule_current,
+            *rule_total,
+            rule_name.as_str(),
+        ),
+        _ => ("", 0, 0, ""),
+    };
+    // 已发现项数/总大小直接由 scan_result 派生，不再在 Scanning 态冗余存储。
+    let (found_count, found_size) = app
+        .scan_result
+        .as_ref()
+        .map_or((0, 0), |r| (r.file_count, r.total_size));
 
     let spinner = chrome::spinner(app.tick);
     let left = vec![

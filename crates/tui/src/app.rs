@@ -9,11 +9,10 @@ use std::sync::Arc;
 pub enum AppState {
     /// 主菜单
     Menu,
-    /// 正在扫描
+    /// 正在扫描。已发现项数/总大小不在此冗余存储，直接由 `scan_result` 派生
+    /// （见 `ui::scan::render_scan_header`），避免两处计数需手动保持一致。
     Scanning {
         progress_text: String,
-        found_count: usize,
-        found_size: u64,
         rule_current: usize,
         rule_total: usize,
         rule_name: String,
@@ -146,23 +145,20 @@ impl App {
         // 分类顺序始终按发现(插入)顺序稳定排列：扫描中不因各分类 size 增长而逐帧重排
         // (跳变)，扫描完成切到 Results 时顺序、展开态、光标全都不变——消除完成瞬间的跳变。
         let safety_order = [SafetyLevel::Safe, SafetyLevel::Moderate, SafetyLevel::Risky];
+        // 每个分类的主导安全等级只算一次（此前在 3 个 safety 分区里各算一遍）。
+        let dominant: Vec<SafetyLevel> =
+            result.categories.iter().map(Self::dominant_safety).collect();
 
         let mut rows = Vec::new();
         for &level in &safety_order {
-            let mut indices: Vec<usize> = result
-                .categories
-                .iter()
-                .enumerate()
-                .filter(|(_, cat)| Self::dominant_safety(cat) == level)
-                .map(|(idx, _)| idx)
+            // (0..len).filter 天然升序，即发现(插入)顺序，无需再 sort。
+            let indices: Vec<usize> = (0..result.categories.len())
+                .filter(|&idx| dominant[idx] == level)
                 .collect();
 
             if indices.is_empty() {
                 continue;
             }
-
-            // 按分类发现(插入)顺序，扫描前后一致
-            indices.sort_unstable();
 
             // 先构建该分区的行；过滤时跳过无匹配分类，最终无行则连 Separator 一起跳过
             let mut level_rows = Vec::new();
