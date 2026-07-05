@@ -1,6 +1,6 @@
 use crate::{Cli, Commands};
 use mc_core::engine::Engine;
-use mc_core::models::{DeleteMode, SafetyLevel, ScanResult};
+use mc_core::models::{DeleteMode, SafetyLevel, ScanItem, ScanResult};
 use mc_core::platform;
 use mc_core::progress::{ProgressEvent, ProgressReporter};
 
@@ -116,17 +116,7 @@ fn print_purge_summary(result: &ScanResult) {
     for cat in &result.categories {
         println!("  {} ({} 个项目, {}):", cat.name, cat.file_count, format_size(cat.total_size, DECIMAL));
         for item in &cat.items {
-            let safety_indicator = match item.safety {
-                SafetyLevel::Safe => "\u{1f7e2}",
-                SafetyLevel::Moderate => "\u{1f7e1}",
-                SafetyLevel::Risky => "\u{1f534}",
-            };
-            println!(
-                "    {} {} — {}",
-                safety_indicator,
-                item.path.display(),
-                format_size(item.size, DECIMAL),
-            );
+            println!("    {}", format_item_line(item));
         }
     }
     println!(
@@ -134,4 +124,47 @@ fn print_purge_summary(result: &ScanResult) {
         result.file_count,
         format_size(result.total_size, DECIMAL),
     );
+}
+
+/// 单项展示：颜色标记 + 路径 + 大小 + 恢复方式（若有）。恢复文案让"删了怎么拿回来"可见。
+fn format_item_line(item: &ScanItem) -> String {
+    let safety_indicator = match item.safety {
+        SafetyLevel::Safe => "\u{1f7e2}",
+        SafetyLevel::Moderate => "\u{1f7e1}",
+        SafetyLevel::Risky => "\u{1f534}",
+    };
+    let base = format!(
+        "{} {} — {}",
+        safety_indicator,
+        item.path.display(),
+        format_size(item.size, DECIMAL),
+    );
+    if item.recovery.trim().is_empty() {
+        base
+    } else {
+        format!("{base}  · {}", item.recovery)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn format_item_line_appends_recovery_when_present() {
+        let item = ScanItem::new(PathBuf::from("/p/node_modules"), 1024, SafetyLevel::Moderate, "Node.js".into())
+            .with_evidence("依赖被清空".into(), "运行 npm install".into());
+        let line = format_item_line(&item);
+        assert!(line.contains("/p/node_modules"), "应含路径");
+        assert!(line.contains("· 运行 npm install"), "应追加 recovery 文案");
+        assert!(line.contains('\u{1f7e1}'), "Moderate 应用黄色标记");
+    }
+
+    #[test]
+    fn format_item_line_omits_recovery_when_empty() {
+        let item = ScanItem::new(PathBuf::from("/app"), 512, SafetyLevel::Safe, "x".into());
+        let line = format_item_line(&item);
+        assert!(!line.contains('·'), "空 recovery 不应出现分隔符");
+    }
 }
