@@ -1,6 +1,8 @@
 use crate::models::{CategoryGroup, SafetyLevel, ScanItem, ScanResult};
 use crate::progress::{ProgressEvent, ProgressReporter};
-use crate::rules::{clean_rules, purge_rules, CleanRule, PathPattern};
+use crate::rules::{
+    clean_rules, matches_root_markers, purge_rules, CleanRule, PathPattern, RootMarker,
+};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -307,13 +309,14 @@ impl Scanner {
             path: base_path.to_path_buf(),
         });
 
-        let dirname_rules: Vec<(String, Meta)> = rules
+        let dirname_rules: Vec<(String, Vec<RootMarker>, Meta)> = rules
             .iter()
             .flat_map(|rule| {
                 let meta = Meta::from_rule(rule);
+                let markers = rule.root_markers.clone();
                 rule.patterns.iter().filter_map(move |p| {
                     if let PathPattern::DirName(name) = p {
-                        Some((name.clone(), meta.clone()))
+                        Some((name.clone(), markers.clone(), meta.clone()))
                     } else {
                         None
                     }
@@ -386,14 +389,12 @@ impl Scanner {
 
                             let entry_path = e.path();
 
-                            for (dir_name, meta) in dirname_clone.iter() {
+                            for (dir_name, markers, meta) in dirname_clone.iter() {
                                 if name.as_ref() == dir_name.as_str() {
-                                    if dir_name == "target" {
-                                        if let Some(p) = entry_path.parent() {
-                                            if !p.join("Cargo.toml").exists() {
-                                                continue;
-                                            }
-                                        }
+                                    // 项目根守卫：不满足标记则跳过此规则（如无 Cargo.toml 的 target、
+                                    // 无 package.json 的 build），消除按目录名匹配的误报。
+                                    if !matches_root_markers(markers, &entry_path) {
+                                        continue;
                                     }
                                     if let Ok(mut dirs) = matched_clone.lock() {
                                         dirs.push((entry_path, meta.clone()));
@@ -641,12 +642,13 @@ mod tests {
         let tmp = tempdir().unwrap();
         let base = tmp.path();
 
-        // 创建 project_a/node_modules 结构
+        // 创建 project_a/node_modules 结构（含 sibling package.json 守卫标记）
         let nm = base.join("project_a").join("node_modules");
         std::fs::create_dir_all(&nm).unwrap();
         std::fs::write(nm.join("pkg.js"), "console.log('hi')").unwrap();
+        std::fs::write(base.join("project_a").join("package.json"), "{}").unwrap();
 
-        // 创建 project_b/.venv 结构
+        // 创建 project_b/.venv 结构（含 inside pyvenv.cfg 守卫标记）
         let venv = base.join("project_b").join(".venv");
         std::fs::create_dir_all(&venv).unwrap();
         std::fs::write(venv.join("pyvenv.cfg"), "home = /usr").unwrap();
@@ -691,10 +693,11 @@ mod tests {
         let tmp = tempdir().unwrap();
         let base = tmp.path();
 
-        // 创建一个 node_modules 目录
+        // 创建一个 node_modules 目录（含 sibling package.json 守卫标记）
         let nm = base.join("myproject").join("node_modules");
         std::fs::create_dir_all(&nm).unwrap();
         std::fs::write(nm.join("index.js"), "module.exports = {}").unwrap();
+        std::fs::write(base.join("myproject").join("package.json"), "{}").unwrap();
 
         let (reporter, events) = TestReporter::new();
         Scanner::scan_purge(base, &reporter).unwrap();
@@ -862,11 +865,12 @@ mod tests {
         let tmp = tempdir().unwrap();
         let base = tmp.path();
 
-        // 创建 node_modules 内部嵌套 node_modules
+        // 创建 node_modules 内部嵌套 node_modules（proj 含 package.json 守卫标记）
         let outer_nm = base.join("proj").join("node_modules");
         let inner_nm = outer_nm.join("some_pkg").join("node_modules");
         std::fs::create_dir_all(&inner_nm).unwrap();
         std::fs::write(inner_nm.join("nested.js"), "x").unwrap();
+        std::fs::write(base.join("proj").join("package.json"), "{}").unwrap();
 
         let (reporter, _events) = TestReporter::new();
         let result = Scanner::scan_purge(base, &reporter).unwrap();
@@ -907,10 +911,11 @@ mod tests {
         std::fs::create_dir_all(&real_dir).unwrap();
         std::fs::write(real_dir.join("data.bin"), vec![0u8; 1000]).unwrap();
 
-        // 创建一个伪 node_modules 内有符号链接指向 real 目录
+        // 创建一个伪 node_modules 内有符号链接指向 real 目录（project 含 package.json 守卫标记）
         let nm = base.join("project").join("node_modules");
         std::fs::create_dir_all(&nm).unwrap();
         std::fs::write(nm.join("small.js"), "x").unwrap();
+        std::fs::write(base.join("project").join("package.json"), "{}").unwrap();
 
         // 创建符号链接 node_modules/linked -> real
         #[cfg(unix)]
@@ -977,5 +982,45 @@ mod tests {
             target_items[0].path.starts_with(&proj_a),
             "匹配的 target 应在 rust_proj 下"
         );
+    }
+
+    #[test]
+    fn test_dirname_root_guards_sibling_and_inside() {
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+
+        // build：sibling package.json 才匹配（防 electron-builder build/ 等误删）
+        let js = base.join("js_proj");
+        std::fs::create_dir_all(js.join("build")).unwrap();
+        std::fs::write(js.join("build").join("a.js"), "x").unwrap();
+        std::fs::write(js.join("package.json"), "{}").unwrap();
+        let data = base.join("data_dir"); // 无 package.json 的 build 不应匹配
+        std::fs::create_dir_all(data.join("build")).unwrap();
+        std::fs::write(data.join("build").join("photo.raw"), "x").unwrap();
+
+        // venv：inside pyvenv.cfg 才匹配
+        let py = base.join("py_proj");
+        std::fs::create_dir_all(py.join("venv")).unwrap();
+        std::fs::write(py.join("venv").join("pyvenv.cfg"), "home = /usr").unwrap();
+        let py2 = base.join("py_proj2"); // 无 pyvenv.cfg 的 venv 不应匹配
+        std::fs::create_dir_all(py2.join("venv")).unwrap();
+        std::fs::write(py2.join("venv").join("note.txt"), "x").unwrap();
+
+        let (reporter, _events) = TestReporter::new();
+        let result = Scanner::scan_purge(base, &reporter).unwrap();
+        let matched: Vec<&PathBuf> = result
+            .categories
+            .iter()
+            .flat_map(|c| c.items.iter())
+            .map(|i| &i.path)
+            .collect();
+
+        let build_hits: Vec<_> = matched.iter().filter(|p| p.ends_with("build")).collect();
+        assert_eq!(build_hits.len(), 1, "只有含 package.json 的 build 应匹配");
+        assert!(build_hits[0].starts_with(&js));
+
+        let venv_hits: Vec<_> = matched.iter().filter(|p| p.ends_with("venv")).collect();
+        assert_eq!(venv_hits.len(), 1, "只有含 pyvenv.cfg 的 venv 应匹配");
+        assert!(venv_hits[0].starts_with(&py));
     }
 }
