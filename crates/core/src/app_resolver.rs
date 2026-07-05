@@ -24,7 +24,8 @@ const LEFTOVER_SUBDIRS: &[&str] = &[
 ];
 
 /// 可能存放不可再生用户数据的残留子目录（数据库、IndexedDB/localStorage、存档等）。
-/// 卸载惯例仍默认勾选这些项以彻底移除应用，但必须给出非空证据文案——避免"看不到依据却默认删"。
+/// 这些项标 `Moderate` + 不默认预选（issue #25 方案 B，详见 `find_leftovers` D3 注释）：
+/// 可能含数据但移废纸篓可逆，故既不静默默认删、也不逐个 type-to-confirm 告警。
 const USER_DATA_SUBDIRS: &[&str] = &[
     "Application Support",
     "WebKit",
@@ -273,18 +274,27 @@ impl AppResolver {
                         }
                         Err(_) => 0,
                     };
-                    // D3：Application Support / WebKit / HTTPStorages / Saved Application State
-                    // 可能存放应用的主用户数据（数据库、IndexedDB/localStorage、存档等）。保持默认
-                    // 勾选（符合卸载器"彻底移除"惯例），但必须给出非空证据文案，避免"看不到依据却默认删"。
-                    // 其余残留（Caches/Preferences/Logs 等）无附加文案。
-                    let item = ScanItem::new(path, size, SafetyLevel::Safe, format!("应用残留 ({subdir})"));
+                    // D3（issue #25 方案 B）：Application Support / WebKit / HTTPStorages /
+                    // Saved Application State 可能存放应用的主用户数据（数据库、IndexedDB/
+                    // localStorage、存档等），但移废纸篓可恢复。取舍：
+                    //   - 不标 Safe + 默认勾选——"可能丢不可再生数据却静默默认删"违反无静默删除原则；
+                    //   - 也不标 Risky——残留能从废纸篓找回，逐个 type-to-confirm 属 cry wolf、太烦。
+                    // 故标 Moderate + preselect=false：不过度告警、不默认删，用户想删按键勾上即可
+                    //（selected = safety != Risky && preselect，Moderate+false 即"不预选、可手动勾、
+                    // 无需 type-to-confirm"）。
+                    // 模型 nuance：Moderate 原义是"零数据丢失 + 重建摩擦"；此处是"可能丢数据但可逆"，
+                    // 属两判据决策树对"不确定含数据、但可逆"这一格的留白，借 Moderate 这一格承载。
+                    // 保留原证据文案。其余残留（Caches/Preferences/Logs 等）是明确可再生产物，
+                    // 仍 Safe + 默认预选。
                     let item = if USER_DATA_SUBDIRS.contains(subdir) {
-                        item.with_evidence(
-                            "可能含应用数据（数据库、缓存的文档/草稿、存档等）".to_string(),
-                            "默认移入废纸篓可找回；清空废纸篓或 --permanent 后不可恢复".to_string(),
-                        )
+                        ScanItem::new(path, size, SafetyLevel::Moderate, format!("应用残留 ({subdir})"))
+                            .with_evidence(
+                                "可能含应用数据（数据库、缓存的文档/草稿、存档等）".to_string(),
+                                "默认移入废纸篓可找回；清空废纸篓或 --permanent 后不可恢复".to_string(),
+                            )
+                            .with_preselect(false)
                     } else {
-                        item
+                        ScanItem::new(path, size, SafetyLevel::Safe, format!("应用残留 ({subdir})"))
                     };
                     leftovers.push(item);
                 }
@@ -527,17 +537,39 @@ mod tests {
     }
 
     #[test]
-    fn test_all_leftovers_marked_safe() {
-        // 对一个存在的应用搜索残留，确认全部标记为 Safe
-        // 使用 com.apple.Safari 因为几乎所有 Mac 都有
+    fn test_user_data_leftovers_moderate_others_safe() {
+        // issue #25 方案 B：USER_DATA_SUBDIRS 派生的残留（Application Support / WebKit /
+        // HTTPStorages / Saved Application State）应为 Moderate + 未预选 + 非空证据文案；
+        // 其余残留（Caches/Preferences/Logs 等）仍为 Safe。
+        // 用 com.apple.Safari，因为几乎所有 Mac 都有。
+        // 注意：真实 ~/Library 子目录可能不含该 bundle 的残留 → leftovers 为空，
+        // 此时循环不执行即通过，属稳健行为（不因环境无残留而误判）。
         let leftovers = AppResolver::find_leftovers("com.apple.Safari");
         for item in &leftovers {
-            assert_eq!(
-                item.safety,
-                SafetyLevel::Safe,
-                "所有残留项应标记为 Safe: {:?}",
-                item.path
-            );
+            let is_user_data = USER_DATA_SUBDIRS
+                .iter()
+                .any(|sub| item.category.contains(sub));
+            if is_user_data {
+                assert_eq!(
+                    item.safety,
+                    SafetyLevel::Moderate,
+                    "用户数据残留应为 Moderate: {:?}",
+                    item.path
+                );
+                assert!(!item.selected, "用户数据残留不应默认预选: {:?}", item.path);
+                assert!(
+                    !item.impact.is_empty() && !item.recovery.is_empty(),
+                    "用户数据残留应有非空证据文案: {:?}",
+                    item.path
+                );
+            } else {
+                assert_eq!(
+                    item.safety,
+                    SafetyLevel::Safe,
+                    "其余残留应为 Safe: {:?}",
+                    item.path
+                );
+            }
         }
     }
 }
