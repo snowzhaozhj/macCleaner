@@ -13,7 +13,7 @@ use mc_core::models::{ScanResult, SafetyLevel};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::widgets::{Block, Borders, List, ListItem};
 use ratatui::Frame;
 
 /// 渲染扁平分类/文件列表到指定区域（扫描页与结果页共用，确保切换无差异）。
@@ -40,34 +40,47 @@ pub fn render_flat_list(f: &mut Frame, app: &App, area: Rect, title: &str) {
         f.render_widget(placeholder, area);
         return;
     }
-    // 复刻 ratatui ListState(offset=0) 的默认滚动：光标在第一屏时顶到 0，
-    // 超出时置于窗口末行。每帧从 cursor 计算，无独立滚动状态。
+    // 视口优化（plan 009 U4）：只为可见行构建 ListItem，从 O(total) 降到 O(visible)。
+    // 对齐 analyzer 的 render_children_list（Issue #4 同款）——扫描期发现项可达上千，
+    // 每帧对全部行建带样式的 ListItem 是主线程重复浪费。滚动逻辑复刻 ratatui
+    // ListState(offset=0) 的默认行为：光标第一屏顶到 0、超出则置于窗口末行，无用户可感知变化。
+    let total = flat_rows.len();
+    // 防御性 clamp（对齐 analyzer.rs 的 render_children_list）：当前 result_cursor 的唯一收缩来源
+    // 是过滤，且各 filter 编辑处都已调 clamp_result_cursor，故 total>0 时恒不越界；此处再兜一层，
+    // 让未来任何"渲染前收缩 flat_rows 却漏 clamp"的路径也只滑动窗口、不显示空白。
+    let cursor = app.result_cursor.min(total.saturating_sub(1));
     let visible_height = (area.height as usize).saturating_sub(2);
-    let scroll_offset = if visible_height > 0 && app.result_cursor >= visible_height {
-        app.result_cursor + 1 - visible_height
+    let (window_start, window_end) = if visible_height == 0 {
+        (0, 0)
     } else {
-        0
+        let start = if cursor >= visible_height {
+            cursor + 1 - visible_height
+        } else {
+            0
+        };
+        (start, (start + visible_height).min(total))
     };
 
-    let items: Vec<ListItem> = flat_rows
-        .iter()
-        .enumerate()
-        .map(|(idx, row)| flat_row_item(app, result, row, idx == app.result_cursor))
+    // 仅构建可见区间的行；is_cursor 用**绝对**索引判断（cursor 是全局坐标）。
+    // 越界一律走 .get() 降为跳过，防御流式重排下的 TOCTOU。
+    let items: Vec<ListItem> = (window_start..window_end)
+        .filter_map(|idx| {
+            flat_rows
+                .get(idx)
+                .map(|row| flat_row_item(app, result, row, idx == cursor))
+        })
         .collect();
 
+    // 窗口内行已自带光标高亮，用普通 List（offset=0）渲染即可，不再需要 ListState 偏移。
     let list = List::new(items).block(
         Block::default()
             .title(title.to_string())
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::accent())),
     );
+    f.render_widget(list, area);
 
-    let mut state = ListState::default();
-    state.select(Some(app.result_cursor));
-    *state.offset_mut() = scroll_offset;
-    f.render_stateful_widget(list, area, &mut state);
-
-    chrome::render_scrollbar(f, area, flat_rows.len(), app.result_cursor);
+    chrome::render_scrollbar(f, area, total, cursor);
 }
 
 /// 一个分类的主导安全等级：含危险则危险；全安全则安全；否则中等。
