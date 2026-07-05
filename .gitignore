@@ -3,6 +3,9 @@
 *.swp
 *.swo
 .agents/
-/target
 .idea/
-.claude/
+
+# .claude 纳入版本管理（共享 hooks / settings / CE 工作流配置）；仅忽略个人与本地生成物
+.claude/worktrees/
+.claude/skills/
+.claude/settings.local.json
