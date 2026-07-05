@@ -187,30 +187,49 @@ mod tests {
 
     #[test]
     fn purge_rules_safety_levels() {
-        let rules = purge_rules();
-        let moderate_rules = [
+        // 按 rubric 重评级：项目本地产物为 Moderate，可能丢数据/状态的为 Risky，其余（含所有下载缓存）为 Safe。
+        let moderate = [
+            "node_modules",
+            "Rust target",
+            "Python venv",
             "dist/build",
-            "Docker Desktop Data",
-            "Maven Repository",
-            "Xcode Archives",
-            "Android AVD/SDK",
+            "DerivedData",
+            "Pods",
         ];
-        for rule in &rules {
-            if moderate_rules.contains(&rule.name.as_str()) {
-                assert_eq!(
-                    rule.safety,
-                    SafetyLevel::Moderate,
-                    "'{}' 应为 Moderate",
-                    rule.name
-                );
+        let risky = ["Docker Desktop Data", "Xcode Archives", "Android AVD"];
+        for rule in &purge_rules() {
+            let name = rule.name.as_str();
+            let expected = if moderate.contains(&name) {
+                SafetyLevel::Moderate
+            } else if risky.contains(&name) {
+                SafetyLevel::Risky
             } else {
-                assert_eq!(
-                    rule.safety,
-                    SafetyLevel::Safe,
-                    "'{}' 应为 Safe",
-                    rule.name
-                );
-            }
+                SafetyLevel::Safe
+            };
+            assert_eq!(rule.safety, expected, "'{name}' 分级不符 rubric");
+        }
+    }
+
+    #[test]
+    fn all_download_caches_are_safe() {
+        // 跨语言一致性：所有下载/共享缓存必须同为 Safe（含 Maven，历史上曾被误标 Moderate）。
+        let caches = [
+            "Maven Repository",
+            "Homebrew Cache",
+            "Go Module Cache",
+            "Cargo Cache",
+            "npm/pnpm/yarn Cache",
+            "pip Cache",
+            "JetBrains Cache",
+            "Gradle Cache",
+        ];
+        let rules = purge_rules();
+        for name in &caches {
+            let rule = rules
+                .iter()
+                .find(|r| r.name == *name)
+                .unwrap_or_else(|| panic!("缺少缓存规则: {name}"));
+            assert_eq!(rule.safety, SafetyLevel::Safe, "下载缓存 '{name}' 应为 Safe");
         }
     }
 
@@ -227,11 +246,79 @@ mod tests {
             "npm/pnpm/yarn Cache",
             "pip Cache",
             "Xcode Archives",
-            "Android AVD/SDK",
+            "Android AVD",
+            "Android SDK Temp",
+            "Gradle Cache",
             "JetBrains Cache",
         ];
         for name in &expected {
             assert!(names.contains(name), "缺少规则: {name}");
+        }
+    }
+
+    #[test]
+    fn android_avd_sdk_split(/* R4 */) {
+        let rules = purge_rules();
+        let avd = rules.iter().find(|r| r.name == "Android AVD").expect("缺少 Android AVD");
+        let sdk = rules.iter().find(|r| r.name == "Android SDK Temp").expect("缺少 Android SDK Temp");
+        assert_eq!(avd.safety, SafetyLevel::Risky, "AVD 应为 Risky");
+        assert_eq!(sdk.safety, SafetyLevel::Safe, "SDK 临时文件应为 Safe");
+    }
+
+    #[test]
+    fn all_rules_evidence_non_empty(/* R6 */) {
+        for rule in all_rules() {
+            assert!(!rule.impact.trim().is_empty(), "规则 '{}' impact 不能为空", rule.name);
+            assert!(!rule.recovery.trim().is_empty(), "规则 '{}' recovery 不能为空", rule.name);
+        }
+    }
+
+    #[test]
+    fn gradle_narrowed_to_caches(/* D1 */) {
+        // .gradle 必须窄化为 exact ~/.gradle/caches，不能整树 dir_name 匹配（否则删签名密钥/配置）。
+        for rule in all_rules() {
+            for p in &rule.patterns {
+                if let PathPattern::DirName(name) = p {
+                    assert_ne!(name, ".gradle", "不应存在 dir_name '.gradle' 整树规则");
+                }
+            }
+        }
+        let gradle = purge_rules()
+            .into_iter()
+            .find(|r| r.name == "Gradle Cache")
+            .expect("缺少 Gradle Cache 规则");
+        let ok = gradle.patterns.iter().any(|p| {
+            matches!(p, PathPattern::Exact(path) if path.ends_with("caches") && path.to_string_lossy().contains(".gradle"))
+        });
+        assert!(ok, "Gradle Cache 应精确匹配 ~/.gradle/caches");
+    }
+
+    #[test]
+    fn dist_build_not_preselected(/* D2 */) {
+        for rule in purge_rules() {
+            if rule.name == "dist/build" {
+                assert!(!rule.preselect, "dist/build 应默认不勾选");
+            } else {
+                assert!(rule.preselect, "'{}' 应默认勾选", rule.name);
+            }
+        }
+    }
+
+    #[test]
+    fn dirname_rules_have_guards(/* R5 */) {
+        // 除 __pycache__ 外，每条 dir_name 规则都必须配置项目根守卫。
+        for rule in all_rules() {
+            let has_dirname = rule
+                .patterns
+                .iter()
+                .any(|p| matches!(p, PathPattern::DirName(_)));
+            if has_dirname && rule.name != "__pycache__" {
+                assert!(
+                    !rule.root_markers.is_empty(),
+                    "dir_name 规则 '{}' 必须配置 root_markers",
+                    rule.name
+                );
+            }
         }
     }
 
@@ -248,7 +335,7 @@ mod tests {
                 "npm/pnpm/yarn Cache" => assert_eq!(rule.category, "Node.js"),
                 "pip Cache" => assert_eq!(rule.category, "Python"),
                 "Xcode Archives" => assert_eq!(rule.category, "Xcode"),
-                "Android AVD/SDK" => assert_eq!(rule.category, "Android"),
+                "Android AVD" | "Android SDK Temp" => assert_eq!(rule.category, "Android"),
                 "JetBrains Cache" => assert_eq!(rule.category, "JetBrains"),
                 _ => {}
             }
