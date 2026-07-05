@@ -1,9 +1,10 @@
 # 开发产物清理规则
 #
-# 安全分级 rubric（判据："删了会不会丢不可再生的东西"）：
-#   Safe     —— 零数据丢失，自动/按需透明补回（共享/下载缓存）
-#   Moderate —— 零数据丢失，但需用户手动重装/重建一个项目（项目本地依赖/构建产物）
-#   Risky    —— 可能丢失不可再生数据/有价值状态，默认不勾选、删除额外确认
+# 安全分级 rubric（两条判据串联：先数据丢失，再重建摩擦——非单轴）：
+#   Risky    —— 会丢不可再生数据/有价值状态；默认不勾选、删除额外确认
+#   否则再看重建摩擦（Safe 与 Moderate 都是零数据丢失，靠这条区分）：
+#   Safe     —— 自动/按需透明补回、无需用户主动动作（共享/下载缓存）
+#   Moderate —— 需用户主动重装/重建一个项目、有明显耗时/打断（项目本地依赖/构建产物）
 #
 # 字段：safety / impact（删了会怎样）/ recovery（如何恢复）/ preselect（默认 true）
 # pattern：{ exact = "相对 $HOME" } | { absolute = "绝对路径" } | { dir_name = "目录名" }
@@ -74,8 +75,8 @@ name = "DerivedData"
 description = "Xcode 构建缓存"
 category = "Xcode"
 safety = "Moderate"
-impact = "Xcode 项目构建缓存被清空，下次构建为全量冷编译、较慢"
-recovery = "无需操作，Xcode 下次构建自动重建"
+impact = "Xcode 项目构建缓存被清空，下次构建为全量冷编译、耗时较长"
+recovery = "在 Xcode 重新构建项目（Cmd+B），首次为全量冷编译"
 patterns = [{ exact = "Library/Developer/Xcode/DerivedData" }]
 
 [[rules]]
