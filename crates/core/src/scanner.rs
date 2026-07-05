@@ -729,6 +729,70 @@ mod tests {
     }
 
     #[test]
+    fn scan_clean_streams_multiple_categories_under_one_root() {
+        // 根规则 + 最长前缀子规则：两个分类都以 path=root.path 流式 emit Found。
+        // 验证 TUI 侧按 (category, path) 合并时不会把不同分类混淆，各自求和独立正确。
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("cache");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // 直接位于 root 下的文件归"根缓存"；位于 sub 下的归"子缓存"。
+        // 总数 >200 触发遍历途中的增量 flush。
+        let mut root_expected: u64 = 0;
+        for i in 0..150u32 {
+            let content = format!("root-{i}-xx");
+            root_expected += content.len() as u64;
+            std::fs::write(root.join(format!("r{i}.bin")), content).unwrap();
+        }
+        let mut sub_expected: u64 = 0;
+        for i in 0..100u32 {
+            let content = format!("sub-{i}-payload-longer");
+            sub_expected += content.len() as u64;
+            std::fs::write(sub.join(format!("s{i}.bin")), content).unwrap();
+        }
+
+        let rules = vec![
+            CleanRule {
+                name: "root".into(),
+                description: String::new(),
+                patterns: vec![PathPattern::Exact(root.clone())],
+                safety: SafetyLevel::Safe,
+                category: "根缓存".into(),
+            },
+            CleanRule {
+                name: "sub".into(),
+                description: String::new(),
+                patterns: vec![PathPattern::Exact(sub.clone())],
+                safety: SafetyLevel::Moderate,
+                category: "子缓存".into(),
+            },
+        ];
+
+        let found = Arc::new(Mutex::new(HashMap::new()));
+        let found_events = Arc::new(Mutex::new(0usize));
+        let reporter = SizeReporter {
+            found: found.clone(),
+            found_events: found_events.clone(),
+        };
+
+        let result = Scanner::scan_with_rules(&rules, &reporter).unwrap();
+
+        let found = found.lock().unwrap();
+        assert_eq!(
+            found.get("根缓存").copied().unwrap_or(0),
+            root_expected,
+            "根分类流式 delta 求和应等于其真实大小（不被子分类污染）"
+        );
+        assert_eq!(
+            found.get("子缓存").copied().unwrap_or(0),
+            sub_expected,
+            "子分类流式 delta 求和应等于其真实大小（最长前缀归类）"
+        );
+        assert_eq!(result.total_size, root_expected + sub_expected);
+    }
+
+    #[test]
     fn test_scan_purge_does_not_descend_into_matched_dirs() {
         let tmp = tempdir().unwrap();
         let base = tmp.path();

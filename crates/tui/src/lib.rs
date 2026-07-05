@@ -850,7 +850,8 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
                 if let Some(ref mut result) = app.scan_result {
                     result.total_size = result.categories.iter().map(|c| c.total_size).sum();
                     result.file_count = result.categories.iter().map(|c| c.file_count).sum();
-                    result.categories.sort_by(|a, b| a.name.cmp(&b.name));
+                    // 不再 sort_by(name) 重排底层 vec：display 顺序由 build_flat_rows 决定，
+                    // 重排会打乱 expanded/marked 的按 cat_idx 对齐，造成完成瞬间展开态跳变。
                 }
                 app.init_results();
                 app.state = AppState::Results;

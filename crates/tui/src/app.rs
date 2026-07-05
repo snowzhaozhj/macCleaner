@@ -75,7 +75,6 @@ pub struct App {
     pub menu_index: usize,
 
     // 结果页状态
-    pub result_scroll: usize,
     pub result_cursor: usize,
     /// 每个 category 的展开状态
     pub expanded: Vec<bool>,
@@ -114,7 +113,6 @@ impl App {
             clean_report: None,
             should_quit: false,
             menu_index: 0,
-            result_scroll: 0,
             result_cursor: 0,
             expanded: Vec::new(),
             purge_path: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
@@ -145,9 +143,8 @@ impl App {
 
         let query = self.filter_query.to_lowercase();
         let filtering = !query.is_empty();
-        // 扫描中按发现(插入)顺序稳定排列；仅在扫描完成的 Results 页才按大小降序。
-        // 否则扫描时各分类 total_size 不断增长会每帧重排，导致行位置来回跳(跳变)。
-        let scanning = matches!(self.state, AppState::Scanning { .. });
+        // 分类顺序始终按发现(插入)顺序稳定排列：扫描中不因各分类 size 增长而逐帧重排
+        // (跳变)，扫描完成切到 Results 时顺序、展开态、光标全都不变——消除完成瞬间的跳变。
         let safety_order = [SafetyLevel::Safe, SafetyLevel::Moderate, SafetyLevel::Risky];
 
         let mut rows = Vec::new();
@@ -164,16 +161,8 @@ impl App {
                 continue;
             }
 
-            if scanning {
-                // 稳定：按分类发现(插入)顺序，扫描中不随大小重排
-                indices.sort_unstable();
-            } else {
-                indices.sort_by(|&a, &b| {
-                    result.categories[b]
-                        .total_size
-                        .cmp(&result.categories[a].total_size)
-                });
-            }
+            // 按分类发现(插入)顺序，扫描前后一致
+            indices.sort_unstable();
 
             // 先构建该分区的行；过滤时跳过无匹配分类，最终无行则连 Separator 一起跳过
             let mut level_rows = Vec::new();
@@ -268,12 +257,15 @@ impl App {
             .map(|i| i.path.clone())
             .collect();
 
-        self.expanded = vec![false; cat_count];
-        self.result_cursor = 0;
-        self.result_scroll = 0;
         self.marked = safe_paths;
-        // 跳过开头的 Separator
+
+        // 保留扫描期间的展开态/光标，避免扫描完成瞬间"展开态跳变、列表回弹"。
+        // resize 仅防御（Found 处理已维持 expanded.len()==categories.len() 不变式）。
+        self.expanded.resize(cat_count, false);
         let rows = self.build_flat_rows();
+        if !rows.is_empty() && self.result_cursor >= rows.len() {
+            self.result_cursor = rows.len() - 1;
+        }
         self.skip_separator_forward(&rows);
     }
 
@@ -487,7 +479,6 @@ impl App {
         self.clean_report = None;
         self.expanded.clear();
         self.result_cursor = 0;
-        self.result_scroll = 0;
         self.filter_active = false;
         self.filter_query.clear();
         self.marked.clear();
