@@ -973,10 +973,20 @@ fn spawn_trash_thread(items: Vec<(PathBuf, u64)>, events: &EventHandler) {
             .collect();
         let refs: Vec<&ScanItem> = scan_items.iter().collect();
 
-        match Engine::clean(&refs, DeleteMode::Trash, &reporter) {
-            Ok(_report) => {}
-            Err(e) => {
+        // 与四条扫描线程一致，用 catch_unwind 包裹删除，确保 panic 也回发 Error。
+        // 否则 Cleaner::execute 恒返回 Ok 使 panic 成为唯一失败出口，一旦 panic，
+        // 主线程收不到 CleaningDone/Error，而 Cleaning 态屏蔽除 Ctrl+C 外全部按键 → 卡死
+        // （经分析器删除路径触发时还会连带丢失暂存的整棵树）。Error 分支在 Cleaning 态会转 Done 解卡。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Engine::clean(&refs, DeleteMode::Trash, &reporter)
+        }));
+        match result {
+            Ok(Ok(_report)) => {}
+            Ok(Err(e)) => {
                 reporter.on_event(ProgressEvent::Error(e.to_string()));
+            }
+            Err(_) => {
+                reporter.on_event(ProgressEvent::Error("删除线程内部错误（panic）".into()));
             }
         }
     });
@@ -1068,11 +1078,20 @@ fn restore_analyzer_after_delete(
     // 界面显示的用量与磁盘保持一致，用户仍能看到并重试。
     let failed = deleted.len().saturating_sub(deleted_paths.len());
     let deleted_set: HashSet<PathBuf> = deleted_paths.iter().cloned().collect();
+    // 剪枝前记录 nav_path 各层目标的路径快照：剪枝后按**路径**（而非裸索引）恢复导航，
+    // 避免删除某祖先层靠前兄弟致索引左移后 nav_path 静默指向另一目录。
+    let nav_target_paths = nav_path_target_paths(&tree, &nav_path);
     let mut tree = tree;
     {
         let root = Arc::make_mut(&mut tree);
         prune_paths(root, &deleted_set);
-        clamp_nav_after_prune(root, &mut nav_path, &mut cursor, &mut cursor_stack);
+        clamp_nav_after_prune(
+            root,
+            &nav_target_paths,
+            &mut nav_path,
+            &mut cursor,
+            &mut cursor_stack,
+        );
     }
     app.state = AppState::Analyzing {
         tree_root: tree,
@@ -1109,25 +1128,48 @@ fn prune_paths(node: &mut DirNode, deleted: &HashSet<PathBuf>) {
     }
 }
 
-/// 剪枝后校正导航：截断指向已删/越界目录的 `nav_path`，并把 cursor 夹回当前层范围。
+/// 剪枝前沿 `nav_path` 逐层解析出每一层目标目录的路径快照，供剪枝后按路径恢复导航。
+fn nav_path_target_paths(root: &DirNode, nav_path: &[usize]) -> Vec<PathBuf> {
+    let mut node = root;
+    let mut paths = Vec::with_capacity(nav_path.len());
+    for &idx in nav_path {
+        match node.children.get(idx) {
+            Some(c) => {
+                paths.push(c.path.clone());
+                node = c;
+            }
+            None => break,
+        }
+    }
+    paths
+}
+
+/// 剪枝后校正导航：按剪枝前记录的**路径**逐层重新定位索引（而非沿用可能左移的裸索引），
+/// 某层目标已删或不再是目录则在该层截断，最后把 cursor 夹回当前层范围。
 fn clamp_nav_after_prune(
     root: &DirNode,
+    nav_target_paths: &[PathBuf],
     nav_path: &mut Vec<usize>,
     cursor: &mut usize,
     cursor_stack: &mut Vec<usize>,
 ) {
     let mut node = root;
-    let mut valid = 0usize;
-    for &idx in nav_path.iter() {
-        match node.children.get(idx) {
-            Some(c) if !c.is_file => {
-                node = c;
-                valid += 1;
+    let mut new_nav = Vec::with_capacity(nav_target_paths.len());
+    for target in nav_target_paths {
+        match node
+            .children
+            .iter()
+            .position(|c| !c.is_file && &c.path == target)
+        {
+            Some(idx) => {
+                new_nav.push(idx);
+                node = &node.children[idx];
             }
-            _ => break,
+            None => break,
         }
     }
-    nav_path.truncate(valid);
+    let valid = new_nav.len();
+    *nav_path = new_nav;
     cursor_stack.truncate(valid);
     let current = resolve_nav_node(root, nav_path);
     let len = current.children.len();
@@ -1508,16 +1550,78 @@ mod tests {
     }
 
     #[test]
-    fn clamp_nav_truncates_invalid_path_and_clamps_cursor() {
-        // root 只有 1 个子项；nav_path 指向越界 index 5、cursor 越界 9
+    fn clamp_nav_truncates_when_target_dir_deleted_and_clamps_cursor() {
+        // root -> a(dir)；nav 指向 a。删除 a 后目标路径不再存在 → nav 应清空、cursor 夹回 0。
         let mut root = DirNode::new_dir(PathBuf::from("/r"), "r".into());
-        root.children.push(DirNode::new_file(PathBuf::from("/r/x"), "x".into(), 10));
-        let mut nav = vec![5];
+        root.children.push(DirNode::new_dir(PathBuf::from("/r/a"), "a".into()));
+        let nav_before = vec![0];
+        let targets = super::nav_path_target_paths(&root, &nav_before);
+
+        let mut deleted = HashSet::new();
+        deleted.insert(PathBuf::from("/r/a"));
+        super::prune_paths(&mut root, &deleted);
+
+        let mut nav = nav_before.clone();
         let mut cursor = 9;
-        let mut stack = vec![5];
-        super::clamp_nav_after_prune(&root, &mut nav, &mut cursor, &mut stack);
+        let mut stack = vec![0];
+        super::clamp_nav_after_prune(&root, &targets, &mut nav, &mut cursor, &mut stack);
         assert!(nav.is_empty());
         assert!(stack.is_empty());
         assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn clamp_nav_follows_target_by_path_after_earlier_sibling_removed() {
+        // root -> [a(dir), b(dir), c(dir)]；nav 指向 b(index 1)。
+        // 删除靠前兄弟 a 后 b 左移到 index 0；按裸索引会静默指向 c，按路径应仍锁定 b。
+        let mut root = DirNode::new_dir(PathBuf::from("/r"), "r".into());
+        for name in ["a", "b", "c"] {
+            root.children
+                .push(DirNode::new_dir(PathBuf::from(format!("/r/{name}")), name.into()));
+        }
+        let nav_before = vec![1]; // 指向 b
+        let targets = super::nav_path_target_paths(&root, &nav_before);
+
+        let mut deleted = HashSet::new();
+        deleted.insert(PathBuf::from("/r/a"));
+        super::prune_paths(&mut root, &deleted);
+
+        let mut nav = nav_before.clone();
+        let mut cursor = 0;
+        let mut stack = vec![1];
+        super::clamp_nav_after_prune(&root, &targets, &mut nav, &mut cursor, &mut stack);
+        // 索引已从 1 重映射到 0，且解析出的目标仍是 b（而非 c）。
+        assert_eq!(nav, vec![0]);
+        assert_eq!(super::resolve_nav_node(&root, &nav).path, PathBuf::from("/r/b"));
+    }
+
+    #[test]
+    fn request_leave_to_menu_two_step_confirm_when_marked() {
+        use super::{request_leave_to_menu, App, AppState};
+        let mut app = App::new();
+        app.state = AppState::Results;
+        app.marked.insert(PathBuf::from("/r/x"));
+        // 第一次按 q：有标记项 → 仅置 pending_leave + 提示，不离开。
+        request_leave_to_menu(&mut app, &mut None, &mut None, &mut None);
+        assert!(app.pending_leave);
+        assert!(matches!(app.state, AppState::Results));
+        assert!(app.status_message.is_some());
+        assert_eq!(app.marked.len(), 1);
+        // 第二次按 q：真正返回菜单并清空标记/提示。
+        request_leave_to_menu(&mut app, &mut None, &mut None, &mut None);
+        assert!(matches!(app.state, AppState::Menu));
+        assert!(app.marked.is_empty());
+        assert!(!app.pending_leave);
+    }
+
+    #[test]
+    fn request_leave_to_menu_immediate_when_no_marks() {
+        use super::{request_leave_to_menu, App, AppState};
+        let mut app = App::new();
+        app.state = AppState::Results;
+        // 无标记：一次按 q 即返回菜单，不进入二次确认。
+        request_leave_to_menu(&mut app, &mut None, &mut None, &mut None);
+        assert!(matches!(app.state, AppState::Menu));
+        assert!(!app.pending_leave);
     }
 }
