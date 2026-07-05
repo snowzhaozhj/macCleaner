@@ -9,11 +9,10 @@ use std::sync::Arc;
 pub enum AppState {
     /// 主菜单
     Menu,
-    /// 正在扫描
+    /// 正在扫描。已发现项数/总大小不在此冗余存储，直接由 `scan_result` 派生
+    /// （见 `ui::scan::render_scan_header`），避免两处计数需手动保持一致。
     Scanning {
         progress_text: String,
-        found_count: usize,
-        found_size: u64,
         rule_current: usize,
         rule_total: usize,
         rule_name: String,
@@ -75,7 +74,6 @@ pub struct App {
     pub menu_index: usize,
 
     // 结果页状态
-    pub result_scroll: usize,
     pub result_cursor: usize,
     /// 每个 category 的展开状态
     pub expanded: Vec<bool>,
@@ -95,6 +93,14 @@ pub struct App {
     pub marked: HashSet<PathBuf>,
     /// 删除确认覆盖层：Some 时弹出确认框，内含待删的 (路径, 大小) 清单
     pub confirm_delete: Option<Vec<(PathBuf, u64)>>,
+    /// 从磁盘分析器发起删除时暂存的树与导航状态；删除在后台线程完成后据此
+    /// **剪除已删节点并原地返回分析器**，而非拆树回菜单（修复"删除后莫名退出"）。
+    pub analyzer_return: Option<AnalyzerReturn>,
+    /// 瞬时状态提示（如"扫描中不可标记"），渲染在底部一行，下一次按键即清除。
+    pub status_message: Option<String>,
+    /// 沉没成本二次确认：存在已标记项时，第一次按 q 返回菜单只置位并提示，
+    /// 第二次按才真正放弃标记返回（对齐 dua 的 `pending_exit`，避免手滑丢标记）。
+    pub pending_leave: bool,
 }
 
 impl App {
@@ -106,7 +112,6 @@ impl App {
             clean_report: None,
             should_quit: false,
             menu_index: 0,
-            result_scroll: 0,
             result_cursor: 0,
             expanded: Vec::new(),
             purge_path: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
@@ -117,13 +122,16 @@ impl App {
             filter_query: String::new(),
             marked: HashSet::new(),
             confirm_delete: None,
+            analyzer_return: None,
+            status_message: None,
+            pending_leave: false,
         }
     }
 
     /// 构建扁平化的行列表，用于结果页渲染和交互
     ///
-    /// 按 `SafetyLevel` 分区（Safe → Moderate → Risky），组内按 `total_size` 降序排列。
-    /// 每个非空分区前插入一个 Separator 标题行。
+    /// 按 `SafetyLevel` 分区（Safe → Moderate → Risky），组内按分类发现(插入)顺序稳定排列
+    /// （扫描前后一致，避免完成瞬间重排跳变）。每个非空分区前插入一个 Separator 标题行。
     /// 当 `filter_query` 非空时：大小写不敏感子串匹配项名，强制展开分类只显示匹配项，
     /// 跳过无匹配的分类与分区。
     pub fn build_flat_rows(&self) -> Vec<FlatRow> {
@@ -134,27 +142,23 @@ impl App {
 
         let query = self.filter_query.to_lowercase();
         let filtering = !query.is_empty();
+        // 分类顺序始终按发现(插入)顺序稳定排列：扫描中不因各分类 size 增长而逐帧重排
+        // (跳变)，扫描完成切到 Results 时顺序、展开态、光标全都不变——消除完成瞬间的跳变。
         let safety_order = [SafetyLevel::Safe, SafetyLevel::Moderate, SafetyLevel::Risky];
+        // 每个分类的主导安全等级只算一次（此前在 3 个 safety 分区里各算一遍）。
+        let dominant: Vec<SafetyLevel> =
+            result.categories.iter().map(Self::dominant_safety).collect();
 
         let mut rows = Vec::new();
         for &level in &safety_order {
-            let mut indices: Vec<usize> = result
-                .categories
-                .iter()
-                .enumerate()
-                .filter(|(_, cat)| Self::dominant_safety(cat) == level)
-                .map(|(idx, _)| idx)
+            // (0..len).filter 天然升序，即发现(插入)顺序，无需再 sort。
+            let indices: Vec<usize> = (0..result.categories.len())
+                .filter(|&idx| dominant[idx] == level)
                 .collect();
 
             if indices.is_empty() {
                 continue;
             }
-
-            indices.sort_by(|&a, &b| {
-                result.categories[b]
-                    .total_size
-                    .cmp(&result.categories[a].total_size)
-            });
 
             // 先构建该分区的行；过滤时跳过无匹配分类，最终无行则连 Separator 一起跳过
             let mut level_rows = Vec::new();
@@ -249,12 +253,15 @@ impl App {
             .map(|i| i.path.clone())
             .collect();
 
-        self.expanded = vec![false; cat_count];
-        self.result_cursor = 0;
-        self.result_scroll = 0;
         self.marked = safe_paths;
-        // 跳过开头的 Separator
+
+        // 保留扫描期间的展开态/光标，避免扫描完成瞬间"展开态跳变、列表回弹"。
+        // resize 仅防御（Found 处理已维持 expanded.len()==categories.len() 不变式）。
+        self.expanded.resize(cat_count, false);
         let rows = self.build_flat_rows();
+        if !rows.is_empty() && self.result_cursor >= rows.len() {
+            self.result_cursor = rows.len() - 1;
+        }
         self.skip_separator_forward(&rows);
     }
 
@@ -468,12 +475,24 @@ impl App {
         self.clean_report = None;
         self.expanded.clear();
         self.result_cursor = 0;
-        self.result_scroll = 0;
         self.filter_active = false;
         self.filter_query.clear();
         self.marked.clear();
         self.confirm_delete = None;
+        self.analyzer_return = None;
+        self.status_message = None;
+        self.pending_leave = false;
     }
+}
+
+/// 分析器删除的返回上下文：删除在后台线程执行期间暂存整棵树与光标位置，
+/// 完成后剪除 `deleted` 中的路径、修正各层大小，再恢复到暂存的导航位置。
+pub struct AnalyzerReturn {
+    pub tree: Arc<DirNode>,
+    pub nav_path: Vec<usize>,
+    pub cursor: usize,
+    pub cursor_stack: Vec<usize>,
+    pub deleted: Vec<PathBuf>,
 }
 
 /// 扁平化的行类型，用于结果列表渲染

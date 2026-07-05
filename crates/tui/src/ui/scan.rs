@@ -2,185 +2,122 @@ use crate::app::{App, AppState};
 use crate::theme;
 use crate::ui::chrome;
 use humansize::{format_size, DECIMAL};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+/// 扫描列表边框标题（列表与空占位共用，避免漂移）
+const SCAN_LIST_TITLE: &str = " 已发现 (扫描中...) ";
+
 pub fn draw(f: &mut Frame, app: &App) {
-    // Analyze 模式不再经过 scan::draw()，直接由 mod.rs 分发到 analyzer::draw_live()
+    // Analyze 模式不再经过 scan::draw()，直接由 mod.rs 分发到 analyzer::draw_live()。
+    //
+    // 布局与 Analyze/Results 页统一——[header(3), 列表(Min), footer(1)]，扫描进度放在
+    // 顶部 header（与 Analyze 一致），扫描完成切到 Results 时 header/列表/footer 均不位移。
+    let [header_area, list_area, footer_area] = chrome::three_row_layout(f.area());
+
+    render_scan_header(f, app, header_area);
 
     let has_results = app
         .scan_result
         .as_ref()
         .is_some_and(|r| !r.categories.is_empty());
-
     if has_results {
-        draw_with_results(f, app);
+        crate::ui::rows::render_flat_list(f, app, list_area, SCAN_LIST_TITLE);
     } else {
-        draw_scanning_only(f, app);
+        render_scanning_placeholder(f, list_area);
     }
+
+    chrome::render_footer(f, footer_area, &crate::keymap::footer_line(&app.state));
 }
 
-fn draw_scanning_only(f: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(6),
-            Constraint::Length(3),
-        ])
-        .split(f.area());
-
-    render_title(f, app, chunks[0]);
-    render_progress(f, app, chunks[1]);
-
-    chrome::render_footer(f, chunks[2], &crate::keymap::footer_line(&app.state));
-}
-
-fn draw_with_results(f: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(5),
-            Constraint::Min(6),
-            Constraint::Length(3),
-        ])
-        .split(f.area());
-
-    render_title(f, app, chunks[0]);
-    render_progress(f, app, chunks[1]);
-    render_result_list(f, app, chunks[2]);
-
-    chrome::render_footer(f, chunks[3], &crate::keymap::footer_line(&app.state));
-}
-
-fn render_title(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+/// 顶部 header（与 Analyze 一致）：左侧 spinner + 当前扫描路径；右侧已发现项/大小/规则进度。
+fn render_scan_header(f: &mut Frame, app: &App, area: Rect) {
     let cmd_name = match app.active_command {
-        Some(crate::app::ActiveCommand::Clean) => "系统缓存扫描",
-        Some(crate::app::ActiveCommand::Purge) => "开发产物扫描",
-        Some(crate::app::ActiveCommand::Uninstall) => "应用扫描",
-        Some(crate::app::ActiveCommand::Analyze) => "磁盘分析",
-        None => "扫描",
+        Some(crate::app::ActiveCommand::Clean) => " 系统缓存扫描 ",
+        Some(crate::app::ActiveCommand::Purge) => " 开发产物扫描 ",
+        Some(crate::app::ActiveCommand::Uninstall) => " 应用扫描 ",
+        Some(crate::app::ActiveCommand::Analyze) => " 磁盘分析 ",
+        None => " 扫描 ",
     };
 
-    let title = Paragraph::new(format!(" {cmd_name} 中..."))
-        .style(
-            Style::default()
-                .fg(theme::c(Color::Yellow))
-                .add_modifier(Modifier::BOLD),
-        )
-        .block(Block::default().borders(Borders::ALL));
-    f.render_widget(title, area);
-}
-
-fn render_progress(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let (progress_text, found_count, found_size, rule_current, rule_total, rule_name) =
-        match &app.state {
-            AppState::Scanning {
-                progress_text,
-                found_count,
-                found_size,
-                rule_current,
-                rule_total,
-                rule_name,
-            } => (
-                progress_text.as_str(),
-                *found_count,
-                *found_size,
-                *rule_current,
-                *rule_total,
-                rule_name.as_str(),
-            ),
-            _ => return,
-        };
+    let (progress_text, rule_current, rule_total, rule_name) = match &app.state {
+        AppState::Scanning {
+            progress_text,
+            rule_current,
+            rule_total,
+            rule_name,
+        } => (
+            progress_text.as_str(),
+            *rule_current,
+            *rule_total,
+            rule_name.as_str(),
+        ),
+        _ => ("", 0, 0, ""),
+    };
+    // 已发现项数/总大小直接由 scan_result 派生，不再在 Scanning 态冗余存储。
+    let (found_count, found_size) = app
+        .scan_result
+        .as_ref()
+        .map_or((0, 0), |r| (r.file_count, r.total_size));
 
     let spinner = chrome::spinner(app.tick);
-
-    // 显示稳定的统计数字 + 顶层目录名（低频变化），不再显示快速闪烁的文件路径
-    let mut lines = vec![Line::from(vec![
+    let left = vec![
         Span::styled(
-            format!("  {spinner} "),
+            format!("{spinner} "),
             Style::default().fg(theme::c(Color::Yellow)),
         ),
+        Span::styled("扫描中: ", Style::default().fg(theme::c(Color::DarkGray))),
         Span::styled(
-            format!(
-                "已扫描 {} 个文件 | {} | {}",
-                found_count,
-                format_size(found_size, DECIMAL),
-                progress_text,
-            ),
+            progress_text.to_string(),
             Style::default().fg(theme::c(Color::White)),
-        ),
-    ])];
-
-    let mut info_spans = vec![
-        Span::styled("  已发现: ", Style::default().fg(theme::c(Color::DarkGray))),
-        Span::styled(
-            format!("{found_count} 个项目"),
-            Style::default().fg(theme::c(Color::Cyan)),
-        ),
-        Span::styled("  |  大小: ", Style::default().fg(theme::c(Color::DarkGray))),
-        Span::styled(
-            format_size(found_size, DECIMAL),
-            Style::default().fg(theme::c(Color::Green)),
         ),
     ];
 
+    let mut right = vec![
+        Span::styled("已发现 ", Style::default().fg(theme::c(Color::DarkGray))),
+        Span::styled(
+            format!("{found_count} 项"),
+            Style::default()
+                .fg(theme::c(Color::Cyan))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  |  ", Style::default().fg(theme::c(Color::DarkGray))),
+        Span::styled(
+            format_size(found_size, DECIMAL),
+            Style::default()
+                .fg(theme::c(Color::Green))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
     if rule_total > 0 {
-        info_spans.push(Span::styled(
+        right.push(Span::styled(
             format!("  |  [{rule_current}/{rule_total}] {rule_name}"),
             Style::default().fg(theme::c(Color::Yellow)),
         ));
     }
 
-    lines.push(Line::from(info_spans));
-
-    let info = Paragraph::new(lines).block(
-        Block::default()
-            .title(" 扫描进度 ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::c(Color::Yellow))),
-    );
-
-    f.render_widget(info, area);
+    chrome::render_header(f, area, cmd_name, left, right);
 }
 
-fn render_result_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let result = match app.scan_result.as_ref() {
-        Some(r) => r,
-        None => return,
-    };
-
-    let flat_rows = app.build_flat_rows();
-    let visible_height = area.height.saturating_sub(2) as usize;
-    let scroll_offset = if app.result_cursor >= app.result_scroll + visible_height {
-        app.result_cursor.saturating_sub(visible_height - 1)
-    } else if app.result_cursor < app.result_scroll {
-        app.result_cursor
-    } else {
-        app.result_scroll
-    };
-
-    let items: Vec<ListItem> = flat_rows
-        .iter()
-        .enumerate()
-        .map(|(idx, row)| crate::ui::rows::flat_row_item(app, result, row, idx == app.result_cursor, false))
-        .collect();
-
-    let list = List::new(items).block(
+/// 尚无结果时的列表占位（与结果列表同样的边框/位置，切换无跳变）。
+fn render_scanning_placeholder(f: &mut Frame, area: Rect) {
+    let para = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  正在扫描，请稍候…",
+            Style::default().fg(theme::c(Color::DarkGray)),
+        )),
+    ])
+    .block(
         Block::default()
-            .title(" 已发现 (扫描中...) ")
+            .title(SCAN_LIST_TITLE)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::c(Color::Cyan))),
     );
-
-    let mut state = ListState::default();
-    state.select(Some(app.result_cursor));
-    *state.offset_mut() = scroll_offset;
-    f.render_stateful_widget(list, area, &mut state);
+    f.render_widget(para, area);
 }
 
 pub fn draw_cleaning(f: &mut Frame, app: &App) {

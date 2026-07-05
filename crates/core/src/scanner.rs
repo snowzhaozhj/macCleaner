@@ -157,9 +157,24 @@ impl Scanner {
                     prefetch_metadata(children);
                 });
 
+            // 预计算本根下各 category 的 safety，用于流式上报 Found。
+            // 按 category 名索引依赖"同名分类 safety 唯一"这一不变式（clean/purge 规则表当前成立）；
+            // 若未来某分类在同根下映射到两种 safety，debug 构建会在此断言失败以提醒改用更精确的键。
+            let mut cat_safety: HashMap<String, SafetyLevel> = HashMap::new();
+            cat_safety.insert(root.category.clone(), root.safety);
+            for (_, s, c) in &root.children {
+                debug_assert!(
+                    cat_safety.get(c).is_none_or(|prev| *prev == *s),
+                    "分类 {c:?} 在同根下出现两种 safety，按名索引会丢失其一"
+                );
+                cat_safety.insert(c.clone(), *s);
+            }
+
             let mut batch_count: usize = 0;
-            // 每个规则的大小累加器：(category, size)
+            // 每个规则的大小累加器：(category, 累计 size)
             let mut size_by_category: HashMap<String, u64> = HashMap::new();
+            // 已流式上报的累计 size，用于计算增量（delta）
+            let mut emitted_by_category: HashMap<String, u64> = HashMap::new();
 
             for entry in walker {
                 let entry = match entry {
@@ -176,15 +191,6 @@ impl Scanner {
 
                 batch_count += 1;
 
-                if batch_count.is_multiple_of(200) {
-                    if reporter.is_cancelled() {
-                        break;
-                    }
-                    reporter.on_event(ProgressEvent::Scanning {
-                        path: path.clone(),
-                    });
-                }
-
                 // 最长前缀匹配：文件归入最具体的子规则，否则归入根规则
                 let (safety, category) = root
                     .children
@@ -196,27 +202,37 @@ impl Scanner {
 
                 *size_by_category.entry(category.clone()).or_insert(0) += size;
 
-                let item = ScanItem::new(path, size, safety, category);
+                let item = ScanItem::new(path.clone(), size, safety, category);
                 category_map
                     .entry(item.category.clone())
                     .or_default()
                     .push(item);
+
+                // 每 200 个文件流式上报一次各分类的增量，让 TUI 列表边扫边填充，
+                // 而不是等整个根目录遍历完才一次性出现（Clean 卡顿感的根因）。
+                if batch_count.is_multiple_of(200) {
+                    if reporter.is_cancelled() {
+                        break;
+                    }
+                    reporter.on_event(ProgressEvent::Scanning { path });
+                    flush_category_deltas(
+                        reporter,
+                        &root.path,
+                        &size_by_category,
+                        &mut emitted_by_category,
+                        &cat_safety,
+                    );
+                }
             }
 
-            // 为根路径下的每个 category 发送 Found 事件
-            for (category, total_size) in &size_by_category {
-                let safety = root
-                    .children
-                    .iter()
-                    .find(|(_, _, c)| c == category)
-                    .map_or(root.safety, |(_, s, _)| *s);
-                reporter.on_event(ProgressEvent::Found {
-                    category: category.clone(),
-                    path: root.path.clone(),
-                    size: *total_size,
-                    safety,
-                });
-            }
+            // 收尾：上报剩余增量（不足 200 的尾巴）
+            flush_category_deltas(
+                reporter,
+                &root.path,
+                &size_by_category,
+                &mut emitted_by_category,
+                &cat_safety,
+            );
         }
 
         let result = build_scan_result(category_map, reporter);
@@ -270,24 +286,31 @@ impl Scanner {
 
         let dir_size_pool = build_dir_size_pool();
 
+        // Exact 路径（如 Xcode DerivedData）体积可达数十 GB，其 dir_size 单个就要数秒。
+        // 在并行 map 内：开算前报 Scanning(当前路径)、算完报 Found，避免这段静默造成
+        // "扫描中: ~ + 长时间无反应"的冻结感。
         let exact_results: Vec<(PathBuf, u64, SafetyLevel, String)> =
             dir_size_pool.install(|| {
                 exact_entries
                     .par_iter()
                     .map(|(path, safety, category)| {
-                        let size = dir_size(path);
+                        if reporter.is_cancelled() {
+                            return (path.clone(), 0, *safety, category.clone());
+                        }
+                        reporter.on_event(ProgressEvent::Scanning { path: path.clone() });
+                        let size = dir_size(path, reporter);
+                        reporter.on_event(ProgressEvent::Found {
+                            category: category.clone(),
+                            path: path.clone(),
+                            size,
+                            safety: *safety,
+                        });
                         (path.clone(), size, *safety, category.clone())
                     })
                     .collect()
             });
 
         for (path, size, safety, category) in exact_results {
-            reporter.on_event(ProgressEvent::Found {
-                category: category.clone(),
-                path: path.clone(),
-                size,
-                safety,
-            });
             let item = ScanItem::new(path, size, safety, category.clone());
             category_map.entry(category).or_default().push(item);
         }
@@ -339,34 +362,51 @@ impl Scanner {
                 });
             });
 
-        // 快速遍历（剪枝后只触碰非匹配目录）
+        // 快速遍历（剪枝后只触碰非匹配目录）。
+        // 遍历整棵树可能耗时数秒——期间必须周期性上报当前目录，否则界面停在
+        // "已扫描 0 | 当前:空 + spinner" 看起来像卡死（对齐 Analyze 的实时反馈）。
+        let mut walked: u64 = 0;
         for entry in walker {
             if reporter.is_cancelled() {
                 break;
             }
-            let _ = entry;
+            if let Ok(e) = entry {
+                if e.file_type().is_dir() {
+                    walked += 1;
+                    if walked.is_multiple_of(48) {
+                        reporter.on_event(ProgressEvent::Scanning { path: e.path() });
+                    }
+                }
+            }
         }
 
-        // 并行计算各匹配目录的大小
+        // 并行计算各匹配目录的大小。这是 Purge 最耗时的相位（大目录可达上百秒）——
+        // 因此在并行 map 内**边算边流式 emit Found**，让 TUI 逐个填充列表、found 计数
+        // 实时增长，而非静默上百秒后一次性爆出（对齐 Analyze 的实时反馈）。
         let dirs = Arc::try_unwrap(matched_dirs).map_or_else(|arc| arc.lock().unwrap().clone(), |mutex| mutex.into_inner().unwrap_or_default());
 
         let dir_sizes: Vec<(PathBuf, u64, SafetyLevel, String)> =
             dir_size_pool.install(|| {
                 dirs.par_iter()
                     .map(|(path, safety, category)| {
-                        let size = dir_size(path);
+                        if reporter.is_cancelled() {
+                            return (path.clone(), 0, *safety, category.clone());
+                        }
+                        let size = dir_size(path, reporter);
+                        // 每算完一个目录立刻上报，供 TUI 增量渲染
+                        reporter.on_event(ProgressEvent::Found {
+                            category: category.clone(),
+                            path: path.clone(),
+                            size,
+                            safety: *safety,
+                        });
                         (path.clone(), size, *safety, category.clone())
                     })
                     .collect()
             });
 
+        // 汇总用于返回值（CLI 路径）；Found 已在并行阶段发过，此处不再重复 emit
         for (path, size, safety, category) in dir_sizes {
-            reporter.on_event(ProgressEvent::Found {
-                category: category.clone(),
-                path: path.clone(),
-                size,
-                safety,
-            });
             let item = ScanItem::new(path, size, safety, category.clone());
             category_map.entry(category).or_default().push(item);
         }
@@ -402,8 +442,43 @@ fn build_scan_result(
     result
 }
 
-/// 使用 jwalk 并行计算目录总大小
-fn dir_size(path: &Path) -> u64 {
+/// 上报各分类相对上次已报 size 的增量（delta），驱动 TUI 列表边扫边填充。
+/// TUI 侧对同一 `(category, path)` 的重复 `Found` 会合并累加，故此处发 delta 即可，
+/// 累加后各分类聚合项的大小与最终一次性上报完全一致。
+fn flush_category_deltas(
+    reporter: &dyn ProgressReporter,
+    root_path: &Path,
+    size_by_category: &HashMap<String, u64>,
+    emitted: &mut HashMap<String, u64>,
+    cat_safety: &HashMap<String, SafetyLevel>,
+) {
+    for (category, &cum) in size_by_category {
+        let last = emitted.get(category).copied();
+        // 已上报过且无新增（cum 单调不减，等于即无增量）则跳过；但**首次**出现即使当前
+        // 累计为 0 也上报一条 size=0 的 Found 建项，让"全零大小分类"也能出现在 TUI（与 CLI 一致）。
+        if last == Some(cum) {
+            continue;
+        }
+        let delta = cum - last.unwrap_or(0);
+        let safety = cat_safety
+            .get(category)
+            .copied()
+            .unwrap_or(SafetyLevel::Safe);
+        reporter.on_event(ProgressEvent::Found {
+            category: category.clone(),
+            path: root_path.to_path_buf(),
+            size: delta,
+            safety,
+        });
+        emitted.insert(category.clone(), cum);
+    }
+}
+
+/// 使用 jwalk 并行计算目录总大小。
+///
+/// 单个大目录（如 Docker/DerivedData 数十 GB）的遍历可达数秒~上百秒，故在消费循环里
+/// 每 1024 个 entry 检查一次取消：用户取消后尽快中止，不再空耗 CPU/IO 与新扫描抢占磁盘。
+fn dir_size(path: &Path, reporter: &dyn ProgressReporter) -> u64 {
     if !path.exists() {
         return 0;
     }
@@ -413,8 +488,13 @@ fn dir_size(path: &Path) -> u64 {
             prefetch_metadata(children);
         });
     let mut total: u64 = 0;
+    let mut seen: u64 = 0;
 
     for entry in walker.into_iter().flatten() {
+        seen += 1;
+        if seen.is_multiple_of(1024) && reporter.is_cancelled() {
+            break;
+        }
         if !entry.file_type().is_dir() {
             total += entry.client_state.unwrap_or(0);
         }
@@ -503,20 +583,20 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(sub.join("c.txt"), "1234567890").unwrap(); // 10 bytes
 
-        let size = dir_size(dir);
+        let size = dir_size(dir, &crate::progress::NoopReporter);
         assert_eq!(size, 21, "目录总大小应为 21 字节");
     }
 
     #[test]
     fn test_dir_size_empty_dir() {
         let tmp = tempdir().unwrap();
-        let size = dir_size(tmp.path());
+        let size = dir_size(tmp.path(), &crate::progress::NoopReporter);
         assert_eq!(size, 0, "空目录大小应为 0");
     }
 
     #[test]
     fn test_dir_size_nonexistent() {
-        let size = dir_size(Path::new("/nonexistent_path_xyz"));
+        let size = dir_size(Path::new("/nonexistent_path_xyz"), &crate::progress::NoopReporter);
         assert_eq!(size, 0, "不存在的路径大小应为 0");
     }
 
@@ -601,6 +681,132 @@ mod tests {
             evts.contains(&"Complete".to_string()),
             "应包含 Complete 事件"
         );
+    }
+
+    /// 累加每个分类收到的 Found size（用于验证流式 delta 的求和正确性）
+    struct SizeReporter {
+        found: Arc<Mutex<HashMap<String, u64>>>,
+        found_events: Arc<Mutex<usize>>,
+    }
+
+    impl ProgressReporter for SizeReporter {
+        fn on_event(&self, event: ProgressEvent) {
+            if let ProgressEvent::Found { category, size, .. } = event {
+                *self.found.lock().unwrap().entry(category).or_insert(0) += size;
+                *self.found_events.lock().unwrap() += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn scan_clean_streamed_found_deltas_sum_to_true_total() {
+        // 超过 200 个文件以触发遍历途中的增量 flush（而非仅收尾一次），
+        // 验证流式 delta 求和后与目录真实总大小完全一致、不重复计数。
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("cache");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut expected: u64 = 0;
+        for i in 0..250u32 {
+            let content = format!("file-{i}-payload");
+            expected += content.len() as u64;
+            std::fs::write(root.join(format!("f{i}.bin")), content).unwrap();
+        }
+
+        let rules = vec![CleanRule {
+            name: "test".into(),
+            description: String::new(),
+            patterns: vec![PathPattern::Exact(root.clone())],
+            safety: SafetyLevel::Safe,
+            category: "测试缓存".into(),
+        }];
+
+        let found = Arc::new(Mutex::new(HashMap::new()));
+        let found_events = Arc::new(Mutex::new(0usize));
+        let reporter = SizeReporter {
+            found: found.clone(),
+            found_events: found_events.clone(),
+        };
+
+        let result = Scanner::scan_with_rules(&rules, &reporter).unwrap();
+
+        // 多次增量 flush：Found 事件数应 > 1（否则未真正流式）
+        assert!(
+            *found_events.lock().unwrap() > 1,
+            "250 个文件应触发多次流式 Found，实际次数: {}",
+            *found_events.lock().unwrap()
+        );
+        // 流式 delta 求和 == 真实总大小
+        assert_eq!(
+            found.lock().unwrap().get("测试缓存").copied().unwrap_or(0),
+            expected,
+            "流式 Found delta 求和应等于目录真实总大小"
+        );
+        // 返回值（CLI 路径）总大小同样正确
+        assert_eq!(result.total_size, expected);
+    }
+
+    #[test]
+    fn scan_clean_streams_multiple_categories_under_one_root() {
+        // 根规则 + 最长前缀子规则：两个分类都以 path=root.path 流式 emit Found。
+        // 验证 TUI 侧按 (category, path) 合并时不会把不同分类混淆，各自求和独立正确。
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("cache");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // 直接位于 root 下的文件归"根缓存"；位于 sub 下的归"子缓存"。
+        // 总数 >200 触发遍历途中的增量 flush。
+        let mut root_expected: u64 = 0;
+        for i in 0..150u32 {
+            let content = format!("root-{i}-xx");
+            root_expected += content.len() as u64;
+            std::fs::write(root.join(format!("r{i}.bin")), content).unwrap();
+        }
+        let mut sub_expected: u64 = 0;
+        for i in 0..100u32 {
+            let content = format!("sub-{i}-payload-longer");
+            sub_expected += content.len() as u64;
+            std::fs::write(sub.join(format!("s{i}.bin")), content).unwrap();
+        }
+
+        let rules = vec![
+            CleanRule {
+                name: "root".into(),
+                description: String::new(),
+                patterns: vec![PathPattern::Exact(root.clone())],
+                safety: SafetyLevel::Safe,
+                category: "根缓存".into(),
+            },
+            CleanRule {
+                name: "sub".into(),
+                description: String::new(),
+                patterns: vec![PathPattern::Exact(sub.clone())],
+                safety: SafetyLevel::Moderate,
+                category: "子缓存".into(),
+            },
+        ];
+
+        let found = Arc::new(Mutex::new(HashMap::new()));
+        let found_events = Arc::new(Mutex::new(0usize));
+        let reporter = SizeReporter {
+            found: found.clone(),
+            found_events: found_events.clone(),
+        };
+
+        let result = Scanner::scan_with_rules(&rules, &reporter).unwrap();
+
+        let found = found.lock().unwrap();
+        assert_eq!(
+            found.get("根缓存").copied().unwrap_or(0),
+            root_expected,
+            "根分类流式 delta 求和应等于其真实大小（不被子分类污染）"
+        );
+        assert_eq!(
+            found.get("子缓存").copied().unwrap_or(0),
+            sub_expected,
+            "子分类流式 delta 求和应等于其真实大小（最长前缀归类）"
+        );
+        assert_eq!(result.total_size, root_expected + sub_expected);
     }
 
     #[test]

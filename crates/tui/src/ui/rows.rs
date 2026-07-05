@@ -1,20 +1,59 @@
 //! 结果/扫描列表的共享行渲染。
 //!
 //! Results 页与扫描进行页（scan）都把 `FlatRow`（分区/分类/文件项）渲染成同一种
-//! `ListItem`——安全等级形状符号 + 颜色、复选框、展开图标、大小。此前两处各存一份
-//! 近乎逐行相同的构建逻辑，任何主题/标记改动都要改两遍（易漂移）。本模块收敛为
-//! 单一入口 `flat_row_item`，两处按 `show_safety_label` 区分唯一差异（分类详情是否
-//! 追加安全等级文字）。
+//! `ListItem`——安全等级形状符号 + 颜色、复选框、展开图标、大小。收敛为单一入口
+//! `render_flat_list`（含光标/滚动/滚动条）与 `flat_row_item`（单行样式），两处
+//! 只以边框 `title` 相区分，其余完全一致（切换无差异）。
 
 use crate::app::{App, FlatRow};
 use crate::theme;
+use crate::ui::chrome;
 use humansize::{format_size, DECIMAL};
 use mc_core::models::{ScanResult, SafetyLevel};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::ListItem;
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::Frame;
 
-/// 安全等级文字标签（仅 Results 分类详情使用）
+/// 渲染扁平分类/文件列表到指定区域（扫描页与结果页共用，确保切换无差异）。
+/// 仅 `title`（边框标题）由调用方区分。
+pub fn render_flat_list(f: &mut Frame, app: &App, area: Rect, title: &str) {
+    let Some(result) = app.scan_result.as_ref() else {
+        return;
+    };
+    let flat_rows = app.build_flat_rows();
+    // 复刻 ratatui ListState(offset=0) 的默认滚动：光标在第一屏时顶到 0，
+    // 超出时置于窗口末行。每帧从 cursor 计算，无独立滚动状态。
+    let visible_height = (area.height as usize).saturating_sub(2);
+    let scroll_offset = if visible_height > 0 && app.result_cursor >= visible_height {
+        app.result_cursor + 1 - visible_height
+    } else {
+        0
+    };
+
+    let items: Vec<ListItem> = flat_rows
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| flat_row_item(app, result, row, idx == app.result_cursor))
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .title(title.to_string())
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::c(Color::Cyan))),
+    );
+
+    let mut state = ListState::default();
+    state.select(Some(app.result_cursor));
+    *state.offset_mut() = scroll_offset;
+    f.render_stateful_widget(list, area, &mut state);
+
+    chrome::render_scrollbar(f, area, flat_rows.len(), app.result_cursor);
+}
+
+/// 安全等级文字标签（分类详情用）
 fn safety_label(safety: SafetyLevel) -> &'static str {
     match safety {
         SafetyLevel::Safe => "安全",
@@ -34,16 +73,12 @@ fn dominant_safety(cat: &mc_core::models::CategoryGroup) -> SafetyLevel {
     }
 }
 
-/// 把单个 `FlatRow` 渲染为 `ListItem`。
-///
-/// - `is_cursor`：该行是否为光标所在行（高亮）。
-/// - `show_safety_label`：分类详情是否追加安全等级文字（Results=true，扫描页=false）。
+/// 把单个 `FlatRow` 渲染为 `ListItem`。`is_cursor` 标记该行是否为光标行（高亮）。
 pub fn flat_row_item(
     app: &App,
     result: &ScanResult,
     row: &FlatRow,
     is_cursor: bool,
-    show_safety_label: bool,
 ) -> ListItem<'static> {
     match row {
         FlatRow::Separator { level } => {
@@ -78,20 +113,12 @@ pub fn flat_row_item(
                 style = theme::cursor_highlight(style.add_modifier(Modifier::BOLD));
             }
 
-            let detail = if show_safety_label {
-                format!(
-                    "  ({} 个文件, {}, {})",
-                    cat.file_count,
-                    format_size(cat.total_size, DECIMAL),
-                    safety_label(dominant),
-                )
-            } else {
-                format!(
-                    "  ({} 个文件, {})",
-                    cat.file_count,
-                    format_size(cat.total_size, DECIMAL),
-                )
-            };
+            let detail = format!(
+                "  ({} 个文件, {}, {})",
+                cat.file_count,
+                format_size(cat.total_size, DECIMAL),
+                safety_label(dominant),
+            );
 
             ListItem::new(Line::from(vec![
                 Span::styled(

@@ -6,6 +6,7 @@ use log::{debug, warn};
 
 use crate::models::{AppInfo, SafetyLevel, ScanItem};
 use crate::platform;
+use crate::progress::{ProgressEvent, ProgressReporter};
 
 /// 应用解析器：发现已安装应用，查找应用残留
 pub struct AppResolver;
@@ -66,6 +67,69 @@ impl AppResolver {
 
         apps.sort_by_key(|a| a.name.to_lowercase());
         apps
+    }
+
+    /// 流式扫描已安装应用：每解析出一个 .app 立刻 `Found` 一条，末尾 `Complete`。
+    ///
+    /// 与 `list_apps` 的区别是把每个 `calc_app_size` 的重活边算边报，供 TUI 在
+    /// 后台线程调用、边扫边渲染，避免主线程同步计算全部应用体积造成界面冻结。
+    /// 尊重 `reporter.is_cancelled()`，用户取消时提前返回。
+    pub fn scan_apps_streaming(reporter: &dyn ProgressReporter) {
+        let home = platform::get_home_dir();
+        let app_dirs = [PathBuf::from("/Applications"), home.join("Applications")];
+        Self::scan_apps_in_dirs(&app_dirs, reporter);
+    }
+
+    /// `scan_apps_streaming` 的可注入目录内核，供测试传入临时目录。
+    fn scan_apps_in_dirs(app_dirs: &[PathBuf], reporter: &dyn ProgressReporter) {
+        let mut found_any = false;
+        let mut read_errors: Vec<String> = Vec::new();
+        for dir in app_dirs {
+            if !dir.exists() {
+                continue;
+            }
+            let entries = match fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    warn!("无法读取应用目录 {dir:?}: {e:?}");
+                    read_errors.push(format!("{}: {e}", dir.display()));
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                if reporter.is_cancelled() {
+                    return;
+                }
+                let path = entry.path();
+                if path.extension().is_none_or(|ext| ext != "app") {
+                    continue;
+                }
+                match Self::read_app_info(&path) {
+                    Ok(info) => {
+                        found_any = true;
+                        reporter.on_event(ProgressEvent::Found {
+                            category: "已安装应用".to_string(),
+                            path: info.path,
+                            size: info.size,
+                            safety: SafetyLevel::Moderate,
+                        });
+                    }
+                    Err(e) => debug!("解析应用信息失败 {path:?}: {e:?}"),
+                }
+            }
+        }
+
+        // 一个应用都没发现、且确有目录读取失败：显式上报 I/O 错误，
+        // 避免 TUI 把"无法读取 /Applications"误显示为"未发现可清理的文件"。
+        if !found_any && !read_errors.is_empty() {
+            reporter.on_event(ProgressEvent::Error(format!(
+                "无法读取应用目录：{}",
+                read_errors.join("；")
+            )));
+            return;
+        }
+
+        reporter.on_event(ProgressEvent::Complete);
     }
 
     /// 从 .app 包的 Info.plist 中读取应用信息
@@ -323,6 +387,90 @@ mod tests {
         let info = AppResolver::read_app_info(&app_dir.clone()).unwrap();
         assert_eq!(info.name, "TestApp");
         assert!(info.bundle_id.is_none());
+    }
+
+    /// 记录事件、可配置取消的测试 reporter
+    struct RecReporter {
+        found: std::sync::Mutex<Vec<PathBuf>>,
+        complete: std::sync::atomic::AtomicBool,
+        error: std::sync::Mutex<Option<String>>,
+        cancelled: bool,
+    }
+    impl RecReporter {
+        fn new(cancelled: bool) -> Self {
+            Self {
+                found: std::sync::Mutex::new(Vec::new()),
+                complete: std::sync::atomic::AtomicBool::new(false),
+                error: std::sync::Mutex::new(None),
+                cancelled,
+            }
+        }
+    }
+    impl ProgressReporter for RecReporter {
+        fn on_event(&self, event: ProgressEvent) {
+            match event {
+                ProgressEvent::Found { path, .. } => self.found.lock().unwrap().push(path),
+                ProgressEvent::Complete => {
+                    self.complete.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                ProgressEvent::Error(msg) => *self.error.lock().unwrap() = Some(msg),
+                _ => {}
+            }
+        }
+        fn is_cancelled(&self) -> bool {
+            self.cancelled
+        }
+    }
+
+    #[test]
+    fn scan_apps_in_dirs_emits_found_per_app_and_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("Foo.app")).unwrap();
+        fs::create_dir_all(dir.path().join("Bar.app")).unwrap();
+        fs::create_dir_all(dir.path().join("NotAnApp")).unwrap(); // 非 .app，应跳过
+
+        let rec = RecReporter::new(false);
+        AppResolver::scan_apps_in_dirs(&[dir.path().to_path_buf()], &rec);
+
+        assert_eq!(rec.found.lock().unwrap().len(), 2, "两个 .app 应各 Found 一次，非 .app 跳过");
+        assert!(
+            rec.complete.load(std::sync::atomic::Ordering::Relaxed),
+            "扫描结束应发送 Complete"
+        );
+    }
+
+    #[test]
+    fn scan_apps_in_dirs_respects_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("Foo.app")).unwrap();
+
+        let rec = RecReporter::new(true); // 一开始就取消
+        AppResolver::scan_apps_in_dirs(&[dir.path().to_path_buf()], &rec);
+
+        assert!(rec.found.lock().unwrap().is_empty(), "已取消应提前返回，不发 Found");
+        assert!(
+            !rec.complete.load(std::sync::atomic::Ordering::Relaxed),
+            "取消路径不发 Complete"
+        );
+    }
+
+    #[test]
+    fn scan_apps_in_dirs_reports_error_when_unreadable_and_no_apps() {
+        // 用一个普通文件冒充应用目录：exists() 为真但 read_dir 失败，
+        // 且没有发现任何 app —— 应上报 Error 而非静默 Complete（否则 TUI 误显"未发现"）。
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("not_a_dir");
+        fs::write(&fake, b"x").unwrap();
+
+        let rec = RecReporter::new(false);
+        AppResolver::scan_apps_in_dirs(&[fake], &rec);
+
+        assert!(rec.found.lock().unwrap().is_empty());
+        assert!(rec.error.lock().unwrap().is_some(), "读取失败且无应用时应上报 Error");
+        assert!(
+            !rec.complete.load(std::sync::atomic::Ordering::Relaxed),
+            "已上报 Error 的路径不再发 Complete"
+        );
     }
 
     #[test]

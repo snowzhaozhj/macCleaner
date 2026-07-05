@@ -46,9 +46,16 @@ impl Cleaner {
             }
         }
 
+        let deleted_paths: Vec<std::path::PathBuf> = report
+            .cleaned
+            .iter()
+            .filter(|c| c.success)
+            .map(|c| c.path.clone())
+            .collect();
         reporter.on_event(ProgressEvent::CleaningDone {
             freed: report.total_freed,
             count: report.success_count,
+            deleted_paths,
         });
 
         Ok(report)
@@ -229,6 +236,67 @@ mod tests {
         assert!(report.cleaned[0].success);
         assert!(!report.cleaned[1].success);
         assert!(report.cleaned[2].success);
+    }
+
+    #[test]
+    fn execute_cleaning_done_deleted_paths_contains_only_successful() {
+        use crate::progress::ProgressReporter;
+        use std::sync::Mutex;
+
+        // 捕获 CleaningDone 事件，断言 deleted_paths 的 filter(success) 生产逻辑——
+        // 它是 TUI 端分析器剪树安全性的唯一数据源：失败项绝不能出现在里面，
+        // 否则会误剪掉磁盘上仍存在的目录。
+        #[derive(Default)]
+        struct CapturingReporter {
+            done: Mutex<Option<(u64, usize, Vec<std::path::PathBuf>)>>,
+        }
+        impl ProgressReporter for CapturingReporter {
+            fn on_event(&self, event: ProgressEvent) {
+                if let ProgressEvent::CleaningDone {
+                    freed,
+                    count,
+                    deleted_paths,
+                } = event
+                {
+                    *self.done.lock().unwrap() = Some((freed, count, deleted_paths));
+                }
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        fs::write(&good, "ok").unwrap();
+        let good_item = make_item(good.clone(), 2);
+        // 不存在的路径 → 删除失败，绝不能进入 deleted_paths
+        let bad = dir.path().join("nonexistent.txt");
+        let bad_item = make_item(bad.clone(), 99);
+        let good2 = dir.path().join("good2.txt");
+        fs::write(&good2, "ok2").unwrap();
+        let good2_item = make_item(good2.clone(), 3);
+
+        let reporter = CapturingReporter::default();
+        Cleaner::execute(
+            &[&good_item, &bad_item, &good2_item],
+            DeleteMode::Permanent,
+            &reporter,
+        )
+        .unwrap();
+
+        let (freed, count, deleted_paths) = reporter
+            .done
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("execute 应发出 CleaningDone");
+        assert_eq!(count, 2);
+        assert_eq!(freed, 2 + 3);
+        assert_eq!(deleted_paths.len(), 2, "只应含两个成功项");
+        assert!(deleted_paths.contains(&good));
+        assert!(deleted_paths.contains(&good2));
+        assert!(
+            !deleted_paths.contains(&bad),
+            "失败项不得出现在 deleted_paths（否则 TUI 会误剪存活目录）"
+        );
     }
 
     #[test]

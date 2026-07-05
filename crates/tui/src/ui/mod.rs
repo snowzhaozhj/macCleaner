@@ -31,6 +31,39 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.show_help {
         draw_help_overlay(f, app);
     }
+
+    // 瞬时状态提示：覆盖底部一行（删除结果、扫描中禁标记、返回二次确认等），下次按键即清除
+    if let Some(msg) = &app.status_message {
+        draw_status_message(f, msg);
+    }
+}
+
+/// 在底部一行渲染瞬时状态提示，醒目底色，覆盖该行 footer
+fn draw_status_message(f: &mut Frame, msg: &str) {
+    use ratatui::layout::Rect;
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::widgets::{Clear, Paragraph};
+
+    let area = f.area();
+    if area.height == 0 {
+        return;
+    }
+    let row = Rect {
+        x: area.x,
+        y: area.y + area.height - 1,
+        width: area.width,
+        height: 1,
+    };
+    f.render_widget(Clear, row);
+    f.render_widget(
+        Paragraph::new(format!(" {msg}")).style(
+            Style::default()
+                .fg(crate::theme::c(Color::Black))
+                .bg(crate::theme::c(Color::Yellow))
+                .add_modifier(Modifier::BOLD),
+        ),
+        row,
+    );
 }
 
 /// 居中的帮助覆盖层，内容来自 keymap 注册表（与 footer 同源）
