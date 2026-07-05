@@ -51,6 +51,15 @@ pub fn safety_symbol(safety: SafetyLevel) -> &'static str {
     }
 }
 
+/// 安全等级 → 中文标签（文字信息通道，`NO_COLOR`/色盲下与符号并存）。
+pub fn safety_label(safety: SafetyLevel) -> &'static str {
+    match safety {
+        SafetyLevel::Safe => "安全",
+        SafetyLevel::Moderate => "中等",
+        SafetyLevel::Risky => "危险",
+    }
+}
+
 /// 光标高亮样式：有色时用深灰背景，`NO_COLOR` 时用反显，二者都保持可见。
 pub fn cursor_highlight(base: Style) -> Style {
     if no_color() {

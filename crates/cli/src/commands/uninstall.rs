@@ -104,6 +104,13 @@ pub fn run(cli: &Cli) -> Result<()> {
     let mut total_size: u64 = 0;
     for item in &items_to_clean {
         println!("  {} ({})", item.path.display(), format_size(item.size, DECIMAL));
+        // 展示可能含用户数据的残留项的证据文案，避免"看不到依据却删除"（D3）。
+        if !item.impact.trim().is_empty() {
+            println!("    ⚠ {}", item.impact);
+        }
+        if !item.recovery.trim().is_empty() {
+            println!("    ↩ {}", item.recovery);
+        }
         total_size += item.size;
     }
     println!("\n  总计: {} 个文件/目录, {}", items_to_clean.len(), format_size(total_size, DECIMAL));

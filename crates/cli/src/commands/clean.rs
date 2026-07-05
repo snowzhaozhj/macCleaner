@@ -87,7 +87,7 @@ pub fn run(cli: &Cli) -> Result<()> {
             .categories
             .iter()
             .flat_map(|c| c.items.iter())
-            .filter(|i| i.selected && i.safety == SafetyLevel::Safe)
+            .filter(|i| i.selected)
             .collect()
     } else {
         // 交互确认

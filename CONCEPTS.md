@@ -23,7 +23,7 @@ macCleaner 对外暴露四个顶层命令，互为对照——前三个按规则
 ## 安全 (Safety)
 
 ### SafetyLevel（安全等级）
-对每个可删项的删除风险分级——安全（可放心删除）、中等（删后需重新获取，如缓存）、危险（需谨慎）。该等级驱动界面配色、形状标记（●/▲/✕）以及是否默认预选；是"这东西删了要紧吗"的单一判据。
+对每个可删项按**两条判据串联**分级（非单轴）：先问"会不会丢不可再生数据/有价值状态"（会 → Risky，如 Docker 命名卷、Xcode Archives 的 dSYM、装好环境的 AVD）；不丢的再问"重建是否需用户主动发起且有明显耗时/打断"——需要 → Moderate（如 node_modules、target、DerivedData 冷编译），自动透明补回 → Safe（如共享/下载缓存、IDE 索引）。Safe 与 Moderate 都是零数据丢失，把它俩分开的正是这条**重建摩擦**轴；每项的具体代价再由证据文案（impact/recovery）细化。该等级驱动界面配色与形状标记（●/▲/✕）。**默认预选与等级解耦**：预选 = `safety != Risky && rule.preselect`——Safe/Moderate 默认勾选，Risky 默认不勾且删除时需 type-to-confirm；个别规则（如 `dist/build`）虽为 Moderate 但设 `preselect = false` 而不默认勾选。评级依据成文 rubric，见 `crates/core/src/models.rs` 的 `SafetyLevel` 文档注释与 `docs/brainstorms/2026-07-05-cleanup-safety-model-requirements.md`。
 
 ## 选择与删除 (Selection & Deletion)
 

@@ -53,15 +53,6 @@ pub fn render_flat_list(f: &mut Frame, app: &App, area: Rect, title: &str) {
     chrome::render_scrollbar(f, area, flat_rows.len(), app.result_cursor);
 }
 
-/// 安全等级文字标签（分类详情用）
-fn safety_label(safety: SafetyLevel) -> &'static str {
-    match safety {
-        SafetyLevel::Safe => "安全",
-        SafetyLevel::Moderate => "中等",
-        SafetyLevel::Risky => "危险",
-    }
-}
-
 /// 一个分类的主导安全等级：含危险则危险；全安全则安全；否则中等。
 fn dominant_safety(cat: &mc_core::models::CategoryGroup) -> SafetyLevel {
     if cat.items.iter().all(|i| i.safety == SafetyLevel::Safe) {
@@ -117,7 +108,7 @@ pub fn flat_row_item(
                 "  ({} 个文件, {}, {})",
                 cat.file_count,
                 format_size(cat.total_size, DECIMAL),
-                safety_label(dominant),
+                theme::safety_label(dominant),
             );
 
             ListItem::new(Line::from(vec![

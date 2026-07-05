@@ -1,14 +1,26 @@
-# 系统缓存清理规则（全部为 Safe）
-# pattern 类型:
-#   { exact = "相对于 $HOME 的路径" }
-#   { absolute = "绝对路径" }
-#   { dir_name = "目录名" }
+# 系统缓存清理规则
+#
+# 安全分级 rubric（两条判据串联：先数据丢失，再重建摩擦——非单轴）：
+#   Risky    —— 会丢不可再生数据/有价值状态；默认不勾选、删除额外确认
+#   否则再看重建摩擦（Safe 与 Moderate 都是零数据丢失，靠这条区分）：
+#   Safe     —— 自动按需补回、无需用户主动动作（本文件全部为 Safe）
+#   Moderate —— 需用户主动重建一个项目、有明显耗时/打断（见 purge_rules.toml）
+#
+# 字段：
+#   safety   = "Safe" | "Moderate" | "Risky"
+#   impact   = 删了会怎样（一句话，最坏情况优先）
+#   recovery = 如何恢复（一句话，不可恢复的写明）
+#   preselect（可选，默认 true）= 是否默认勾选
+# pattern 类型：{ exact = "相对 $HOME 的路径" } | { absolute = "绝对路径" } | { dir_name = "目录名" }
+# root_markers（可选，仅 dir_name 生效）：{ sibling = "标记名" } | { inside = "标记名" }
 
 [[rules]]
 name = "System Caches"
 description = "系统及应用缓存文件"
 category = "系统缓存"
 safety = "Safe"
+impact = "应用缓存被清空，下次使用时自动重建；极少数应用可能在此存放非缓存数据"
+recovery = "无需操作，应用会按需自动重新生成"
 patterns = [{ exact = "Library/Caches" }]
 
 [[rules]]
@@ -16,6 +28,8 @@ name = "Application Logs"
 description = "应用日志文件"
 category = "系统缓存"
 safety = "Safe"
+impact = "历史日志被删除，不影响应用运行，仅丢失过往诊断记录"
+recovery = "无需操作，应用会继续写入新日志"
 patterns = [{ exact = "Library/Logs" }]
 
 [[rules]]
@@ -23,6 +37,8 @@ name = "System Temp Files"
 description = "系统临时文件"
 category = "系统缓存"
 safety = "Safe"
+impact = "临时文件被删除，正在运行的程序会按需重新生成"
+recovery = "无需操作，系统按需重建"
 patterns = [{ absolute = "/tmp" }]
 
 [[rules]]
@@ -30,6 +46,8 @@ name = "Chrome Cache"
 description = "Google Chrome 浏览器缓存"
 category = "浏览器缓存"
 safety = "Safe"
+impact = "网页缓存被清空，首次访问网站会重新下载资源、略慢几秒；不影响书签/密码/历史"
+recovery = "无需操作，浏览时自动重建"
 patterns = [{ exact = "Library/Caches/Google/Chrome" }]
 
 [[rules]]
@@ -37,6 +55,8 @@ name = "Safari Cache"
 description = "Safari 浏览器缓存"
 category = "浏览器缓存"
 safety = "Safe"
+impact = "网页缓存被清空，首次访问网站会重新下载资源、略慢几秒；不影响书签/密码/历史"
+recovery = "无需操作，浏览时自动重建"
 patterns = [{ exact = "Library/Caches/com.apple.Safari" }]
 
 [[rules]]
@@ -44,4 +64,6 @@ name = "Firefox Cache"
 description = "Firefox 浏览器缓存"
 category = "浏览器缓存"
 safety = "Safe"
+impact = "网页缓存被清空，首次访问网站会重新下载资源、略慢几秒；不影响书签/密码/历史"
+recovery = "无需操作，浏览时自动重建"
 patterns = [{ exact = "Library/Caches/Firefox" }]

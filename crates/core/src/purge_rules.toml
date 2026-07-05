@@ -1,81 +1,119 @@
 # 开发产物清理规则
-# safety: "Safe" | "Moderate" | "Risky"
-# pattern 类型:
-#   { exact = "相对于 $HOME 的路径" }
-#   { absolute = "绝对路径" }
-#   { dir_name = "目录名" }
+#
+# 安全分级 rubric（两条判据串联：先数据丢失，再重建摩擦——非单轴）：
+#   Risky    —— 会丢不可再生数据/有价值状态；默认不勾选、删除额外确认
+#   否则再看重建摩擦（Safe 与 Moderate 都是零数据丢失，靠这条区分）：
+#   Safe     —— 自动/按需透明补回、无需用户主动动作（共享/下载缓存）
+#   Moderate —— 需用户主动重装/重建一个项目、有明显耗时/打断（项目本地依赖/构建产物）
+#
+# 字段：safety / impact（删了会怎样）/ recovery（如何恢复）/ preselect（默认 true）
+# pattern：{ exact = "相对 $HOME" } | { absolute = "绝对路径" } | { dir_name = "目录名" }
+# root_markers（仅 dir_name 生效，默认 AND；__pycache__ 唯一豁免）：
+#   { sibling = "标记名" }（存在于匹配目录父级）| { inside = "标记名" }（存在于匹配目录内部）
 
 [[rules]]
 name = "node_modules"
 description = "Node.js 依赖目录"
 category = "Node.js"
-safety = "Safe"
+safety = "Moderate"
+impact = "该项目的依赖被清空，下次构建/运行前需重新安装"
+recovery = "在项目目录运行 npm/pnpm/yarn install"
 patterns = [{ dir_name = "node_modules" }]
+root_markers = [{ sibling = "package.json" }]
 
 [[rules]]
 name = "Rust target"
 description = "Rust 编译产物目录（仅匹配含 Cargo.toml 的项目）"
 category = "Rust"
-safety = "Safe"
+safety = "Moderate"
+impact = "该项目的编译产物被清空，下次构建为全量冷编译、较慢"
+recovery = "在项目目录运行 cargo build"
 patterns = [{ dir_name = "target" }]
+root_markers = [{ sibling = "Cargo.toml" }]
 
 [[rules]]
 name = "Python venv"
 description = "Python 虚拟环境目录"
 category = "Python"
-safety = "Safe"
+safety = "Moderate"
+impact = "该虚拟环境被删除，需重建并重新安装依赖"
+recovery = "python -m venv 重建后 pip install -r requirements.txt"
 patterns = [{ dir_name = ".venv" }, { dir_name = "venv" }]
+root_markers = [{ inside = "pyvenv.cfg" }]
 
 [[rules]]
 name = "__pycache__"
 description = "Python 字节码缓存目录"
 category = "Python"
 safety = "Safe"
+impact = "字节码缓存被删除，下次运行时自动重新生成、无感"
+recovery = "无需操作，运行时自动重建"
 patterns = [{ dir_name = "__pycache__" }]
 
 [[rules]]
 name = "dist/build"
-description = "前端构建产物目录"
+description = "前端/通用构建产物目录（默认不勾选：可能含手工资源）"
 category = "Build Output"
 safety = "Moderate"
+preselect = false
+impact = "构建输出被清空；注意 electron-builder 等以 build/ 存放图标/授权文件等手工资源"
+recovery = "重新运行项目的构建命令；手工资源若被误删需从版本库恢复"
 patterns = [{ dir_name = "dist" }, { dir_name = "build" }]
+root_markers = [{ sibling = "package.json" }]
 
 [[rules]]
-name = ".gradle"
-description = "Gradle 构建缓存目录"
+name = "Gradle Cache"
+description = "Gradle 下载与构建缓存（~/.gradle/caches，不含配置与密钥）"
 category = "Gradle"
 safety = "Safe"
-patterns = [{ dir_name = ".gradle" }]
+impact = "Gradle 依赖/构建缓存被清空，下次构建按需重新下载；不影响 gradle.properties 等配置与密钥"
+recovery = "无需操作，下次构建自动重新下载"
+patterns = [{ exact = ".gradle/caches" }]
 
 [[rules]]
 name = "DerivedData"
 description = "Xcode 构建缓存"
 category = "Xcode"
-safety = "Safe"
+safety = "Moderate"
+impact = "Xcode 项目构建缓存被清空，下次构建为全量冷编译、耗时较长"
+recovery = "在 Xcode 重新构建项目（Cmd+B），首次为全量冷编译"
 patterns = [{ exact = "Library/Developer/Xcode/DerivedData" }]
 
 [[rules]]
 name = "Pods"
 description = "CocoaPods 依赖目录"
 category = "CocoaPods"
-safety = "Safe"
+safety = "Moderate"
+impact = "该项目的 CocoaPods 依赖被清空，需重新安装"
+recovery = "在项目目录运行 pod install"
 patterns = [{ dir_name = "Pods" }]
+root_markers = [{ sibling = "Podfile" }]
 
 [[rules]]
 name = "Docker Desktop Data"
-description = "Docker Desktop 虚拟机磁盘和 buildx 缓存"
+description = "Docker Desktop 虚拟机磁盘（含全部镜像/容器/命名卷）"
 category = "Docker"
-safety = "Moderate"
-patterns = [
-    { exact = "Library/Containers/com.docker.docker/Data/vms" },
-    { exact = ".docker/buildx" },
-]
+safety = "Risky"
+impact = "删除后全部本地镜像、容器和命名卷丢失，命名卷内的数据（如数据库）不可恢复"
+recovery = "镜像可重新 pull/build；命名卷内数据无法恢复"
+patterns = [{ exact = "Library/Containers/com.docker.docker/Data/vms" }]
+
+[[rules]]
+name = "Docker buildx Cache"
+description = "Docker buildx 构建缓存（可重建，与虚拟机磁盘分开）"
+category = "Docker"
+safety = "Safe"
+impact = "buildx 构建缓存被清空，下次构建按需重建；不影响镜像/容器/卷"
+recovery = "无需操作，下次构建自动重建"
+patterns = [{ exact = ".docker/buildx" }]
 
 [[rules]]
 name = "Maven Repository"
 description = "Maven 本地仓库缓存（~/.m2/repository）"
 category = "Java"
-safety = "Moderate"
+safety = "Safe"
+impact = "已下载的依赖被清空，下次构建按需重新下载"
+recovery = "无需操作，下次构建自动重新下载"
 patterns = [{ exact = ".m2/repository" }]
 
 [[rules]]
@@ -83,6 +121,8 @@ name = "Homebrew Cache"
 description = "Homebrew 下载缓存"
 category = "Homebrew"
 safety = "Safe"
+impact = "已下载的安装包缓存被清空，下次安装/升级按需重新下载"
+recovery = "无需操作，下次 brew 操作自动重新下载"
 patterns = [{ exact = "Library/Caches/Homebrew" }]
 
 [[rules]]
@@ -90,6 +130,8 @@ name = "Go Module Cache"
 description = "Go 模块下载缓存（~/go/pkg/mod）"
 category = "Go"
 safety = "Safe"
+impact = "已下载的模块缓存被清空，下次构建按需重新下载"
+recovery = "无需操作，下次 go build 自动重新下载"
 patterns = [{ exact = "go/pkg/mod" }]
 
 [[rules]]
@@ -97,6 +139,8 @@ name = "Cargo Cache"
 description = "Cargo registry 和 git 缓存（与 target 互补）"
 category = "Rust"
 safety = "Safe"
+impact = "已下载的 crate 缓存被清空，下次构建按需重新下载"
+recovery = "无需操作，下次 cargo build 自动重新下载"
 patterns = [{ exact = ".cargo/registry" }, { exact = ".cargo/git" }]
 
 [[rules]]
@@ -104,6 +148,8 @@ name = "npm/pnpm/yarn Cache"
 description = "Node 包管理器全局缓存"
 category = "Node.js"
 safety = "Safe"
+impact = "包管理器全局缓存被清空，下次安装按需重新下载"
+recovery = "无需操作，下次 install 自动重新下载"
 patterns = [
     { exact = ".npm/_cacache" },
     { exact = "Library/pnpm/store" },
@@ -115,28 +161,42 @@ name = "pip Cache"
 description = "pip 下载缓存"
 category = "Python"
 safety = "Safe"
+impact = "pip 下载缓存被清空，下次安装按需重新下载"
+recovery = "无需操作，下次 pip install 自动重新下载"
 patterns = [{ exact = "Library/Caches/pip" }]
 
 [[rules]]
 name = "Xcode Archives"
-description = "Xcode 旧归档文件"
+description = "Xcode 旧归档文件（含已发布 App 的 dSYM）"
 category = "Xcode"
-safety = "Moderate"
+safety = "Risky"
+impact = "归档含已发布 App 的 dSYM，删除后无法再符号化线上崩溃日志，不可再生"
+recovery = "不可恢复（除非保留了对应构建的 dSYM 备份）"
 patterns = [{ exact = "Library/Developer/Xcode/Archives" }]
 
 [[rules]]
-name = "Android AVD/SDK"
-description = "Android 模拟器镜像和 SDK 临时文件"
+name = "Android AVD"
+description = "Android 模拟器镜像（含已装环境与应用状态）"
 category = "Android"
-safety = "Moderate"
-patterns = [
-    { exact = ".android/avd" },
-    { exact = "Library/Android/sdk/.temp" },
-]
+safety = "Risky"
+impact = "模拟器镜像被删除，其中已安装的应用与配置状态丢失，需重建并重新配置"
+recovery = "在 Android Studio 重新创建 AVD 并重装应用/环境"
+patterns = [{ exact = ".android/avd" }]
+
+[[rules]]
+name = "Android SDK Temp"
+description = "Android SDK 临时文件"
+category = "Android"
+safety = "Safe"
+impact = "SDK 临时文件被删除，不影响已安装的 SDK 组件"
+recovery = "无需操作，SDK 操作时按需重建"
+patterns = [{ exact = "Library/Android/sdk/.temp" }]
 
 [[rules]]
 name = "JetBrains Cache"
 description = "JetBrains IDE 缓存（各版本累积）"
 category = "JetBrains"
 safety = "Safe"
+impact = "IDE 缓存与索引被清空，下次启动会重建索引、首次略慢；不影响项目与配置"
+recovery = "无需操作，IDE 启动时自动重建索引"
 patterns = [{ exact = "Library/Caches/JetBrains" }]
