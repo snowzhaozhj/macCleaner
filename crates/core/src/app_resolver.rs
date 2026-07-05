@@ -112,6 +112,9 @@ impl AppResolver {
                             path: info.path,
                             size: info.size,
                             safety: SafetyLevel::Moderate,
+                            impact: String::new(),
+                            recovery: String::new(),
+                            preselect: true,
                         });
                     }
                     Err(e) => debug!("解析应用信息失败 {path:?}: {e:?}"),
@@ -261,12 +264,19 @@ impl AppResolver {
                         }
                         Err(_) => 0,
                     };
-                    leftovers.push(ScanItem::new(
-                        path,
-                        size,
-                        SafetyLevel::Safe,
-                        format!("应用残留 ({subdir})"),
-                    ));
+                    // D3：Application Support 可能存放应用的主用户数据（数据库、存档等）。
+                    // 保持默认勾选（符合卸载器"彻底移除"惯例），但必须给出非空证据文案，
+                    // 避免"看不到依据却默认删"。其余残留（Caches/Preferences 等）无附加文案。
+                    let item = ScanItem::new(path, size, SafetyLevel::Safe, format!("应用残留 ({subdir})"));
+                    let item = if *subdir == "Application Support" {
+                        item.with_evidence(
+                            "含应用数据（可能包括数据库、存档），删除后不可恢复".to_string(),
+                            "已移入废纸篓，可从废纸篓找回".to_string(),
+                        )
+                    } else {
+                        item
+                    };
+                    leftovers.push(item);
                 }
             }
         }

@@ -11,6 +11,16 @@ pub enum PathPattern {
     DirName(String),
 }
 
+/// 项目根标记：仅当匹配目录满足这些标记时才计入结果（消除按目录名匹配的误报）。
+/// 组合子默认 AND（全部命中）——见 `matches_root_markers`。
+#[derive(Debug, Clone)]
+pub enum RootMarker {
+    /// 标记存在于匹配目录的**父级**（如 `node_modules` 旁的 `package.json`）
+    Sibling(String),
+    /// 标记存在于匹配目录**内部**（如 `venv` 内的 `pyvenv.cfg`）
+    Inside(String),
+}
+
 /// 清理规则
 #[derive(Debug, Clone)]
 pub struct CleanRule {
@@ -19,6 +29,14 @@ pub struct CleanRule {
     pub patterns: Vec<PathPattern>,
     pub safety: SafetyLevel,
     pub category: String,
+    /// 删除后果一句话（"删了会怎样"）。
+    pub impact: String,
+    /// 恢复方式一句话（"如何恢复"）。
+    pub recovery: String,
+    /// 仅对 `DirName` 模式生效的项目根守卫；空表示不设守卫（如 `__pycache__`）。
+    pub root_markers: Vec<RootMarker>,
+    /// 是否默认预选。默认 true；`dist/build` 等设 false（仍扫出、仍可手动勾）。
+    pub preselect: bool,
 }
 
 // --- TOML 反序列化中间结构 ---
@@ -35,6 +53,18 @@ struct RuleEntry {
     category: String,
     safety: SafetyLevel,
     patterns: Vec<PatternEntry>,
+    #[serde(default)]
+    impact: String,
+    #[serde(default)]
+    recovery: String,
+    #[serde(default)]
+    root_markers: Vec<MarkerEntry>,
+    #[serde(default = "default_true")]
+    preselect: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -43,6 +73,13 @@ enum PatternEntry {
     Absolute { absolute: String },
     Exact { exact: String },
     DirName { dir_name: String },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MarkerEntry {
+    Sibling { sibling: String },
+    Inside { inside: String },
 }
 
 fn home() -> PathBuf {
@@ -67,15 +104,38 @@ fn parse_rules_toml(toml_str: &str, source: &str) -> Vec<CleanRule> {
                     PatternEntry::DirName { dir_name } => PathPattern::DirName(dir_name),
                 })
                 .collect();
+            let root_markers = entry
+                .root_markers
+                .into_iter()
+                .map(|m| match m {
+                    MarkerEntry::Sibling { sibling } => RootMarker::Sibling(sibling),
+                    MarkerEntry::Inside { inside } => RootMarker::Inside(inside),
+                })
+                .collect();
             CleanRule {
                 name: entry.name,
                 description: entry.description,
                 patterns,
                 safety: entry.safety,
                 category: entry.category,
+                impact: entry.impact,
+                recovery: entry.recovery,
+                root_markers,
+                preselect: entry.preselect,
             }
         })
         .collect()
+}
+
+/// 判断按目录名命中的目录是否满足其规则的项目根守卫（默认 AND：全部命中）。
+/// `matched_dir` 是被命中的目录本身（如 `.../node_modules`）。空守卫恒真。
+pub fn matches_root_markers(markers: &[RootMarker], matched_dir: &std::path::Path) -> bool {
+    markers.iter().all(|m| match m {
+        RootMarker::Sibling(name) => matched_dir
+            .parent()
+            .is_some_and(|parent| parent.join(name).exists()),
+        RootMarker::Inside(name) => matched_dir.join(name).exists(),
+    })
 }
 
 /// 系统缓存清理规则（从 `clean_rules.toml` 加载）

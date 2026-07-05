@@ -647,7 +647,9 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
             path,
             size,
             safety,
-            ..
+            impact,
+            recovery,
+            preselect,
         } => {
             // 仅在扫描态接受 Found：防止已取消/已结束扫描的残留事件在返回菜单等
             // 非扫描态重建 scan_result（会让下个命令看到上个命令的检测结果）。
@@ -681,13 +683,18 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
                     } else {
                         cat.file_count += 1;
                         cat.total_size += size;
-                        cat.items
-                            .push(ScanItem::new(path, size, safety, category.clone()));
+                        cat.items.push(
+                            ScanItem::new(path, size, safety, category.clone())
+                                .with_evidence(impact, recovery)
+                                .with_preselect(preselect),
+                        );
                     }
                 } else {
                     result.categories.push(CategoryGroup::new(
                         category.clone(),
-                        vec![ScanItem::new(path, size, safety, category.clone())],
+                        vec![ScanItem::new(path, size, safety, category.clone())
+                            .with_evidence(impact, recovery)
+                            .with_preselect(preselect)],
                     ));
                     app.expanded.push(false);
                 }
@@ -1420,6 +1427,9 @@ mod tests {
             path: PathBuf::from(path),
             size,
             safety: SafetyLevel::Safe,
+            impact: String::new(),
+            recovery: String::new(),
+            preselect: true,
         };
 
         // 两次同 (category, path) 的流式增量应合并到同一项、size 累加，且不新增计数
@@ -1501,6 +1511,9 @@ mod tests {
                 path: PathBuf::from("/root"),
                 size: 10,
                 safety: SafetyLevel::Safe,
+                impact: String::new(),
+                recovery: String::new(),
+                preselect: true,
             },
         );
         assert!(app.scan_result.is_none(), "非扫描态应忽略残留 Found");

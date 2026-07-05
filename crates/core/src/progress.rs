@@ -3,7 +3,15 @@ use std::path::PathBuf;
 
 pub enum ProgressEvent {
     Scanning { path: PathBuf },
-    Found { category: String, path: PathBuf, size: u64, safety: SafetyLevel },
+    Found {
+        category: String,
+        path: PathBuf,
+        size: u64,
+        safety: SafetyLevel,
+        impact: String,
+        recovery: String,
+        preselect: bool,
+    },
     CategoryDone { category: String, total_size: u64, count: usize },
     RuleProgress { current: usize, total: usize, name: String },
     Complete,

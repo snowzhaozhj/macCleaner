@@ -60,6 +60,57 @@ pub fn prefetch_metadata(
     }
 }
 
+/// 规则派生的每项元数据，随扫描在各中间集合间流转（避免多元组膨胀）。
+#[derive(Clone)]
+struct Meta {
+    safety: SafetyLevel,
+    category: String,
+    impact: String,
+    recovery: String,
+    preselect: bool,
+}
+
+impl Meta {
+    fn from_rule(rule: &CleanRule) -> Self {
+        Self {
+            safety: rule.safety,
+            category: rule.category.clone(),
+            impact: rule.impact.clone(),
+            recovery: rule.recovery.clone(),
+            preselect: rule.preselect,
+        }
+    }
+
+    /// 兜底元数据（分类名未在映射中找到时使用；正常不应触发）。
+    fn fallback(category: String) -> Self {
+        Self {
+            safety: SafetyLevel::Safe,
+            category,
+            impact: String::new(),
+            recovery: String::new(),
+            preselect: true,
+        }
+    }
+
+    fn into_item(self, path: PathBuf, size: u64) -> ScanItem {
+        ScanItem::new(path, size, self.safety, self.category)
+            .with_evidence(self.impact, self.recovery)
+            .with_preselect(self.preselect)
+    }
+
+    fn found(&self, path: PathBuf, size: u64) -> ProgressEvent {
+        ProgressEvent::Found {
+            category: self.category.clone(),
+            path,
+            size,
+            safety: self.safety,
+            impact: self.impact.clone(),
+            recovery: self.recovery.clone(),
+            preselect: self.preselect,
+        }
+    }
+}
+
 pub struct Scanner;
 
 impl Scanner {
@@ -85,13 +136,13 @@ impl Scanner {
     ) -> anyhow::Result<ScanResult> {
         let mut category_map: HashMap<String, Vec<ScanItem>> = HashMap::new();
 
-        // 收集所有 (path, safety, category) 并按路径排序（短路径优先）
-        let mut all_paths: Vec<(PathBuf, SafetyLevel, String)> = Vec::new();
+        // 收集所有 (path, meta) 并按路径排序（短路径优先）
+        let mut all_paths: Vec<(PathBuf, Meta)> = Vec::new();
         for rule in rules {
             for pattern in &rule.patterns {
                 if let PathPattern::Exact(base) = pattern {
                     if base.exists() {
-                        all_paths.push((base.clone(), rule.safety, rule.category.clone()));
+                        all_paths.push((base.clone(), Meta::from_rule(rule)));
                     }
                 }
             }
@@ -102,16 +153,15 @@ impl Scanner {
         // 对于被包含的路径，记录为子规则
         struct RootEntry {
             path: PathBuf,
-            safety: SafetyLevel,
-            category: String,
-            children: Vec<(PathBuf, SafetyLevel, String)>,
+            meta: Meta,
+            children: Vec<(PathBuf, Meta)>,
         }
 
         let mut roots: Vec<RootEntry> = Vec::new();
-        for (path, safety, category) in &all_paths {
+        for (path, meta) in &all_paths {
             let is_child = roots.iter_mut().any(|root| {
                 if path.starts_with(&root.path) && path != &root.path {
-                    root.children.push((path.clone(), *safety, category.clone()));
+                    root.children.push((path.clone(), meta.clone()));
                     true
                 } else {
                     false
@@ -120,8 +170,7 @@ impl Scanner {
             if !is_child {
                 roots.push(RootEntry {
                     path: path.clone(),
-                    safety: *safety,
-                    category: category.clone(),
+                    meta: meta.clone(),
                     children: Vec::new(),
                 });
             }
@@ -137,7 +186,7 @@ impl Scanner {
             reporter.on_event(ProgressEvent::RuleProgress {
                 current: root_idx + 1,
                 total: root_count,
-                name: root.category.clone(),
+                name: root.meta.category.clone(),
             });
             reporter.on_event(ProgressEvent::Scanning {
                 path: root.path.clone(),
@@ -160,14 +209,17 @@ impl Scanner {
             // 预计算本根下各 category 的 safety，用于流式上报 Found。
             // 按 category 名索引依赖"同名分类 safety 唯一"这一不变式（clean/purge 规则表当前成立）；
             // 若未来某分类在同根下映射到两种 safety，debug 构建会在此断言失败以提醒改用更精确的键。
-            let mut cat_safety: HashMap<String, SafetyLevel> = HashMap::new();
-            cat_safety.insert(root.category.clone(), root.safety);
-            for (_, s, c) in &root.children {
+            let mut cat_meta: HashMap<String, Meta> = HashMap::new();
+            cat_meta.insert(root.meta.category.clone(), root.meta.clone());
+            for (_, m) in &root.children {
                 debug_assert!(
-                    cat_safety.get(c).is_none_or(|prev| *prev == *s),
-                    "分类 {c:?} 在同根下出现两种 safety，按名索引会丢失其一"
+                    cat_meta
+                        .get(&m.category)
+                        .is_none_or(|prev| prev.safety == m.safety),
+                    "分类 {:?} 在同根下出现两种 safety，按名索引会丢失其一",
+                    m.category
                 );
-                cat_safety.insert(c.clone(), *s);
+                cat_meta.insert(m.category.clone(), m.clone());
             }
 
             let mut batch_count: usize = 0;
@@ -192,17 +244,16 @@ impl Scanner {
                 batch_count += 1;
 
                 // 最长前缀匹配：文件归入最具体的子规则，否则归入根规则
-                let (safety, category) = root
+                let meta = root
                     .children
                     .iter()
                     .rev()
-                    .find(|(child_path, _, _)| path.starts_with(child_path))
-                    .map(|(_, s, c)| (*s, c.clone()))
-                    .unwrap_or((root.safety, root.category.clone()));
+                    .find(|(child_path, _)| path.starts_with(child_path))
+                    .map_or_else(|| root.meta.clone(), |(_, m)| m.clone());
 
-                *size_by_category.entry(category.clone()).or_insert(0) += size;
+                *size_by_category.entry(meta.category.clone()).or_insert(0) += size;
 
-                let item = ScanItem::new(path.clone(), size, safety, category);
+                let item = meta.into_item(path.clone(), size);
                 category_map
                     .entry(item.category.clone())
                     .or_default()
@@ -220,7 +271,7 @@ impl Scanner {
                         &root.path,
                         &size_by_category,
                         &mut emitted_by_category,
-                        &cat_safety,
+                        &cat_meta,
                     );
                 }
             }
@@ -231,7 +282,7 @@ impl Scanner {
                 &root.path,
                 &size_by_category,
                 &mut emitted_by_category,
-                &cat_safety,
+                &cat_meta,
             );
         }
 
@@ -256,12 +307,13 @@ impl Scanner {
             path: base_path.to_path_buf(),
         });
 
-        let dirname_rules: Vec<(String, SafetyLevel, String)> = rules
+        let dirname_rules: Vec<(String, Meta)> = rules
             .iter()
             .flat_map(|rule| {
+                let meta = Meta::from_rule(rule);
                 rule.patterns.iter().filter_map(move |p| {
                     if let PathPattern::DirName(name) = p {
-                        Some((name.clone(), rule.safety, rule.category.clone()))
+                        Some((name.clone(), meta.clone()))
                     } else {
                         None
                     }
@@ -270,13 +322,14 @@ impl Scanner {
             .collect();
 
         // Exact 规则（如 DerivedData）单独处理——并行计算各路径大小
-        let exact_entries: Vec<(PathBuf, SafetyLevel, String)> = rules
+        let exact_entries: Vec<(PathBuf, Meta)> = rules
             .iter()
             .flat_map(|rule| {
+                let meta = Meta::from_rule(rule);
                 rule.patterns.iter().filter_map(move |p| {
                     if let PathPattern::Exact(exact_path) = p {
                         if exact_path.exists() && exact_path.starts_with(base_path) {
-                            return Some((exact_path.clone(), rule.safety, rule.category.clone()));
+                            return Some((exact_path.clone(), meta.clone()));
                         }
                     }
                     None
@@ -289,35 +342,31 @@ impl Scanner {
         // Exact 路径（如 Xcode DerivedData）体积可达数十 GB，其 dir_size 单个就要数秒。
         // 在并行 map 内：开算前报 Scanning(当前路径)、算完报 Found，避免这段静默造成
         // "扫描中: ~ + 长时间无反应"的冻结感。
-        let exact_results: Vec<(PathBuf, u64, SafetyLevel, String)> =
+        let exact_results: Vec<(PathBuf, u64, Meta)> =
             dir_size_pool.install(|| {
                 exact_entries
                     .par_iter()
-                    .map(|(path, safety, category)| {
+                    .map(|(path, meta)| {
                         if reporter.is_cancelled() {
-                            return (path.clone(), 0, *safety, category.clone());
+                            return (path.clone(), 0, meta.clone());
                         }
                         reporter.on_event(ProgressEvent::Scanning { path: path.clone() });
                         let size = dir_size(path, reporter);
-                        reporter.on_event(ProgressEvent::Found {
-                            category: category.clone(),
-                            path: path.clone(),
-                            size,
-                            safety: *safety,
-                        });
-                        (path.clone(), size, *safety, category.clone())
+                        reporter.on_event(meta.found(path.clone(), size));
+                        (path.clone(), size, meta.clone())
                     })
                     .collect()
             });
 
-        for (path, size, safety, category) in exact_results {
-            let item = ScanItem::new(path, size, safety, category.clone());
+        for (path, size, meta) in exact_results {
+            let category = meta.category.clone();
+            let item = meta.into_item(path, size);
             category_map.entry(category).or_default().push(item);
         }
 
         // 剪枝遍历：匹配到目录名后立即剪枝（不进入子树），收集匹配路径
         // 遍历完成后再并行计算各目录大小
-        let matched_dirs: Arc<Mutex<Vec<(PathBuf, SafetyLevel, String)>>> =
+        let matched_dirs: Arc<Mutex<Vec<(PathBuf, Meta)>>> =
             Arc::new(Mutex::new(Vec::new()));
 
         let dirname_rules_arc = Arc::new(dirname_rules);
@@ -337,7 +386,7 @@ impl Scanner {
 
                             let entry_path = e.path();
 
-                            for (dir_name, safety, category) in dirname_clone.iter() {
+                            for (dir_name, meta) in dirname_clone.iter() {
                                 if name.as_ref() == dir_name.as_str() {
                                     if dir_name == "target" {
                                         if let Some(p) = entry_path.parent() {
@@ -347,11 +396,7 @@ impl Scanner {
                                         }
                                     }
                                     if let Ok(mut dirs) = matched_clone.lock() {
-                                        dirs.push((
-                                            entry_path,
-                                            *safety,
-                                            category.clone(),
-                                        ));
+                                        dirs.push((entry_path, meta.clone()));
                                     }
                                     return false; // 剪枝：不进入匹配的目录子树
                                 }
@@ -385,29 +430,25 @@ impl Scanner {
         // 实时增长，而非静默上百秒后一次性爆出（对齐 Analyze 的实时反馈）。
         let dirs = Arc::try_unwrap(matched_dirs).map_or_else(|arc| arc.lock().unwrap().clone(), |mutex| mutex.into_inner().unwrap_or_default());
 
-        let dir_sizes: Vec<(PathBuf, u64, SafetyLevel, String)> =
+        let dir_sizes: Vec<(PathBuf, u64, Meta)> =
             dir_size_pool.install(|| {
                 dirs.par_iter()
-                    .map(|(path, safety, category)| {
+                    .map(|(path, meta)| {
                         if reporter.is_cancelled() {
-                            return (path.clone(), 0, *safety, category.clone());
+                            return (path.clone(), 0, meta.clone());
                         }
                         let size = dir_size(path, reporter);
                         // 每算完一个目录立刻上报，供 TUI 增量渲染
-                        reporter.on_event(ProgressEvent::Found {
-                            category: category.clone(),
-                            path: path.clone(),
-                            size,
-                            safety: *safety,
-                        });
-                        (path.clone(), size, *safety, category.clone())
+                        reporter.on_event(meta.found(path.clone(), size));
+                        (path.clone(), size, meta.clone())
                     })
                     .collect()
             });
 
         // 汇总用于返回值（CLI 路径）；Found 已在并行阶段发过，此处不再重复 emit
-        for (path, size, safety, category) in dir_sizes {
-            let item = ScanItem::new(path, size, safety, category.clone());
+        for (path, size, meta) in dir_sizes {
+            let category = meta.category.clone();
+            let item = meta.into_item(path, size);
             category_map.entry(category).or_default().push(item);
         }
 
@@ -450,7 +491,7 @@ fn flush_category_deltas(
     root_path: &Path,
     size_by_category: &HashMap<String, u64>,
     emitted: &mut HashMap<String, u64>,
-    cat_safety: &HashMap<String, SafetyLevel>,
+    cat_meta: &HashMap<String, Meta>,
 ) {
     for (category, &cum) in size_by_category {
         let last = emitted.get(category).copied();
@@ -460,16 +501,11 @@ fn flush_category_deltas(
             continue;
         }
         let delta = cum - last.unwrap_or(0);
-        let safety = cat_safety
+        let meta = cat_meta
             .get(category)
-            .copied()
-            .unwrap_or(SafetyLevel::Safe);
-        reporter.on_event(ProgressEvent::Found {
-            category: category.clone(),
-            path: root_path.to_path_buf(),
-            size: delta,
-            safety,
-        });
+            .cloned()
+            .unwrap_or_else(|| Meta::fallback(category.clone()));
+        reporter.on_event(meta.found(root_path.to_path_buf(), delta));
         emitted.insert(category.clone(), cum);
     }
 }
@@ -718,6 +754,10 @@ mod tests {
             patterns: vec![PathPattern::Exact(root.clone())],
             safety: SafetyLevel::Safe,
             category: "测试缓存".into(),
+            impact: String::new(),
+            recovery: String::new(),
+            root_markers: Vec::new(),
+            preselect: true,
         }];
 
         let found = Arc::new(Mutex::new(HashMap::new()));
@@ -776,6 +816,10 @@ mod tests {
                 patterns: vec![PathPattern::Exact(root.clone())],
                 safety: SafetyLevel::Safe,
                 category: "根缓存".into(),
+                impact: String::new(),
+                recovery: String::new(),
+                root_markers: Vec::new(),
+                preselect: true,
             },
             CleanRule {
                 name: "sub".into(),
@@ -783,6 +827,10 @@ mod tests {
                 patterns: vec![PathPattern::Exact(sub.clone())],
                 safety: SafetyLevel::Moderate,
                 category: "子缓存".into(),
+                impact: String::new(),
+                recovery: String::new(),
+                root_markers: Vec::new(),
+                preselect: true,
             },
         ];
 
