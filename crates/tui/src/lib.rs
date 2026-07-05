@@ -553,6 +553,16 @@ fn start_command(
     analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
     tree_builder: &mut Option<IncrementalTreeBuilder>,
 ) {
+    // 每次命令从干净状态开始：清掉上一次可能残留的结果/标记/展开态/光标，
+    // 确保新命令不会看到上一次命令的检测结果（与 reporter 丢弃取消事件形成双保险）。
+    app.scan_result = None;
+    app.expanded.clear();
+    app.marked.clear();
+    app.result_cursor = 0;
+    // 排空进度队列：丢弃上一次扫描（可能刚被取消）残留在 channel 中、尚未消费的事件，
+    // 否则它们会在本次扫描的 Scanning 态被消费、串入新命令的列表。
+    while events.progress_rx.try_recv().is_ok() {}
+
     match cmd {
         ActiveCommand::Clean => {
             app.cancel_flag = Arc::new(AtomicBool::new(false));
@@ -767,6 +777,11 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
             safety,
             ..
         } => {
+            // 仅在扫描态接受 Found：防止已取消/已结束扫描的残留事件在返回菜单等
+            // 非扫描态重建 scan_result（会让下个命令看到上个命令的检测结果）。
+            if !matches!(app.state, AppState::Scanning { .. }) {
+                return;
+            }
             // __analyze_tree__ 路径已废弃，但保留兼容处理避免数据丢失
             if category == "__analyze_tree__" {
                 return;
