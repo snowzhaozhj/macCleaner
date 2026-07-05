@@ -95,6 +95,8 @@ pub struct App {
     pub confirm_delete: Option<Vec<ConfirmItem>>,
     /// 含 Risky 项时的 type-to-confirm 输入缓冲（D4）。
     pub confirm_input: String,
+    /// 确认框清单区的滚动偏移（可见行起点）；打开/关闭确认框时归零（KTD3）。
+    pub confirm_scroll: usize,
     /// 从磁盘分析器发起删除时暂存的树与导航状态；删除在后台线程完成后据此
     /// **剪除已删节点并原地返回分析器**，而非拆树回菜单（修复"删除后莫名退出"）。
     pub analyzer_return: Option<AnalyzerReturn>,
@@ -125,6 +127,7 @@ impl App {
             marked: HashSet::new(),
             confirm_delete: None,
             confirm_input: String::new(),
+            confirm_scroll: 0,
             analyzer_return: None,
             status_message: None,
             pending_leave: false,
@@ -472,6 +475,7 @@ impl App {
                             path: item.path.clone(),
                             size: item.size,
                             safety: item.safety,
+                            category: item.category.clone(),
                             impact: item.impact.clone(),
                             recovery: item.recovery.clone(),
                         });
@@ -522,9 +526,46 @@ impl App {
         self.filter_query.clear();
         self.marked.clear();
         self.confirm_delete = None;
+        self.confirm_input.clear();
+        self.confirm_scroll = 0;
         self.analyzer_return = None;
         self.status_message = None;
         self.pending_leave = false;
+    }
+
+    /// KTD2 诚实披露：勾选父目录会连带其中**未勾选**的子项一并删除（size 归属已扣除、
+    /// 物理包含无法扣除）。为确认框每个"含未勾选子项"的待删父项生成一条 ⚠ 警示文案。
+    /// 仅 Results 模式（有 `scan_result`）适用；分析器 `collect_marked` 已剪除标记目录的子项。
+    pub fn unmarked_child_disclosures(&self) -> Vec<String> {
+        let (Some(list), Some(result)) = (&self.confirm_delete, &self.scan_result) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for p in list {
+            let mut count = 0usize;
+            let mut example: Option<&str> = None;
+            for cat in &result.categories {
+                for item in &cat.items {
+                    if item.path != p.path
+                        && item.path.starts_with(&p.path)
+                        && !self.marked.contains(&item.path)
+                    {
+                        count += 1;
+                        if example.is_none() {
+                            example = Some(cat.name.as_str());
+                        }
+                    }
+                }
+            }
+            if count > 0 {
+                let parent = if p.category.is_empty() { "该项" } else { p.category.as_str() };
+                let ex = example.unwrap_or("其他分类");
+                out.push(format!(
+                    "⚠ {parent} 包含 {count} 个未勾选的子项（如 {ex}），将一并删除"
+                ));
+            }
+        }
+        out
     }
 }
 
@@ -549,12 +590,14 @@ pub enum FlatRow {
     Item { cat_idx: usize, item_idx: usize },
 }
 
-/// 删除确认框的单项：携带 safety/impact/recovery 以支持 Risky 强调与证据展示（U7/R9）。
+/// 删除确认框的单项：携带 safety/impact/recovery 以支持 Risky 强调与证据展示（U7/R9），
+/// 并携带 category 以支持非 Risky 项按分类汇总（KTD3）。分析器发起的删除无规则分类，category 为空。
 #[derive(Debug, Clone)]
 pub struct ConfirmItem {
     pub path: PathBuf,
     pub size: u64,
     pub safety: SafetyLevel,
+    pub category: String,
     pub impact: String,
     pub recovery: String,
 }
@@ -639,6 +682,7 @@ mod tests {
             path: PathBuf::from("/x/nm"),
             size: 1,
             safety: SafetyLevel::Moderate,
+            category: "c".into(),
             impact: String::new(),
             recovery: String::new(),
         }]);

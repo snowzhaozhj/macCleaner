@@ -5,6 +5,7 @@ pub mod confirm;
 pub mod analyzer;
 pub mod chrome;
 pub mod rows;
+pub mod text;
 
 use crate::app::{App, AppState};
 use ratatui::Frame;

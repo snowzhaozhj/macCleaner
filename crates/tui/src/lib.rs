@@ -290,15 +290,27 @@ fn handle_key(
         }
         return;
     }
-    // 删除确认覆盖层优先：Some 时只处理确认/取消并吞键
+    // 删除确认覆盖层优先：Some 时只处理确认/取消/滚动并吞键
     if app.confirm_delete.is_some() {
+        // 清单滚动上界（粗 clamp，防按住翻页时 confirm_scroll 无限膨胀致后续上滚"空按"；
+        // 渲染侧再按可见高度精确 clamp）。每 Risky 项 ≤4 视觉行、每分类 ≤5 行，×5 足够宽松。
+        let scroll_cap = app.confirm_delete.as_ref().map_or(0, Vec::len).saturating_mul(5);
+        let scroll_up = |app: &mut App, n: usize| app.confirm_scroll = app.confirm_scroll.saturating_sub(n);
+        let scroll_down =
+            |app: &mut App, n: usize| app.confirm_scroll = (app.confirm_scroll + n).min(scroll_cap);
         // D4：待删含 Risky（不可逆内容，如 Docker 卷/dSYM）时升级为 type-to-confirm——
         // 需输入 token 才执行，且 Enter 不绑定确认（GNOME HIG：不可逆动作不绑 Enter）。
+        // 有 Risky 时 j/k 归 token 输入缓冲，仅方向键/翻页滚动（避免吞字符）。
         if app.confirm_has_risky() {
             match key {
+                KeyCode::Up => scroll_up(app, 1),
+                KeyCode::Down => scroll_down(app, 1),
+                KeyCode::PageUp => scroll_up(app, PAGE_STEP),
+                KeyCode::PageDown => scroll_down(app, PAGE_STEP),
                 KeyCode::Esc => {
                     app.confirm_delete = None;
                     app.confirm_input.clear();
+                    app.confirm_scroll = 0;
                 }
                 KeyCode::Backspace => {
                     app.confirm_input.pop();
@@ -317,7 +329,12 @@ fn handle_key(
                 KeyCode::Esc | KeyCode::Char('n') => {
                     app.confirm_delete = None;
                     app.confirm_input.clear();
+                    app.confirm_scroll = 0;
                 }
+                KeyCode::Up | KeyCode::Char('k') => scroll_up(app, 1),
+                KeyCode::Down | KeyCode::Char('j') => scroll_down(app, 1),
+                KeyCode::PageUp => scroll_up(app, PAGE_STEP),
+                KeyCode::PageDown => scroll_down(app, PAGE_STEP),
                 _ => {}
             }
         }
@@ -973,6 +990,7 @@ fn handle_results_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers, _eve
             let list = app.results_delete_list();
             if !list.is_empty() {
                 app.confirm_delete = Some(list);
+                app.confirm_scroll = 0;
             }
         }
         _ => {}
@@ -1301,10 +1319,18 @@ fn handle_analyzer_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
                                     String::new(),
                                     String::new(),
                                 ));
-                            crate::app::ConfirmItem { path, size, safety, impact, recovery }
+                            crate::app::ConfirmItem {
+                                path,
+                                size,
+                                safety,
+                                category: String::new(),
+                                impact,
+                                recovery,
+                            }
                         })
                         .collect();
                     app.confirm_delete = Some(items);
+                    app.confirm_scroll = 0;
                 }
             }
             _ => {}
@@ -1428,6 +1454,7 @@ mod tests {
             path: PathBuf::from("/x/docker_vms"),
             size: 1,
             safety: SafetyLevel::Risky,
+            category: "Docker".into(),
             impact: "卷内数据丢失".into(),
             recovery: "不可恢复".into(),
         }]);
