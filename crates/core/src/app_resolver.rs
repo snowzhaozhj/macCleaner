@@ -82,6 +82,8 @@ impl AppResolver {
 
     /// `scan_apps_streaming` 的可注入目录内核，供测试传入临时目录。
     fn scan_apps_in_dirs(app_dirs: &[PathBuf], reporter: &dyn ProgressReporter) {
+        let mut found_any = false;
+        let mut read_errors: Vec<String> = Vec::new();
         for dir in app_dirs {
             if !dir.exists() {
                 continue;
@@ -90,6 +92,7 @@ impl AppResolver {
                 Ok(entries) => entries,
                 Err(e) => {
                     warn!("无法读取应用目录 {dir:?}: {e:?}");
+                    read_errors.push(format!("{}: {e}", dir.display()));
                     continue;
                 }
             };
@@ -102,15 +105,28 @@ impl AppResolver {
                     continue;
                 }
                 match Self::read_app_info(&path) {
-                    Ok(info) => reporter.on_event(ProgressEvent::Found {
-                        category: "已安装应用".to_string(),
-                        path: info.path,
-                        size: info.size,
-                        safety: SafetyLevel::Moderate,
-                    }),
+                    Ok(info) => {
+                        found_any = true;
+                        reporter.on_event(ProgressEvent::Found {
+                            category: "已安装应用".to_string(),
+                            path: info.path,
+                            size: info.size,
+                            safety: SafetyLevel::Moderate,
+                        });
+                    }
                     Err(e) => debug!("解析应用信息失败 {path:?}: {e:?}"),
                 }
             }
+        }
+
+        // 一个应用都没发现、且确有目录读取失败：显式上报 I/O 错误，
+        // 避免 TUI 把"无法读取 /Applications"误显示为"未发现可清理的文件"。
+        if !found_any && !read_errors.is_empty() {
+            reporter.on_event(ProgressEvent::Error(format!(
+                "无法读取应用目录：{}",
+                read_errors.join("；")
+            )));
+            return;
         }
 
         reporter.on_event(ProgressEvent::Complete);
@@ -377,6 +393,7 @@ mod tests {
     struct RecReporter {
         found: std::sync::Mutex<Vec<PathBuf>>,
         complete: std::sync::atomic::AtomicBool,
+        error: std::sync::Mutex<Option<String>>,
         cancelled: bool,
     }
     impl RecReporter {
@@ -384,6 +401,7 @@ mod tests {
             Self {
                 found: std::sync::Mutex::new(Vec::new()),
                 complete: std::sync::atomic::AtomicBool::new(false),
+                error: std::sync::Mutex::new(None),
                 cancelled,
             }
         }
@@ -395,6 +413,7 @@ mod tests {
                 ProgressEvent::Complete => {
                     self.complete.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                ProgressEvent::Error(msg) => *self.error.lock().unwrap() = Some(msg),
                 _ => {}
             }
         }
@@ -432,6 +451,25 @@ mod tests {
         assert!(
             !rec.complete.load(std::sync::atomic::Ordering::Relaxed),
             "取消路径不发 Complete"
+        );
+    }
+
+    #[test]
+    fn scan_apps_in_dirs_reports_error_when_unreadable_and_no_apps() {
+        // 用一个普通文件冒充应用目录：exists() 为真但 read_dir 失败，
+        // 且没有发现任何 app —— 应上报 Error 而非静默 Complete（否则 TUI 误显"未发现"）。
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("not_a_dir");
+        fs::write(&fake, b"x").unwrap();
+
+        let rec = RecReporter::new(false);
+        AppResolver::scan_apps_in_dirs(&[fake], &rec);
+
+        assert!(rec.found.lock().unwrap().is_empty());
+        assert!(rec.error.lock().unwrap().is_some(), "读取失败且无应用时应上报 Error");
+        assert!(
+            !rec.complete.load(std::sync::atomic::Ordering::Relaxed),
+            "已上报 Error 的路径不再发 Complete"
         );
     }
 

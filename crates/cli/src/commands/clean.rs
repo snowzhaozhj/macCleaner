@@ -39,7 +39,7 @@ impl ProgressReporter for CliReporter {
             ProgressEvent::CleaningFile { path } => {
                 eprint!("\r清理中: {} ", path.display());
             }
-            ProgressEvent::CleaningDone { freed, count } => {
+            ProgressEvent::CleaningDone { freed, count, .. } => {
                 eprintln!(
                     "\r已清理 {} 个文件，释放 {}",
                     count,

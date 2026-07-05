@@ -462,12 +462,9 @@ fn handle_key(
         AppState::Scanning { .. } => {
             match key {
                 KeyCode::Esc | KeyCode::Backspace => {
-                    app.cancel_flag.store(true, Ordering::Relaxed);
-                    app.state = AppState::Menu;
-                    app.active_command = None;
-                    app.scan_result = None;
-                    app.expanded.clear();
-                    app.cancel_flag = Arc::new(AtomicBool::new(false));
+                    // 与 q 走同一条返回菜单路径（取消扫描 + back_to_menu 彻底清态），
+                    // 不再内联重复实现，避免两处清理逻辑漂移。
+                    request_leave_to_menu(app, analyze_rx, tree_builder, sort_rx);
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     app.move_cursor_up();
@@ -500,9 +497,7 @@ fn handle_key(
         AppState::Sorting => {
             match key {
                 KeyCode::Esc | KeyCode::Backspace => {
-                    app.state = AppState::Menu;
-                    app.active_command = None;
-                    *sort_rx = None; // drop Receiver 让排序线程 send 失败
+                    request_leave_to_menu(app, analyze_rx, tree_builder, sort_rx);
                 }
                 _ => {}
             }
@@ -798,10 +793,15 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
 
             // Clean 流式上报同一 (category, root.path) 的增量，此处按 path 合并到既有聚合项，
             // 避免重复插入。merged=true 表示只是给既有项累加 size（不新增计数）。
+            //
+            // 只比对**末项**而非线性查找全部 items：scan_with_rules 顺序处理各根，某分类的
+            // 当前可合并项恒为最后压入的那一项（新根到来才追加新末项）。Purge/Uninstall 的
+            // 每个 Found 都是唯一路径、末项必不匹配→直接 push。由此把每事件的合并从 O(n)
+            // 降为 O(1)，避免单分类累积上千项时的 O(n²) 主线程卡顿。
             let mut merged = false;
             if let Some(result) = app.scan_result.as_mut() {
                 if let Some(cat) = result.categories.iter_mut().find(|c| c.name == category) {
-                    if let Some(existing) = cat.items.iter_mut().find(|it| it.path == path) {
+                    if let Some(existing) = cat.items.last_mut().filter(|it| it.path == path) {
                         existing.size += size;
                         cat.total_size += size;
                         merged = true;
@@ -884,10 +884,10 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
                 *progress_text = path.display().to_string();
             }
         }
-        ProgressEvent::CleaningDone { freed, count } => {
+        ProgressEvent::CleaningDone { freed, count, deleted_paths } => {
             if let Some(ret) = app.analyzer_return.take() {
-                // 分析器发起的删除：剪树并原地返回，不拆树回菜单
-                restore_analyzer_after_delete(app, ret, freed, count);
+                // 分析器发起的删除：仅剪除成功删除的节点并原地返回，不拆树回菜单
+                restore_analyzer_after_delete(app, ret, freed, count, &deleted_paths);
             } else {
                 app.state = AppState::Done {
                     message: format!(
@@ -1193,6 +1193,7 @@ fn restore_analyzer_after_delete(
     ret: app::AnalyzerReturn,
     freed: u64,
     count: usize,
+    deleted_paths: &[PathBuf],
 ) {
     let app::AnalyzerReturn {
         tree,
@@ -1201,7 +1202,10 @@ fn restore_analyzer_after_delete(
         mut cursor_stack,
         deleted,
     } = ret;
-    let deleted_set: HashSet<PathBuf> = deleted.into_iter().collect();
+    // 仅按**成功**删除的路径剪树：失败项（权限/SIP/占用等）保留在树中，
+    // 界面显示的用量与磁盘保持一致，用户仍能看到并重试。
+    let failed = deleted.len().saturating_sub(deleted_paths.len());
+    let deleted_set: HashSet<PathBuf> = deleted_paths.iter().cloned().collect();
     let mut tree = tree;
     {
         let root = Arc::make_mut(&mut tree);
@@ -1214,6 +1218,15 @@ fn restore_analyzer_after_delete(
         cursor,
         cursor_stack,
     };
+    if failed > 0 {
+        app.status_message = Some(format!(
+            "已删除 {} 项，释放 {}；{} 项失败，仍保留",
+            count,
+            format_size(freed, DECIMAL),
+            failed
+        ));
+        return;
+    }
     app.status_message = Some(format!(
         "已删除 {} 项，释放 {}",
         count,
@@ -1529,6 +1542,46 @@ mod tests {
         };
         assert_eq!(found_count, 2);
         assert_eq!(found_size, 22);
+    }
+
+    #[test]
+    fn restore_analyzer_prunes_only_succeeded_and_keeps_failed() {
+        // 部分移废纸篓失败时：只剪除成功项，失败项保留在树中、size 据实重算，
+        // 并提示失败数 —— 避免界面与磁盘发散（评审 P2）。
+        use super::{restore_analyzer_after_delete, App, AppState};
+        use mc_core::models::DirNode;
+        use std::sync::Arc;
+
+        let mut root = DirNode::new_dir(PathBuf::from("/root"), "root".into());
+        root.size = 150;
+        root.children
+            .push(DirNode::new_file(PathBuf::from("/root/keep"), "keep".into(), 100));
+        root.children
+            .push(DirNode::new_file(PathBuf::from("/root/fail"), "fail".into(), 50));
+
+        let ret = crate::app::AnalyzerReturn {
+            tree: Arc::new(root),
+            nav_path: vec![],
+            cursor: 0,
+            cursor_stack: vec![],
+            // 两项都被请求删除
+            deleted: vec![PathBuf::from("/root/keep"), PathBuf::from("/root/fail")],
+        };
+
+        let mut app = App::new();
+        // 仅 keep 成功、fail 失败
+        restore_analyzer_after_delete(&mut app, ret, 100, 1, &[PathBuf::from("/root/keep")]);
+
+        let AppState::Analyzing { tree_root, .. } = &app.state else {
+            panic!("应回到 Analyzing 态");
+        };
+        let names: Vec<&str> = tree_root.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["fail"], "成功项剪除、失败项保留");
+        assert_eq!(tree_root.size, 50, "size 按剩余项重算");
+        assert!(
+            app.status_message.as_ref().unwrap().contains("1 项失败"),
+            "应提示失败数量"
+        );
     }
 
     #[test]

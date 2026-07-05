@@ -9,7 +9,13 @@ pub enum ProgressEvent {
     Complete,
     Error(String),
     CleaningFile { path: PathBuf },
-    CleaningDone { freed: u64, count: usize },
+    /// 清理完成。`deleted_paths` 仅含**成功**移除的路径（供分析器精确剪树，
+    /// 失败项须保留在视图中，避免界面与磁盘发散）。
+    CleaningDone {
+        freed: u64,
+        count: usize,
+        deleted_paths: Vec<PathBuf>,
+    },
 }
 
 pub trait ProgressReporter: Send + Sync {

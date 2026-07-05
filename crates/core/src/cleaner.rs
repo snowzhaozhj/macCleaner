@@ -46,9 +46,16 @@ impl Cleaner {
             }
         }
 
+        let deleted_paths: Vec<std::path::PathBuf> = report
+            .cleaned
+            .iter()
+            .filter(|c| c.success)
+            .map(|c| c.path.clone())
+            .collect();
         reporter.on_event(ProgressEvent::CleaningDone {
             freed: report.total_freed,
             count: report.success_count,
+            deleted_paths,
         });
 
         Ok(report)

@@ -292,7 +292,7 @@ impl Scanner {
                             return (path.clone(), 0, *safety, category.clone());
                         }
                         reporter.on_event(ProgressEvent::Scanning { path: path.clone() });
-                        let size = dir_size(path);
+                        let size = dir_size(path, reporter);
                         reporter.on_event(ProgressEvent::Found {
                             category: category.clone(),
                             path: path.clone(),
@@ -386,7 +386,7 @@ impl Scanner {
                         if reporter.is_cancelled() {
                             return (path.clone(), 0, *safety, category.clone());
                         }
-                        let size = dir_size(path);
+                        let size = dir_size(path, reporter);
                         // 每算完一个目录立刻上报，供 TUI 增量渲染
                         reporter.on_event(ProgressEvent::Found {
                             category: category.clone(),
@@ -465,8 +465,11 @@ fn flush_category_deltas(
     }
 }
 
-/// 使用 jwalk 并行计算目录总大小
-fn dir_size(path: &Path) -> u64 {
+/// 使用 jwalk 并行计算目录总大小。
+///
+/// 单个大目录（如 Docker/DerivedData 数十 GB）的遍历可达数秒~上百秒，故在消费循环里
+/// 每 1024 个 entry 检查一次取消：用户取消后尽快中止，不再空耗 CPU/IO 与新扫描抢占磁盘。
+fn dir_size(path: &Path, reporter: &dyn ProgressReporter) -> u64 {
     if !path.exists() {
         return 0;
     }
@@ -476,8 +479,13 @@ fn dir_size(path: &Path) -> u64 {
             prefetch_metadata(children);
         });
     let mut total: u64 = 0;
+    let mut seen: u64 = 0;
 
     for entry in walker.into_iter().flatten() {
+        seen += 1;
+        if seen.is_multiple_of(1024) && reporter.is_cancelled() {
+            break;
+        }
         if !entry.file_type().is_dir() {
             total += entry.client_state.unwrap_or(0);
         }
@@ -566,20 +574,20 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(sub.join("c.txt"), "1234567890").unwrap(); // 10 bytes
 
-        let size = dir_size(dir);
+        let size = dir_size(dir, &crate::progress::NoopReporter);
         assert_eq!(size, 21, "目录总大小应为 21 字节");
     }
 
     #[test]
     fn test_dir_size_empty_dir() {
         let tmp = tempdir().unwrap();
-        let size = dir_size(tmp.path());
+        let size = dir_size(tmp.path(), &crate::progress::NoopReporter);
         assert_eq!(size, 0, "空目录大小应为 0");
     }
 
     #[test]
     fn test_dir_size_nonexistent() {
-        let size = dir_size(Path::new("/nonexistent_path_xyz"));
+        let size = dir_size(Path::new("/nonexistent_path_xyz"), &crate::progress::NoopReporter);
         assert_eq!(size, 0, "不存在的路径大小应为 0");
     }
 
