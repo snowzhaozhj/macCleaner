@@ -11,7 +11,7 @@ use crate::ui::chrome;
 use humansize::{format_size, DECIMAL};
 use mc_core::models::{ScanResult, SafetyLevel};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 use ratatui::Frame;
@@ -42,7 +42,7 @@ pub fn render_flat_list(f: &mut Frame, app: &App, area: Rect, title: &str) {
         Block::default()
             .title(title.to_string())
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::c(Color::Cyan))),
+            .border_style(Style::default().fg(theme::accent())),
     );
 
     let mut state = ListState::default();
@@ -117,7 +117,7 @@ pub fn flat_row_item(
                     style,
                 ),
                 Span::styled(cat.name.clone(), style.add_modifier(Modifier::BOLD)),
-                Span::styled(detail, Style::default().fg(theme::c(Color::DarkGray))),
+                Span::styled(detail, Style::default().fg(theme::ink_muted())),
             ]))
         }
         FlatRow::Item { cat_idx, item_idx } => {
@@ -139,7 +139,7 @@ pub fn flat_row_item(
                 Span::styled(path_str, style),
                 Span::styled(
                     format!("  ({})", format_size(item.size, DECIMAL)),
-                    Style::default().fg(theme::c(Color::DarkGray)),
+                    Style::default().fg(theme::ink_muted()),
                 ),
             ]))
         }

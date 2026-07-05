@@ -8,7 +8,7 @@
 //! - `three_row_layout` 返回 [header, body, footer] 三段布局供各页复用。
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -34,7 +34,7 @@ pub fn render_header(f: &mut Frame, area: Rect, title: &str, left: Vec<Span<'_>>
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(crate::theme::c(Color::Cyan)));
+        .border_style(Style::default().fg(crate::theme::accent()));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -60,7 +60,7 @@ pub fn render_header(f: &mut Frame, area: Rect, title: &str, left: Vec<Span<'_>>
 
 /// 单行 footer 提示（DarkGray，无边框），复用现有底部 hint 样式。
 pub fn render_footer(f: &mut Frame, area: Rect, hint: &str) {
-    let para = Paragraph::new(hint).style(Style::default().fg(crate::theme::c(Color::DarkGray)));
+    let para = Paragraph::new(hint).style(Style::default().fg(crate::theme::ink_muted()));
     f.render_widget(para, area);
 }
 

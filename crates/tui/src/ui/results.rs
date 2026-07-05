@@ -4,7 +4,7 @@ use crate::ui::chrome;
 use humansize::{format_size, DECIMAL};
 use mc_core::models::SafetyLevel;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
@@ -27,19 +27,19 @@ pub fn draw(f: &mut Frame, app: &App) {
     let left = vec![
         Span::styled(
             "扫描结果: ",
-            Style::default().fg(theme::c(Color::DarkGray)),
+            Style::default().fg(theme::ink_muted()),
         ),
         Span::styled(
             format!("{total_count} 个文件, {}", format_size(total_size, DECIMAL)),
-            Style::default().fg(theme::c(Color::Cyan)),
+            Style::default().fg(theme::accent()),
         ),
     ];
     let right = vec![
-        Span::styled("已选: ", Style::default().fg(theme::c(Color::DarkGray))),
+        Span::styled("已选: ", Style::default().fg(theme::ink_muted())),
         Span::styled(
             format!("{selected_count} 项, {}", format_size(selected_size, DECIMAL)),
             Style::default()
-                .fg(theme::c(Color::Green))
+                .fg(theme::success())
                 .add_modifier(Modifier::BOLD),
         ),
     ];
@@ -135,7 +135,7 @@ fn render_detail(f: &mut Frame, area: Rect, detail: &DetailView) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::c(Color::DarkGray)))
+        .border_style(Style::default().fg(theme::border_subtle()))
         .title(" 详情 ");
     let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     f.render_widget(para, area);

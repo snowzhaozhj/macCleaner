@@ -2,7 +2,7 @@ use crate::app::App;
 use crate::theme;
 use crate::ui::chrome;
 use ratatui::layout::{Constraint, Direction, Layout, Alignment};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
@@ -31,13 +31,13 @@ pub fn draw(f: &mut Frame, app: &App) {
             Span::styled(
                 " macCleaner ",
                 Style::default()
-                    .fg(theme::c(Color::Cyan))
+                    .fg(theme::accent())
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(Span::styled(
             " macOS 系统清理工具",
-            Style::default().fg(theme::c(Color::DarkGray)),
+            Style::default().fg(theme::ink_muted()),
         )),
     ])
     .alignment(Alignment::Center);
@@ -51,16 +51,16 @@ pub fn draw(f: &mut Frame, app: &App) {
             let marker = if i == app.menu_index { "▶ " } else { "  " };
             let style = if i == app.menu_index {
                 Style::default()
-                    .fg(theme::c(Color::Cyan))
+                    .fg(theme::accent())
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::c(Color::White))
+                Style::default().fg(theme::ink())
             };
             ListItem::new(vec![
                 Line::from(Span::styled(format!("{marker}{name}"), style)),
                 Line::from(Span::styled(
                     format!("    {desc}"),
-                    Style::default().fg(theme::c(Color::DarkGray)),
+                    Style::default().fg(theme::ink_muted()),
                 )),
             ])
         })
@@ -71,7 +71,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             Block::default()
                 .title(" 选择操作 ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::c(Color::Cyan))),
+                .border_style(Style::default().fg(theme::accent())),
         );
 
     let mut state = ListState::default();

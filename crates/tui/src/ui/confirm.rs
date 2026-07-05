@@ -4,7 +4,7 @@ use crate::ui::chrome;
 use humansize::{format_size, DECIMAL};
 use mc_core::models::SafetyLevel;
 use ratatui::layout::Alignment;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
@@ -30,14 +30,14 @@ pub fn draw(f: &mut Frame, app: &App) {
         Line::from(""),
         Line::from(Span::styled(
             " 确认删除?",
-            Style::default().fg(theme::c(Color::Yellow)).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::warning()).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  项目数量: ", Style::default().fg(theme::c(Color::DarkGray))),
-            Span::styled(format!("{count}"), Style::default().fg(theme::c(Color::Cyan))),
-            Span::styled("    预计释放: ", Style::default().fg(theme::c(Color::DarkGray))),
-            Span::styled(format_size(total, DECIMAL), Style::default().fg(theme::c(Color::Green))),
+            Span::styled("  项目数量: ", Style::default().fg(theme::ink_muted())),
+            Span::styled(format!("{count}"), Style::default().fg(theme::accent())),
+            Span::styled("    预计释放: ", Style::default().fg(theme::ink_muted())),
+            Span::styled(format_size(total, DECIMAL), Style::default().fg(theme::success())),
         ]),
         Line::from(""),
     ];
@@ -56,7 +56,7 @@ pub fn draw(f: &mut Frame, app: &App) {
                 Span::styled(item.path.display().to_string(), red.add_modifier(Modifier::BOLD)),
                 Span::styled(
                     format!("  ({})", format_size(item.size, DECIMAL)),
-                    Style::default().fg(theme::c(Color::DarkGray)),
+                    Style::default().fg(theme::ink_muted()),
                 ),
             ]));
             if !item.impact.trim().is_empty() {
@@ -65,7 +65,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             if !item.recovery.trim().is_empty() {
                 lines.push(Line::from(Span::styled(
                     format!("      恢复: {}", item.recovery),
-                    Style::default().fg(theme::c(Color::DarkGray)),
+                    Style::default().fg(theme::ink_muted()),
                 )));
             }
         }
@@ -75,18 +75,18 @@ pub fn draw(f: &mut Frame, app: &App) {
     // 其余（非 Risky）项：最多 MAX_SHOWN 条，让用户看清"到底删什么"
     for item in others.iter().take(MAX_SHOWN) {
         lines.push(Line::from(vec![
-            Span::styled("  • ", Style::default().fg(theme::c(Color::Red))),
-            Span::styled(item.path.display().to_string(), Style::default().fg(theme::c(Color::White))),
+            Span::styled("  • ", Style::default().fg(theme::danger())),
+            Span::styled(item.path.display().to_string(), Style::default().fg(theme::ink())),
             Span::styled(
                 format!("  ({})", format_size(item.size, DECIMAL)),
-                Style::default().fg(theme::c(Color::DarkGray)),
+                Style::default().fg(theme::ink_muted()),
             ),
         ]));
     }
     if others.len() > MAX_SHOWN {
         lines.push(Line::from(Span::styled(
             format!("  …… 还有 {} 项", others.len() - MAX_SHOWN),
-            Style::default().fg(theme::c(Color::DarkGray)),
+            Style::default().fg(theme::ink_muted()),
         )));
     }
 
@@ -97,7 +97,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         lines.push(Line::from(Span::styled(
             format!("  ⚠ 其中 {hidden} 项不在当前过滤视图中，仍将一并删除"),
             Style::default()
-                .fg(theme::c(Color::Yellow))
+                .fg(theme::warning())
                 .add_modifier(Modifier::BOLD),
         )));
     }
@@ -105,7 +105,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  文件将移至废纸篓（可恢复）",
-        Style::default().fg(theme::c(Color::DarkGray)),
+        Style::default().fg(theme::ink_muted()),
     )));
     lines.push(Line::from(""));
 
@@ -113,28 +113,29 @@ pub fn draw(f: &mut Frame, app: &App) {
     if has_risky {
         lines.push(Line::from(Span::styled(
             format!("  含危险项：请输入 {} 确认删除（Enter 无效）", crate::CONFIRM_TOKEN),
-            Style::default().fg(theme::c(Color::Red)).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::danger()).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(vec![
-            Span::styled("  已输入: ", Style::default().fg(theme::c(Color::DarkGray))),
+            Span::styled("  已输入: ", Style::default().fg(theme::ink_muted())),
             Span::styled(
                 format!("{}▏", app.confirm_input),
-                Style::default().fg(theme::c(Color::Yellow)),
+                Style::default().fg(theme::warning()),
             ),
-            Span::styled("    [Esc] 取消", Style::default().fg(theme::c(Color::Red))),
+            Span::styled("    [Esc] 取消", Style::default().fg(theme::danger())),
         ]));
     } else {
         lines.push(Line::from(vec![
             Span::styled(
                 "  [Enter] 确认  ",
-                Style::default().fg(theme::c(Color::Green)).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::success()).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  [Esc] 取消", Style::default().fg(theme::c(Color::Red))),
+            Span::styled("  [Esc] 取消", Style::default().fg(theme::danger())),
         ]));
     }
 
     let height = u16::try_from(lines.len()).unwrap_or(0).saturating_add(2);
-    let border = if has_risky { Color::Red } else { Color::Yellow };
+    // 边框语义：含 Risky → danger（破坏性），否则 warning（一般确认）
+    let border = if has_risky { theme::danger() } else { theme::warning() };
     let area = chrome::centered_rect(64, height, f.area());
     f.render_widget(Clear, area);
     f.render_widget(
@@ -142,7 +143,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             Block::default()
                 .title(" 确认删除 ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::c(border))),
+                .border_style(Style::default().fg(border)),
         ),
         area,
     );
