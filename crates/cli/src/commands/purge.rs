@@ -102,6 +102,9 @@ pub fn run(cli: &Cli) -> Result<()> {
     let mode = if cli.permanent { DeleteMode::Permanent } else { DeleteMode::Trash };
     let report = Engine::clean(&items, mode, &reporter)?;
 
+    // 写入只读账本（#24）：优雅降级，失败不影响清理结果
+    super::history::record(mc_core::history::HistoryCommand::Purge, &items, &report);
+
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if report.failure_count > 0 {
