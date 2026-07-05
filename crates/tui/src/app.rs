@@ -202,6 +202,31 @@ impl App {
         rows
     }
 
+    /// 当前光标所在行的详情面板内容（U5）。光标可能落在 Separator/Category/Item 任一行，
+    /// 各自给出对应说明，保证任何位置都有可读内容、不 panic。
+    pub fn current_detail(&self) -> DetailView {
+        let rows = self.build_flat_rows();
+        let (Some(row), Some(result)) = (rows.get(self.result_cursor), self.scan_result.as_ref())
+        else {
+            return DetailView::Empty;
+        };
+        match row {
+            FlatRow::Separator { level } => DetailView::Level(*level),
+            FlatRow::Category { cat_idx, .. } => {
+                let cat = &result.categories[*cat_idx];
+                DetailView::Level(Self::dominant_safety(cat))
+            }
+            FlatRow::Item { cat_idx, item_idx } => {
+                let item = &result.categories[*cat_idx].items[*item_idx];
+                DetailView::Item {
+                    safety: item.safety,
+                    impact: item.impact.clone(),
+                    recovery: item.recovery.clone(),
+                }
+            }
+        }
+    }
+
     /// 项的显示名（文件名，小写），用于过滤匹配
     fn item_name(item: &mc_core::models::ScanItem) -> String {
         item.path
@@ -508,6 +533,21 @@ pub enum FlatRow {
     Item { cat_idx: usize, item_idx: usize },
 }
 
+/// 结果页详情面板内容（U5）：随光标位置给出可读说明。
+#[derive(Debug, Clone)]
+pub enum DetailView {
+    /// 无扫描结果或空列表
+    Empty,
+    /// 光标在分区/分类行：展示该等级的 rubric 一句话
+    Level(SafetyLevel),
+    /// 光标在文件项：展示该项的影响与恢复方式（evidence 为空则显示占位）
+    Item {
+        safety: SafetyLevel,
+        impact: String,
+        recovery: String,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +581,44 @@ mod tests {
         app.scan_result = Some(ScanResult::from_categories(vec![cat]));
         app.expanded = vec![true];
         app
+    }
+
+    #[test]
+    fn current_detail_resolves_item_and_level_rows() {
+        let items = vec![ScanItem::new(PathBuf::from("/x/nm"), 20, SafetyLevel::Moderate, "c".into())
+            .with_evidence("依赖被清空".into(), "npm install".into())];
+        let cat = CategoryGroup::new("c".into(), items);
+        let mut app = App::new();
+        app.scan_result = Some(ScanResult::from_categories(vec![cat]));
+        app.expanded = vec![true];
+
+        let rows = app.build_flat_rows();
+        // 光标落在 Item 行 → DetailView::Item 带 impact/recovery
+        let item_idx = rows
+            .iter()
+            .position(|r| matches!(r, FlatRow::Item { .. }))
+            .expect("应有 Item 行");
+        app.result_cursor = item_idx;
+        match app.current_detail() {
+            DetailView::Item { impact, recovery, safety } => {
+                assert_eq!(safety, SafetyLevel::Moderate);
+                assert_eq!(impact, "依赖被清空");
+                assert_eq!(recovery, "npm install");
+            }
+            other => panic!("Item 行应返回 DetailView::Item，实际 {other:?}"),
+        }
+
+        // 光标落在分区/分类行 → DetailView::Level，不 panic
+        let sep_idx = rows
+            .iter()
+            .position(|r| matches!(r, FlatRow::Separator { .. }))
+            .expect("应有 Separator 行");
+        app.result_cursor = sep_idx;
+        assert!(matches!(app.current_detail(), DetailView::Level(_)));
+
+        // 无扫描结果 → Empty
+        let empty = App::new();
+        assert!(matches!(empty.current_detail(), DetailView::Empty));
     }
 
     #[test]
