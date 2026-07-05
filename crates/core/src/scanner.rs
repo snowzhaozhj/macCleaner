@@ -1,4 +1,5 @@
 use crate::models::{CategoryGroup, SafetyLevel, ScanItem, ScanResult};
+use crate::park_walk::{park_walk, prefetch_sizes};
 use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::rules::{
     clean_rules, matches_root_markers, purge_rules, CleanRule, PathPattern, RootMarker,
@@ -44,6 +45,85 @@ fn walk_parallelism() -> jwalk::Parallelism {
         jwalk::Parallelism::RayonDefaultPool { busy_timeout: std::time::Duration::from_secs(1) }
     } else {
         jwalk::Parallelism::RayonNewPool(threads)
+    }
+}
+
+/// 并行 walk 的后端选择（issue #20 / plan 010）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WalkEngine {
+    /// jwalk 0.8.1 自旋式并行（现状默认，零回退风险）。
+    Jwalk,
+    /// 自写 park 式阻塞 work-queue（空闲挂起，0 CPU）。见 `crate::park_walk`。
+    Park,
+}
+
+/// `MC_WALK_ENGINE` 路由：`park` → park 引擎；其余（含未设、非法值）→ jwalk（默认）。
+///
+/// 门控在此（plan 010 R7）：干净（无 EDR）机复测确认不退化前，默认保持 jwalk 现状行为。
+fn walk_engine() -> WalkEngine {
+    match std::env::var("MC_WALK_ENGINE").as_deref() {
+        Ok("park") => WalkEngine::Park,
+        _ => WalkEngine::Jwalk,
+    }
+}
+
+/// park 引擎 worker 数：`MC_WALK_THREADS`（≥1）覆盖，缺省 3（对齐 macOS 下 jwalk 默认并行度）。
+/// park worker 空闲挂起、不自旋，故线程数只影响 I/O 重叠度而非 CPU 自旋（与 jwalk 关键区别）。
+fn park_threads() -> usize {
+    std::env::var("MC_WALK_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(3)
+}
+
+/// 磁盘分析（analyze）全树遍历：对**除根以外**的每个 entry 调 `on_entry(name, path, size, is_file)`
+/// （目录 size=0），并周期性查 `is_cancelled` 及时中止。内部按 `MC_WALK_ENGINE` 选后端，
+/// UI 侧（TUI 实时建树 / CLI 一次性建树）无需感知遍历实现。
+///
+/// 交付顺序：jwalk 为 DFS 序，park 为完成序——消费方（`IncrementalTreeBuilder` 路径键控插入）
+/// 与顺序解耦，两者结果逐字节一致（R3）。
+pub fn analyze_walk<X, C>(root: &Path, is_cancelled: X, mut on_entry: C)
+where
+    X: Fn() -> bool,
+    C: FnMut(String, PathBuf, u64, bool),
+{
+    let file_name = |path: &Path| {
+        path.file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+    };
+    match walk_engine() {
+        WalkEngine::Jwalk => {
+            let walker = create_walker(root).process_read_dir(|_d, _p, _s, children| {
+                prefetch_metadata(children);
+            });
+            for entry in walker.into_iter().flatten() {
+                if is_cancelled() {
+                    break;
+                }
+                let path = entry.path();
+                if path == root {
+                    continue; // 跳过根自身（jwalk 把根作为顶层 entry 上报）
+                }
+                let is_file = !entry.file_type().is_dir();
+                let size = if is_file { entry.client_state.unwrap_or(0) } else { 0 };
+                on_entry(file_name(&path), path, size, is_file);
+            }
+        }
+        WalkEngine::Park => {
+            park_walk(
+                root,
+                park_threads(),
+                |children| prefetch_sizes(children),
+                is_cancelled,
+                |e| {
+                    if e.path == root {
+                        return; // 跳过根自身（park 同样把根作为 entry 交付）
+                    }
+                    on_entry(file_name(&e.path), e.path, e.size, !e.is_dir);
+                },
+            );
+        }
     }
 }
 
@@ -129,6 +209,120 @@ impl Meta {
     }
 }
 
+/// clean 扫描中一个根路径及其被包含的子规则（最长前缀归类的候选）。
+struct RootEntry {
+    path: PathBuf,
+    meta: Meta,
+    children: Vec<(PathBuf, Meta)>,
+}
+
+/// clean 单根遍历的消费端：把「最长前缀归类 + 流式 delta 上报」从遍历后端解耦，
+/// 供 jwalk（in-order 迭代）与 park（完成序批交付）**两路共用同一份逻辑**，避免分叉。
+///
+/// 只接收**文件** entry（目录在两路各自过滤掉），故交付顺序不影响结果（各文件独立归类、
+/// size 累加到基路径）。承接 plan 009 R4 的流式聚合不变式（键 = 删除粒度的 `PathBuf`）。
+struct CleanRootSink<'a> {
+    root: &'a RootEntry,
+    reporter: &'a dyn ProgressReporter,
+    base_meta: &'a HashMap<PathBuf, Meta>,
+    category_map: &'a mut HashMap<String, Vec<ScanItem>>,
+    size_by_base: HashMap<PathBuf, u64>,
+    emitted_by_base: HashMap<PathBuf, u64>,
+    batch_count: usize,
+    /// 达到某个 200-批时观测到取消——jwalk 路径据此 break；park 路径由引擎自身中止。
+    cancelled: bool,
+}
+
+impl<'a> CleanRootSink<'a> {
+    fn new(
+        root: &'a RootEntry,
+        reporter: &'a dyn ProgressReporter,
+        base_meta: &'a HashMap<PathBuf, Meta>,
+        category_map: &'a mut HashMap<String, Vec<ScanItem>>,
+    ) -> Self {
+        Self {
+            root,
+            reporter,
+            base_meta,
+            category_map,
+            size_by_base: HashMap::new(),
+            emitted_by_base: HashMap::new(),
+            batch_count: 0,
+            cancelled: false,
+        }
+    }
+
+    /// 归类单个文件并累加大小；每 200 个触发一次流式 delta flush（让 TUI 边扫边填充）。
+    fn push_file(&mut self, path: PathBuf, size: u64) {
+        self.batch_count += 1;
+
+        // 最长前缀匹配：文件归入最具体的子规则（连同其基路径），否则归入根规则。
+        // size 累加到**基路径**而非分类名——流式 Found 才能挂在真实子路径上（P0）。
+        let (base, meta) = self
+            .root
+            .children
+            .iter()
+            .rev()
+            .find(|(child_path, _)| path.starts_with(child_path))
+            .map_or_else(|| (&self.root.path, &self.root.meta), |(p, m)| (p, m));
+
+        *self.size_by_base.entry(base.clone()).or_insert(0) += size;
+
+        let item = meta.clone().into_item(path.clone(), size);
+        self.category_map
+            .entry(item.category.clone())
+            .or_default()
+            .push(item);
+
+        if self.batch_count.is_multiple_of(200) {
+            if self.reporter.is_cancelled() {
+                self.cancelled = true;
+                return;
+            }
+            self.reporter.on_event(ProgressEvent::Scanning { path });
+            flush_base_deltas(
+                self.reporter,
+                &self.size_by_base,
+                &mut self.emitted_by_base,
+                self.base_meta,
+            );
+        }
+    }
+
+    /// 收尾：上报剩余增量（不足 200 的尾巴）。
+    fn finish(&mut self) {
+        flush_base_deltas(
+            self.reporter,
+            &self.size_by_base,
+            &mut self.emitted_by_base,
+            self.base_meta,
+        );
+    }
+}
+
+/// purge 剪枝判定：`name` 命中某条 `DirName` 规则且满足项目根守卫时，记录 `(path, meta)`
+/// 到 `matched` 并返回 `true`（应剪枝、不深入其子树）。jwalk 与 park 两路共用。
+fn purge_try_match(
+    name: &str,
+    entry_path: &Path,
+    dirname_rules: &[(String, Vec<RootMarker>, Meta)],
+    matched: &Mutex<Vec<(PathBuf, Meta)>>,
+) -> bool {
+    for (dir_name, markers, meta) in dirname_rules {
+        if name == dir_name.as_str() {
+            // 项目根守卫：不满足标记则跳过此规则（如无 Cargo.toml 的 target），消除误报。
+            if !matches_root_markers(markers, entry_path) {
+                continue;
+            }
+            if let Ok(mut dirs) = matched.lock() {
+                dirs.push((entry_path.to_path_buf(), meta.clone()));
+            }
+            return true;
+        }
+    }
+    false
+}
+
 pub struct Scanner;
 
 impl Scanner {
@@ -168,13 +362,7 @@ impl Scanner {
         all_paths.sort_by(|a, b| a.0.cmp(&b.0));
 
         // 识别根路径（不被其他路径包含的路径）
-        // 对于被包含的路径，记录为子规则
-        struct RootEntry {
-            path: PathBuf,
-            meta: Meta,
-            children: Vec<(PathBuf, Meta)>,
-        }
-
+        // 对于被包含的路径，记录为子规则（RootEntry 定义已上移到模块级，供 CleanRootSink 引用）
         let mut roots: Vec<RootEntry> = Vec::new();
         for (path, meta) in &all_paths {
             let is_child = roots.iter_mut().any(|root| {
@@ -210,20 +398,6 @@ impl Scanner {
                 path: root.path.clone(),
             });
 
-            let walker = create_walker(&root.path)
-                .process_read_dir(|_depth, _path, _state, children| {
-                    children.retain(|entry| {
-                        if let Ok(ref e) = entry {
-                            if e.file_type().is_dir() {
-                                let name = e.file_name().to_string_lossy();
-                                return !SKIP_DIRS.contains(&name.as_ref());
-                            }
-                        }
-                        true
-                    });
-                    prefetch_metadata(children);
-                });
-
             // 预计算本根下各**匹配基路径**的 meta，用于流式上报 Found。
             // 键必须是删除粒度的键（路径 PathBuf），不能是展示粒度的键（分类名）——
             // 否则同根下的子规则（如"浏览器缓存"，其基路径是 ~/Library/Caches/Google/Chrome）
@@ -234,62 +408,58 @@ impl Scanner {
                 base_meta.insert(child_path.clone(), m.clone());
             }
 
-            let mut batch_count: usize = 0;
-            // 每个基路径的大小累加器：(base_path, 累计 size)
-            let mut size_by_base: HashMap<PathBuf, u64> = HashMap::new();
-            // 已流式上报的累计 size，用于计算增量（delta）
-            let mut emitted_by_base: HashMap<PathBuf, u64> = HashMap::new();
+            // 归类 + 流式上报逻辑收敛到 CleanRootSink，jwalk / park 两路共用同一份。
+            let mut sink = CleanRootSink::new(root, reporter, &base_meta, &mut category_map);
 
-            for entry in walker {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-
-                if entry.file_type().is_dir() {
-                    continue;
-                }
-
-                let size = entry.client_state.unwrap_or(0);
-                let path = entry.path();
-
-                batch_count += 1;
-
-                // 最长前缀匹配：文件归入最具体的子规则（连同其基路径），否则归入根规则。
-                // size 累加到**基路径**而非分类名——流式 Found 才能挂在真实子路径上。
-                let (base, meta) = root
-                    .children
-                    .iter()
-                    .rev()
-                    .find(|(child_path, _)| path.starts_with(child_path))
-                    .map_or_else(|| (&root.path, &root.meta), |(p, m)| (p, m));
-
-                *size_by_base.entry(base.clone()).or_insert(0) += size;
-
-                let item = meta.clone().into_item(path.clone(), size);
-                category_map
-                    .entry(item.category.clone())
-                    .or_default()
-                    .push(item);
-
-                // 每 200 个文件流式上报一次各分类的增量，让 TUI 列表边扫边填充，
-                // 而不是等整个根目录遍历完才一次性出现（Clean 卡顿感的根因）。
-                if batch_count.is_multiple_of(200) {
-                    if reporter.is_cancelled() {
-                        break;
+            match walk_engine() {
+                WalkEngine::Jwalk => {
+                    let walker = create_walker(&root.path).process_read_dir(
+                        |_depth, _path, _state, children| {
+                            children.retain(|entry| {
+                                if let Ok(ref e) = entry {
+                                    if e.file_type().is_dir() {
+                                        let name = e.file_name().to_string_lossy();
+                                        return !SKIP_DIRS.contains(&name.as_ref());
+                                    }
+                                }
+                                true
+                            });
+                            prefetch_metadata(children);
+                        },
+                    );
+                    for entry in walker {
+                        let Ok(entry) = entry else { continue };
+                        if entry.file_type().is_dir() {
+                            continue;
+                        }
+                        sink.push_file(entry.path(), entry.client_state.unwrap_or(0));
+                        if sink.cancelled {
+                            break;
+                        }
                     }
-                    reporter.on_event(ProgressEvent::Scanning { path });
-                    flush_base_deltas(
-                        reporter,
-                        &size_by_base,
-                        &mut emitted_by_base,
-                        &base_meta,
+                }
+                WalkEngine::Park => {
+                    // park 按完成序批交付；文件独立归类，顺序无关。取消由引擎内部中止。
+                    park_walk(
+                        &root.path,
+                        park_threads(),
+                        |children| {
+                            children.retain(|c| {
+                                !(c.is_dir && SKIP_DIRS.contains(&c.file_name().as_ref()))
+                            });
+                            prefetch_sizes(children);
+                        },
+                        || reporter.is_cancelled(),
+                        |e| {
+                            if !e.is_dir {
+                                sink.push_file(e.path, e.size);
+                            }
+                        },
                     );
                 }
             }
 
-            // 收尾：上报剩余增量（不足 200 的尾巴）
-            flush_base_deltas(reporter, &size_by_base, &mut emitted_by_base, &base_meta);
+            sink.finish();
         }
 
         let result = build_scan_result(category_map, reporter);
@@ -377,56 +547,86 @@ impl Scanner {
             Arc::new(Mutex::new(Vec::new()));
 
         let dirname_rules_arc = Arc::new(dirname_rules);
-        let matched_clone = matched_dirs.clone();
-        let dirname_clone = dirname_rules_arc.clone();
 
-        let walker = create_walker(base_path)
-            .process_read_dir(move |_depth, _path, _state, children| {
-                children.retain(|entry| {
-                    if let Ok(ref e) = entry {
-                        if e.file_type().is_dir() {
-                            let name = e.file_name().to_string_lossy();
-
-                            if PURGE_SKIP_DIRS.contains(&name.as_ref()) {
-                                return false;
-                            }
-
-                            let entry_path = e.path();
-
-                            for (dir_name, markers, meta) in dirname_clone.iter() {
-                                if name.as_ref() == dir_name.as_str() {
-                                    // 项目根守卫：不满足标记则跳过此规则（如无 Cargo.toml 的 target、
-                                    // 无 package.json 的 build），消除按目录名匹配的误报。
-                                    if !matches_root_markers(markers, &entry_path) {
-                                        continue;
+        // 剪枝遍历（剪枝后只触碰非匹配目录）：命中目录名 + 守卫即收集并剪枝。
+        // 遍历整棵树可能耗时数秒——期间周期性上报当前目录，否则界面像卡死（对齐 Analyze）。
+        // 匹配判定收敛到 purge_try_match，jwalk / park 两路共用；结果与遍历顺序无关。
+        match walk_engine() {
+            WalkEngine::Jwalk => {
+                let matched_clone = matched_dirs.clone();
+                let dirname_clone = dirname_rules_arc.clone();
+                let walker = create_walker(base_path).process_read_dir(
+                    move |_depth, _path, _state, children| {
+                        children.retain(|entry| {
+                            if let Ok(ref e) = entry {
+                                if e.file_type().is_dir() {
+                                    let name = e.file_name().to_string_lossy();
+                                    if PURGE_SKIP_DIRS.contains(&name.as_ref()) {
+                                        return false;
                                     }
-                                    if let Ok(mut dirs) = matched_clone.lock() {
-                                        dirs.push((entry_path, meta.clone()));
+                                    if purge_try_match(
+                                        &name,
+                                        &e.path(),
+                                        &dirname_clone,
+                                        &matched_clone,
+                                    ) {
+                                        return false; // 剪枝：不进入匹配的目录子树
                                     }
-                                    return false; // 剪枝：不进入匹配的目录子树
                                 }
+                            }
+                            true
+                        });
+                    },
+                );
+                let mut walked: u64 = 0;
+                for entry in walker {
+                    if reporter.is_cancelled() {
+                        break;
+                    }
+                    if let Ok(e) = entry {
+                        if e.file_type().is_dir() {
+                            walked += 1;
+                            if walked.is_multiple_of(48) {
+                                reporter.on_event(ProgressEvent::Scanning { path: e.path() });
                             }
                         }
                     }
-                    true
-                });
-            });
-
-        // 快速遍历（剪枝后只触碰非匹配目录）。
-        // 遍历整棵树可能耗时数秒——期间必须周期性上报当前目录，否则界面停在
-        // "已扫描 0 | 当前:空 + spinner" 看起来像卡死（对齐 Analyze 的实时反馈）。
-        let mut walked: u64 = 0;
-        for entry in walker {
-            if reporter.is_cancelled() {
-                break;
-            }
-            if let Ok(e) = entry {
-                if e.file_type().is_dir() {
-                    walked += 1;
-                    if walked.is_multiple_of(48) {
-                        reporter.on_event(ProgressEvent::Scanning { path: e.path() });
-                    }
                 }
+            }
+            WalkEngine::Park => {
+                let mut walked: u64 = 0;
+                park_walk(
+                    base_path,
+                    park_threads(),
+                    |children| {
+                        children.retain(|c| {
+                            if c.is_dir {
+                                let name = c.file_name();
+                                if PURGE_SKIP_DIRS.contains(&name.as_ref()) {
+                                    return false;
+                                }
+                                if purge_try_match(
+                                    &name,
+                                    &c.path,
+                                    &dirname_rules_arc,
+                                    &matched_dirs,
+                                ) {
+                                    return false; // 剪枝
+                                }
+                            }
+                            true
+                        });
+                    },
+                    || reporter.is_cancelled(),
+                    |e| {
+                        if e.is_dir {
+                            walked += 1;
+                            if walked.is_multiple_of(48) {
+                                reporter.on_event(ProgressEvent::Scanning { path: e.path });
+                            }
+                        }
+                    },
+                );
             }
         }
 

@@ -548,52 +548,34 @@ fn start_command(
                 let tx_clone = tx.clone();
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                        let root_len = home.components().count();
-                        let walker = mc_core::create_walker(std::path::Path::new(&home))
-                            .process_read_dir(|_depth, _path, _state, children| {
-                                mc_core::prefetch_metadata(children);
-                            });
+                        // 取消信号：Receiver drop（用户离开 analyze）→ send 失败 → 置 stop。
+                        // jwalk 按 entry、park 按批查此 flag 及时中止遍历。
+                        let stop = std::sync::atomic::AtomicBool::new(false);
                         let mut count = 0u64;
                         let mut total = 0u64;
-                        for entry in walker.into_iter().filter_map(std::result::Result::ok) {
-                            let is_file = !entry.file_type().is_dir();
-                            let size = if is_file {
-                                entry.client_state.unwrap_or(0)
-                            } else {
-                                0
-                            };
-                            let entry_path = entry.path();
-                            let depth = entry_path.components().count() - root_len;
-                            if depth == 0 {
-                                continue;
-                            }
-                            let name = entry
-                                .file_name()
-                                .to_string_lossy()
-                                .into_owned();
-                            if tx_clone
-                                .send(AnalyzeEvent::Entry {
-                                    depth,
-                                    name,
-                                    path: entry_path,
-                                    size,
-                                    is_file,
-                                })
-                                .is_err()
-                            {
-                                return; // Receiver 已 drop（用户取消），直接退出
-                            }
-                            if is_file {
-                                count += 1;
-                                total += size;
-                                if count.is_multiple_of(500) {
-                                    let _ = tx_clone.send(AnalyzeEvent::Progress {
-                                        file_count: count,
-                                        total_size: total,
-                                    });
+                        mc_core::analyze_walk(
+                            &home,
+                            || stop.load(std::sync::atomic::Ordering::Relaxed),
+                            |name, path, size, is_file| {
+                                if tx_clone
+                                    .send(AnalyzeEvent::Entry { name, path, size, is_file })
+                                    .is_err()
+                                {
+                                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    return;
                                 }
-                            }
-                        }
+                                if is_file {
+                                    count += 1;
+                                    total += size;
+                                    if count.is_multiple_of(500) {
+                                        let _ = tx_clone.send(AnalyzeEvent::Progress {
+                                            file_count: count,
+                                            total_size: total,
+                                        });
+                                    }
+                                }
+                            },
+                        );
                     }));
                 // 无论正常完成还是 panic，都发送 Finished
                 let _ = tx.send(AnalyzeEvent::Finished);
@@ -822,7 +804,6 @@ fn handle_analyze_entry(
 ) {
     match evt {
         AnalyzeEvent::Entry {
-            depth,
             name,
             path,
             size,
@@ -837,7 +818,7 @@ fn handle_analyze_entry(
                 ..
             } = &mut app.state
             {
-                let _ = builder.integrate_entry(tree_root, depth, name, path, size, is_file);
+                let _ = builder.integrate_entry(tree_root, name, path, size, is_file);
                 if is_file {
                     *file_count += 1;
                     *total_size += size;

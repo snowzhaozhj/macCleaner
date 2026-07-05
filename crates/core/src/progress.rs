@@ -41,9 +41,10 @@ impl ProgressReporter for NoopReporter {
 
 /// 磁盘分析增量遍历事件，通过独立 channel 传输，不经过 `ProgressReporter`。
 pub enum AnalyzeEvent {
-    /// 发现一个文件或目录 entry（每个 entry 一条）
+    /// 发现一个文件或目录 entry（每个 entry 一条）。
+    /// 无 `depth` 字段：树构建改为**路径键控插入**（见 `mc_tui` 的 `IncrementalTreeBuilder`），
+    /// 父子关系由路径推导，与交付顺序解耦——不再依赖遍历方（jwalk/park）给出 DFS 深度。
     Entry {
-        depth: usize,        // 相对于遍历根的深度，根的直接子项 depth=1
         name: String,
         path: PathBuf,
         size: u64,           // 文件的字节大小；目录为 0
