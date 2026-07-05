@@ -32,21 +32,48 @@ const WALK_THREADS: usize = 0;
 /// 带预取 metadata 的 walker `类型别名：client_state` 存储文件大小 Option<u64>
 pub type MetaWalkDir = jwalk::WalkDirGeneric<((), Option<u64>)>;
 
+/// 主遍历并行度：默认 macOS 3 线程、其他平台 jwalk 默认池；
+/// `MC_WALK_THREADS` 环境变量可在运行时覆盖（用于阶段 A 的线程数↔速度测量与阶段 C 调参，
+/// 见 plan 009 U1/KTD1）。缺省时行为与改动前完全一致。
+fn walk_parallelism() -> jwalk::Parallelism {
+    let threads = std::env::var("MC_WALK_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(WALK_THREADS);
+    if threads == 0 {
+        jwalk::Parallelism::RayonDefaultPool { busy_timeout: std::time::Duration::from_secs(1) }
+    } else {
+        jwalk::Parallelism::RayonNewPool(threads)
+    }
+}
+
 /// 创建带正确并行度配置的 walker（返回类型支持 `client_state` 预取）
 ///
 /// 注意：此函数不设置 `process_read_dir`，调用方需自行设置并在回调中调用
 /// `prefetch_metadata` 来预取文件大小。这是因为 `process_read_dir` 是替换型 API，
 /// 后调用会覆盖前调用。
 pub fn create_walker(path: &Path) -> MetaWalkDir {
-    let parallelism = if WALK_THREADS == 0 {
-        jwalk::Parallelism::RayonDefaultPool { busy_timeout: std::time::Duration::from_secs(1) }
-    } else {
-        jwalk::Parallelism::RayonNewPool(WALK_THREADS)
-    };
     MetaWalkDir::new(path)
         .skip_hidden(false)
         .follow_links(false)
-        .parallelism(parallelism)
+        .parallelism(walk_parallelism())
+}
+
+/// `dir_size` 专用 walker：**串行**遍历（`Parallelism::Serial`），并行度完全由外层
+/// `dir_size_pool` 的 `par_iter` 提供。
+///
+/// 消除嵌套线程池 churn（plan 009 U6/KTD2）：改前 `dir_size` 走 `create_walker`→
+/// `RayonNewPool(3)`，而它本身又在 4 线程池的 `par_iter` 内被调用——每个匹配目录都
+/// `ThreadPoolBuilder::build()` 新建一个 3 线程池、用完即销毁（jwalk 0.8.1 `RayonNewPool`
+/// 语义 = 每 walker 建全新池不复用），峰值 ~16 walker 线程 + 反复建池/销毁开销，是 macOS
+/// 下扫描 CPU 被放大的真凶。串行 walker 把总线程数收敛到外层池的线程数（默认 4），
+/// 不再有内层池。选串行而非 `RayonExistingPool` 复用同池，是为规避"同池嵌套消费"的
+/// 潜在 self-lock（外层 `par_iter` 线程阻塞读 walk 结果、而 walk 又需同池线程产出）。
+fn create_walker_serial(path: &Path) -> MetaWalkDir {
+    MetaWalkDir::new(path)
+        .skip_hidden(false)
+        .follow_links(false)
+        .parallelism(jwalk::Parallelism::Serial)
 }
 
 /// 在 `process_read_dir` 回调中预取每个条目的 metadata，将文件大小存入 `client_state`。
@@ -495,7 +522,8 @@ fn dir_size(path: &Path, reporter: &dyn ProgressReporter) -> u64 {
         return 0;
     }
 
-    let walker = create_walker(path)
+    // 串行 walker：并行度由外层 dir_size_pool 的 par_iter 提供，消除嵌套池 churn（U6）。
+    let walker = create_walker_serial(path)
         .process_read_dir(|_depth, _path, _state, children| {
             prefetch_metadata(children);
         });
@@ -520,10 +548,21 @@ extern "C" {
     fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
 }
 
-/// 构建 `dir_size` 专用线程池：4 线程 + macOS I/O 优先级降级
+/// `dir_size` 池线程数：默认 4；`MC_DIRSIZE_THREADS` 可运行时覆盖（plan 009 U1/KTD1）。
+/// 现在这是 Purge 目录大小计算的**唯一**并行度来源（`dir_size` walker 已改串行，U6），
+/// 故调这个数即调整整体扫描并发。
+fn dir_size_threads() -> usize {
+    std::env::var("MC_DIRSIZE_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4)
+}
+
+/// 构建 `dir_size` 专用线程池：默认 4 线程 + macOS I/O 优先级降级
 fn build_dir_size_pool() -> rayon::ThreadPool {
     rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
+        .num_threads(dir_size_threads())
         .thread_name(|i| format!("mc-dir-size-{i}"))
         .start_handler(|_| {
             #[cfg(target_os = "macos")]
@@ -598,6 +637,44 @@ mod tests {
 
         let size = dir_size(dir, &crate::progress::NoopReporter);
         assert_eq!(size, 21, "目录总大小应为 21 字节");
+    }
+
+    #[test]
+    fn test_scan_purge_many_dirs_parallel_no_deadlock() {
+        // U6 回归：dir_size 改串行 walker 后，并行度全由 dir_size_pool 的 par_iter 提供。
+        // 多个匹配目录（>池线程数）在同一池内并发算大小，必须全部完成、无死锁，且每项大小正确。
+        // 这是"消除嵌套池"改动的核心安全断言：不再每目录建新池，也不因同池嵌套而自锁。
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+
+        // 造 12 个各含 package.json 守卫 + node_modules（内有文件）的项目，>默认 4 线程。
+        for i in 0..12u32 {
+            let proj = base.join(format!("proj_{i}"));
+            let nm = proj.join("node_modules");
+            std::fs::create_dir_all(&nm).unwrap();
+            std::fs::write(proj.join("package.json"), "{}").unwrap();
+            // 每个 node_modules 放 3 个文件，含嵌套子目录，确保串行 walker 递归正确。
+            std::fs::write(nm.join("a.js"), "xxxxx").unwrap(); // 5
+            let sub = nm.join("sub");
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join("b.js"), "yy").unwrap(); // 2
+            std::fs::write(sub.join("c.js"), "zzz").unwrap(); // 3
+        }
+
+        let (reporter, _events) = TestReporter::new();
+        let result = Scanner::scan_purge(base, &reporter).unwrap();
+
+        let nm_items: Vec<&ScanItem> = result
+            .categories
+            .iter()
+            .flat_map(|c| c.items.iter())
+            .filter(|i| i.path.file_name().is_some_and(|n| n == "node_modules"))
+            .collect();
+
+        assert_eq!(nm_items.len(), 12, "应找到全部 12 个 node_modules（无一因死锁丢失）");
+        for item in &nm_items {
+            assert_eq!(item.size, 10, "每个 node_modules 大小应为 10 字节（5+2+3）");
+        }
     }
 
     #[test]
