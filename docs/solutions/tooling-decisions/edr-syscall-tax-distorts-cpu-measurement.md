@@ -66,7 +66,8 @@ CPU 随扫描树规模放大，不是固定 1 核。
 
 3. **无干净机时，改用"环境不变量"做优化目标**：
    - **忽略** EDR 税那部分（不可控），聚焦**任何机器上都是浪费**的项——本例是 25% 的 `sched_yield`
-     自旋（rayon 过度订阅，见 [[nested-rayon-pool-churn]] 续篇）。
+     自旋（jwalk 并行迭代器**消费端固定忙等**，与池大小无关；后已改 walk 默认 Serial 消除，见
+     [[nested-rayon-pool-churn]] 续篇）。
    - **用 profiler 的 `swtch_pri` 样本占比**衡量自旋优化效果，而非墙钟/CPU% 秒数——后者被 EDR 的
      close 噪声淹没（单次 `purge ~` 墙钟方差 85–98s，比要测的效应还大）。
    - 减少 syscall **总数**的优化（如批量枚举 `getattrlistbulk`）在干净机和本机上**双赢**（既省真实
@@ -85,6 +86,6 @@ CPU 随扫描树规模放大，不是固定 1 核。
 - **企业 Mac 上的 I/O 密集 CPU 测量默认不可信**——先排查 EDR，再下结论。
 - **区分"可控浪费"与"环境税"**：优化前把 profiler 拆成 { 自旋/锁等浪费 | 真实工作 | 环境税 }，
   只对前两类动手。
-- 相关：[[nested-rayon-pool-churn]]（同一次扫描的 rayon 过度订阅续篇）、
+- 相关：[[nested-rayon-pool-churn]]（同一次扫描的消费端自旋续篇，walk 改默认 Serial）、
   `docs/plans/2026-07-05-009-perf-scan-cpu-optimization-plan.md`（被本文修正的原始结论）、
   `docs/solutions/tooling-decisions/rust-workspace-pedantic-clippy-and-release-profile.md`（release 测量前提）。
