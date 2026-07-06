@@ -110,6 +110,10 @@ pub struct App {
     /// 沉没成本二次确认：存在已标记项时，第一次按 q 返回菜单只置位并提示，
     /// 第二次按才真正放弃标记返回（对齐 dua 的 `pending_exit`，避免手滑丢标记）。
     pub pending_leave: bool,
+    /// `AnalyzingLive` 态提交删除的暂存清单（KTD1）：live 删除须先 finalize 部分树，
+    /// 故在 `confirm_accept` 暂存待删 (路径, 大小)，待 `SortDone` 进入稳定 `Analyzing` 态后
+    /// 再经 `start_cleaning_from_analyzer` 执行。非空即表示"本次 finalize 是为删除而非扫描完成"。
+    pub pending_analyzer_delete: Vec<(PathBuf, u64)>,
 }
 
 impl App {
@@ -138,6 +142,7 @@ impl App {
             analyzer_return: None,
             status_message: None,
             pending_leave: false,
+            pending_analyzer_delete: Vec::new(),
         }
     }
 
@@ -283,18 +288,9 @@ impl App {
             return;
         };
         let cat_count = result.categories.len();
-        // 默认预选：直接采纳各项已计算的 selected（= safety != Risky && rule.preselect）。
-        // 由此 Risky 项与 preselect=false 的项（如 dist/build）默认不勾选。
-        let default_paths: HashSet<PathBuf> = result
-            .categories
-            .iter()
-            .flat_map(|c| c.items.iter())
-            .filter(|i| i.selected)
-            .map(|i| i.path.clone())
-            .collect();
-
-        self.marked = default_paths;
-
+        // KTD3：预选（= safety != Risky && rule.preselect）已在扫描期随 Found 首次插入时
+        // 增量播种到 marked，此处**不再重播种**——否则会冲掉用户扫描期的手动勾选/取消
+        // （假反馈）。仅整理展开态与光标。
         // 保留扫描期间的展开态/光标，避免扫描完成瞬间"展开态跳变、列表回弹"。
         // resize 仅防御（Found 处理已维持 expanded.len()==categories.len() 不变式）。
         self.expanded.resize(cat_count, false);
@@ -455,6 +451,30 @@ impl App {
         }
     }
 
+    /// `h`/`←` 折叠：折叠光标所在分类，或把光标从子项移回其分类头（KTD4，与 Analyze 的
+    /// "返回上级"最接近的二级语义）。返回 `true` 表示发生了折叠/聚焦；`false` 表示光标处
+    /// 无可折叠项（已折叠的分类头 / 分隔行 / 空列表），由调用方决定根层回退（如返回菜单）。
+    pub fn collapse_or_focus_category(&mut self, rows: &[FlatRow]) -> bool {
+        let cat_idx = match rows.get(self.result_cursor) {
+            Some(FlatRow::Item { cat_idx, .. }) => *cat_idx,
+            Some(FlatRow::Category { cat_idx, expanded: true }) => *cat_idx,
+            _ => return false, // 已折叠的分类头 / 分隔行 / 越界：无可折叠
+        };
+        if let Some(exp) = self.expanded.get_mut(cat_idx) {
+            *exp = false;
+        }
+        // 光标移到该分类头行（折叠后子项行消失，避免光标悬空）。
+        let new_rows = self.build_flat_rows();
+        if let Some(pos) = new_rows
+            .iter()
+            .position(|r| matches!(r, FlatRow::Category { cat_idx: ci, .. } if *ci == cat_idx))
+        {
+            self.result_cursor = pos;
+        }
+        self.clamp_result_cursor();
+        true
+    }
+
     /// 获取选中项的总数量和总大小（基于统一标记集）
     pub fn selected_summary(&self) -> (usize, u64) {
         let mut count = 0;
@@ -541,6 +561,7 @@ impl App {
         self.analyzer_return = None;
         self.status_message = None;
         self.pending_leave = false;
+        self.pending_analyzer_delete.clear();
     }
 
     /// KTD2 诚实披露：勾选父目录会连带其中**未勾选**的子项一并删除（size 归属已扣除、
@@ -782,14 +803,22 @@ mod tests {
     }
 
     #[test]
-    fn init_results_preselects_non_risky_except_preselect_false() {
-        // U4/D2：默认勾选 Safe + Moderate（preselect=true），不勾 Risky 与 preselect=false 的 build。
+    fn init_results_does_not_clobber_scan_time_marks() {
+        // KTD3：预选改在扫描期随 Found 播种；init_results 不再重播种，
+        // 保留用户扫描期的手动勾选/取消，完成瞬间不冲掉（消除假反馈）。
         let mut app = app_mixed_safety();
+        // 模拟扫描期标记状态：保留一个预选项、手动加入一个 preselect=false 项、
+        // 手动取消一个本会预选的 Moderate 项（未加入 marked）。
+        app.marked.insert(PathBuf::from("/x/cache"));
+        app.marked.insert(PathBuf::from("/x/build"));
         app.init_results();
-        assert!(app.marked.contains(&PathBuf::from("/x/cache")), "Safe 应勾选");
-        assert!(app.marked.contains(&PathBuf::from("/x/node_modules")), "Moderate 应勾选");
-        assert!(!app.marked.contains(&PathBuf::from("/x/docker")), "Risky 不应勾选");
-        assert!(!app.marked.contains(&PathBuf::from("/x/build")), "preselect=false 不应勾选");
+        assert!(app.marked.contains(&PathBuf::from("/x/cache")), "手动保留项应在");
+        assert!(app.marked.contains(&PathBuf::from("/x/build")), "手动加入项应保留（preselect=false 也不被剔除）");
+        assert!(
+            !app.marked.contains(&PathBuf::from("/x/node_modules")),
+            "被取消的预选不应被重播回"
+        );
+        assert!(!app.marked.contains(&PathBuf::from("/x/docker")), "Risky 不应出现");
     }
 
     #[test]
@@ -857,6 +886,43 @@ mod tests {
         // 再次切换：Logs 取消
         app.toggle_selection(&row);
         assert!(!app.marked.contains(&PathBuf::from("/a/Logs")));
+    }
+
+    #[test]
+    fn collapse_or_focus_from_item_collapses_and_focuses_head() {
+        // U6/KTD4：光标在子项按 h → 折叠父分类并把光标移回分类头。
+        let mut app = app_with_logs_caches_tmp(); // expanded=[true]
+        let rows = app.build_flat_rows();
+        let item_pos = rows.iter().position(|r| matches!(r, FlatRow::Item { .. })).unwrap();
+        app.result_cursor = item_pos;
+        assert!(app.collapse_or_focus_category(&rows), "应发生折叠");
+        assert!(!app.expanded[0], "父分类应折叠");
+        let new_rows = app.build_flat_rows();
+        assert!(
+            matches!(new_rows[app.result_cursor], FlatRow::Category { .. }),
+            "光标应落在分类头"
+        );
+    }
+
+    #[test]
+    fn collapse_or_focus_on_collapsed_head_is_noop() {
+        // 已折叠的分类头无可折叠 → 返回 false，交调用方决定根层回退。
+        let mut app = app_with_logs_caches_tmp();
+        app.expanded = vec![false];
+        let rows = app.build_flat_rows();
+        let head_pos = rows.iter().position(|r| matches!(r, FlatRow::Category { .. })).unwrap();
+        app.result_cursor = head_pos;
+        assert!(!app.collapse_or_focus_category(&rows), "已折叠头应返回 false");
+    }
+
+    #[test]
+    fn collapse_or_focus_on_expanded_head_collapses() {
+        let mut app = app_with_logs_caches_tmp(); // expanded=[true]
+        let rows = app.build_flat_rows();
+        let head_pos = rows.iter().position(|r| matches!(r, FlatRow::Category { .. })).unwrap();
+        app.result_cursor = head_pos;
+        assert!(app.collapse_or_focus_category(&rows));
+        assert!(!app.expanded[0], "展开的分类头按 h 应折叠");
     }
 
     #[test]
