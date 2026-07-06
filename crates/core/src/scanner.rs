@@ -115,6 +115,9 @@ where
                 root,
                 park_threads(),
                 |children| prefetch_sizes(children),
+                // analyze 不做权限跳过上报（#23 只覆盖 clean/purge）：读不到的目录静默跳过，
+                // 保持与改 park 引擎前的行为一致。
+                |_p, _err| {},
                 is_cancelled,
                 |e| {
                     if e.path == root {
@@ -428,7 +431,20 @@ impl Scanner {
                         },
                     );
                     for entry in walker {
-                        let Ok(entry) = entry else { continue };
+                        let entry = match entry {
+                            Ok(e) => e,
+                            Err(err) => {
+                                // 权限跳过升为结构化事件（#23）：只有 PermissionDenied 才进「需授权」区，
+                                // 其它 IO 错误仍静默跳过（不误报成缺授权）。
+                                emit_if_permission_denied(reporter, &err);
+                                continue;
+                            }
+                        };
+                        // jwalk 不把"目录读不进去"作为 Err yield：不可读目录本身作为 Ok 条目返回，
+                        // 读子项失败挂在其 read_children_error 上。故权限跳过要从这里取（#23）。
+                        if let Some(err) = &entry.read_children_error {
+                            emit_if_permission_denied(reporter, err);
+                        }
                         if entry.file_type().is_dir() {
                             continue;
                         }
@@ -449,6 +465,8 @@ impl Scanner {
                             });
                             prefetch_sizes(children);
                         },
+                        // 权限跳过（#23）：park 读目录失败时回调，仅 PermissionDenied 升结构化事件。
+                        |p, err| emit_park_permission_denied(reporter, p, err),
                         || reporter.is_cancelled(),
                         |e| {
                             if !e.is_dir {
@@ -583,13 +601,21 @@ impl Scanner {
                     if reporter.is_cancelled() {
                         break;
                     }
-                    if let Ok(e) = entry {
-                        if e.file_type().is_dir() {
-                            walked += 1;
-                            if walked.is_multiple_of(48) {
-                                reporter.on_event(ProgressEvent::Scanning { path: e.path() });
+                    match entry {
+                        Ok(e) => {
+                            // 不可读目录作为 Ok 返回、错误挂在 read_children_error 上（见 scan_with_rules 注释）。
+                            if let Some(err) = &e.read_children_error {
+                                emit_if_permission_denied(reporter, err);
+                            }
+                            if e.file_type().is_dir() {
+                                walked += 1;
+                                if walked.is_multiple_of(48) {
+                                    reporter.on_event(ProgressEvent::Scanning { path: e.path() });
+                                }
                             }
                         }
+                        // 权限跳过升为结构化事件（#23，仅 PermissionDenied）。
+                        Err(err) => emit_if_permission_denied(reporter, &err),
                     }
                 }
             }
@@ -617,6 +643,8 @@ impl Scanner {
                             true
                         });
                     },
+                    // 权限跳过（#23）：park 读目录失败时回调，仅 PermissionDenied 升结构化事件。
+                    |p, err| emit_park_permission_denied(reporter, p, err),
                     || reporter.is_cancelled(),
                     |e| {
                         if e.is_dir {
@@ -710,6 +738,34 @@ fn flush_base_deltas(
         let meta = &base_meta[base];
         reporter.on_event(meta.found(base.clone(), delta));
         emitted.insert(base.clone(), cum);
+    }
+}
+
+/// 若 jwalk 错误的底层 IO 是 `PermissionDenied`，上报一条结构化「跳过（需授权）」事件（#23）。
+/// 其它 IO 错误不上报此事件——保持"只有权限类才进需授权区"的分流不变式。
+/// 取路径优先用 jwalk 记录的出错路径；缺失时不报（无路径的跳过对用户无意义）。
+fn emit_if_permission_denied(reporter: &dyn ProgressReporter, err: &jwalk::Error) {
+    if err
+        .io_error()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    {
+        if let Some(path) = err.path() {
+            reporter.on_event(ProgressEvent::SkippedNoPermission {
+                path: path.to_path_buf(),
+            });
+        }
+    }
+}
+
+/// park 引擎读目录失败的分流回调（#23）：`park_walk` 把**所有** `read_dir` 失败原样回调过来
+/// （引擎保持通用、不内嵌"权限"语义），由此处做与 jwalk `emit_if_permission_denied` 一致的分流——
+/// 只有 `PermissionDenied` 升为结构化「跳过（需授权）」事件，其它 IO 错误静默跳过（与旧 jwalk 行为一致，
+/// 不把"文件系统坏了"误报成"缺授权"）。在 park worker 线程上调用，故 `reporter` 需 `Sync`（trait 已保证）。
+fn emit_park_permission_denied(reporter: &dyn ProgressReporter, path: &Path, err: &std::io::Error) {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        reporter.on_event(ProgressEvent::SkippedNoPermission {
+            path: path.to_path_buf(),
+        });
     }
 }
 
@@ -810,6 +866,9 @@ mod tests {
                 }
                 ProgressEvent::RuleProgress { current, total, .. } => {
                     format!("RuleProgress:{current}/{total}")
+                }
+                ProgressEvent::SkippedNoPermission { path } => {
+                    format!("Skipped:{}", path.display())
                 }
                 ProgressEvent::Complete => "Complete".to_string(),
                 ProgressEvent::Error(msg) => format!("Error:{msg}"),
@@ -1259,6 +1318,35 @@ mod tests {
         assert!(
             target_items[0].path.starts_with(&proj_a),
             "匹配的 target 应在 rust_proj 下"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_purge_emits_skipped_for_permission_denied_dir() {
+        // #23：purge 遍历撞到无权限读取的目录时，应产生结构化 SkippedNoPermission 事件
+        // （TestReporter 记为 "Skipped:<path>" 标签），而非静默吞掉。
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let locked = base.join("locked_dir");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // root 可穿透 0o000：若当前进程仍能读，环境不适合断言，复原后跳过。
+        if std::fs::read_dir(&locked).is_ok() {
+            let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+            return;
+        }
+
+        let (reporter, events) = TestReporter::new();
+        let _ = Scanner::scan_purge(base, &reporter);
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+
+        let evts = events.lock().unwrap();
+        assert!(
+            evts.iter().any(|e| e.starts_with("Skipped:") && e.contains("locked_dir")),
+            "无权限目录应产生 SkippedNoPermission 事件，实际: {evts:?}"
         );
     }
 

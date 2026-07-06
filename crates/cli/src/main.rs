@@ -48,6 +48,8 @@ pub enum Commands {
     },
     /// 查看清理历史（上次清理以来的回收趋势）
     History,
+    /// 诊断磁盘访问权限（检查 Full Disk Access，只读）
+    Doctor,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -61,6 +63,7 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Analyze { .. }) => commands::analyze::run(&cli)?,
         Some(Commands::Purge { .. }) => commands::purge::run(&cli)?,
         Some(Commands::History) => commands::history::run(&cli)?,
+        Some(Commands::Doctor) => commands::doctor::run(&cli)?,
     }
 
     Ok(())

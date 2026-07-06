@@ -6,16 +6,27 @@ use mc_core::progress::{ProgressEvent, ProgressReporter};
 
 use anyhow::Result;
 use humansize::{format_size, DECIMAL};
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
-struct CliReporter;
+/// CLI 进度上报器。`skipped` 收集扫描期间因权限跳过的路径（#23），扫描后单列展示。
+#[derive(Default)]
+struct CliReporter {
+    skipped: Mutex<BTreeSet<PathBuf>>,
+}
 
 impl ProgressReporter for CliReporter {
     fn on_event(&self, event: ProgressEvent) {
         match event {
             ProgressEvent::Scanning { path } => {
                 eprint!("\r扫描中: {} ", path.display());
+            }
+            ProgressEvent::SkippedNoPermission { path } => {
+                if let Ok(mut s) = self.skipped.lock() {
+                    s.insert(path);
+                }
             }
             ProgressEvent::Found { category, path, size, .. } => {
                 eprintln!("\r  发现 {} — {} ({})", category, path.display(), format_size(size, DECIMAL));
@@ -45,10 +56,13 @@ pub fn run(cli: &Cli) -> Result<()> {
         anyhow::bail!("路径不存在: {}", path.display());
     }
 
-    let reporter = CliReporter;
+    let reporter = CliReporter::default();
     eprintln!("正在扫描 {} 中的开发产物...\n", path.display());
 
     let result = Engine::scan_purge(&path, &reporter)?;
+
+    // 扫描期间因权限跳过的路径单列展示，引导 mc doctor（#23）。
+    print_skipped(&reporter);
 
     if result.file_count == 0 {
         println!("未发现开发产物。");
@@ -112,6 +126,22 @@ pub fn run(cli: &Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// 展示「跳过（需授权）」区：列出扫描时因权限读不到的路径并引导 mc doctor。
+/// 无跳过则完全静默。
+fn print_skipped(reporter: &CliReporter) {
+    let Ok(skipped) = reporter.skipped.lock() else {
+        return;
+    };
+    if skipped.is_empty() {
+        return;
+    }
+    eprintln!("\n跳过（需授权）— {} 个路径因权限未能读取：", skipped.len());
+    for path in skipped.iter() {
+        eprintln!("  {}", path.display());
+    }
+    eprintln!("运行 mc doctor 查看磁盘访问权限与授权引导。\n");
 }
 
 fn print_purge_summary(result: &ScanResult) {

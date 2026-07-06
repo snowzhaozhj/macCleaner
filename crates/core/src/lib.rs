@@ -1,5 +1,6 @@
 pub mod app_resolver;
 pub mod cleaner;
+pub mod doctor;
 pub mod engine;
 pub mod history;
 pub mod models;

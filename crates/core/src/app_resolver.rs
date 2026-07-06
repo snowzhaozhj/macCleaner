@@ -101,6 +101,13 @@ impl AppResolver {
             let entries = match fs::read_dir(dir) {
                 Ok(entries) => entries,
                 Err(e) => {
+                    // 权限类读取失败升为结构化「跳过（需授权）」事件（#23）；仍保留 read_errors
+                    // 用于"全无所获时上报 Error"的兜底。非权限错误只走原有 warn 路径。
+                    if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        reporter.on_event(ProgressEvent::SkippedNoPermission {
+                            path: dir.clone(),
+                        });
+                    }
                     warn!("无法读取应用目录 {dir:?}: {e:?}");
                     read_errors.push(format!("{}: {e}", dir.display()));
                     continue;
@@ -424,6 +431,7 @@ mod tests {
         found: std::sync::Mutex<Vec<PathBuf>>,
         complete: std::sync::atomic::AtomicBool,
         error: std::sync::Mutex<Option<String>>,
+        skipped: std::sync::Mutex<Vec<PathBuf>>,
         cancelled: bool,
     }
     impl RecReporter {
@@ -432,6 +440,7 @@ mod tests {
                 found: std::sync::Mutex::new(Vec::new()),
                 complete: std::sync::atomic::AtomicBool::new(false),
                 error: std::sync::Mutex::new(None),
+                skipped: std::sync::Mutex::new(Vec::new()),
                 cancelled,
             }
         }
@@ -444,6 +453,9 @@ mod tests {
                     self.complete.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 ProgressEvent::Error(msg) => *self.error.lock().unwrap() = Some(msg),
+                ProgressEvent::SkippedNoPermission { path } => {
+                    self.skipped.lock().unwrap().push(path);
+                }
                 _ => {}
             }
         }
@@ -500,6 +512,33 @@ mod tests {
         assert!(
             !rec.complete.load(std::sync::atomic::Ordering::Relaxed),
             "已上报 Error 的路径不再发 Complete"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_apps_in_dirs_emits_skipped_on_permission_denied() {
+        // #23：应用目录因权限读不到时，产生结构化 SkippedNoPermission（而非只静默 warn）。
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked_apps");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // root 可穿透 0o000：若能读则环境不适合断言，复原后跳过。
+        if fs::read_dir(&locked).is_ok() {
+            let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+            return;
+        }
+
+        let rec = RecReporter::new(false);
+        AppResolver::scan_apps_in_dirs(std::slice::from_ref(&locked), &rec);
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+
+        let skipped = rec.skipped.lock().unwrap();
+        assert!(
+            skipped.iter().any(|p| p == &locked),
+            "无权限的应用目录应产生 SkippedNoPermission 事件，实际: {skipped:?}"
         );
     }
 
