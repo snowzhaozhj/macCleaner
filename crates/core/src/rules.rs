@@ -154,33 +154,14 @@ pub fn purge_rules() -> Vec<CleanRule> {
     parse_rules_toml(TOML, "purge_rules.toml").expect("内置 purge_rules.toml 应始终有效")
 }
 
-/// 用户数据目录黑名单（home 相对）：任何用户规则的模式落在这些目录内/或作为其祖先扫入
-/// 它们，都会毁掉不可再生的用户数据 → 拒绝。故意**不含 Downloads**：内置规则允许清理下载
-/// 缓存，用户规则同样可指向 `~/Downloads` 子路径（但仍受 preselect 强制 false 保护）。
-const USER_DATA_BLACKLIST: [&str; 5] = ["Documents", "Desktop", "Pictures", "Movies", "Music"];
-
-/// 把路径逐组件小写化，供大小写不敏感的 macOS 文件系统上做健壮的前缀比较
-/// （避免用 `documents` 绕过 `Documents`）。用 `PathBuf::starts_with` 的组件级语义，
-/// 不会把 `music` 误判为 `musicvideos` 的前缀（字符串级 `starts_with` 会）。
-fn lower_path(p: &std::path::Path) -> PathBuf {
-    p.iter()
-        .map(|c| c.to_string_lossy().to_lowercase())
-        .collect()
-}
-
 /// 用户规则安全 lint 门禁（纯函数，便于单测）。通过返回 `Ok`，违规返回 `Err(原因)`。
 ///
-/// **不检查 preselect**——preselect 由加载层无条件强制为 false（见 `user_rules_from_str`），
-/// 不是「拒绝」判据。本函数只判「该不该拒绝整条规则」：
-/// 1. 任一 `Exact`/`DirName` 模式命中用户数据黑名单 → 拒绝（含把黑名单目录当祖先扫入的情形）；
-/// 2. 含 `DirName` 模式却无 `root_markers` → 拒绝（否则整树按目录名匹配、误报炸裂）。
+/// 只做一项**正确性**校验：含 `DirName` 模式却无 `root_markers` → 拒绝（否则整树按目录名匹配、
+/// 误报炸裂）。**不做数据目录黑名单**——防「误删用户数据」的职责由加载层无条件的
+/// `preselect = false` 强制承担（见 `user_rules_from_str`）：用户规则永不自动预选、永不被
+/// `--yes`/默认勾选自动删除，需用户在 TUI 里手动逐项勾选。故硬拒绝路径既非必要也无谓限制了
+/// 用户对自己数据的清理自由。同理**不检查 preselect**——它由加载层强制，不是拒绝判据。
 pub fn validate_user_rule(rule: &CleanRule) -> Result<(), String> {
-    let home = home();
-    let blacklist_paths: Vec<PathBuf> = USER_DATA_BLACKLIST
-        .iter()
-        .map(|n| lower_path(&home.join(n)))
-        .collect();
-
     let has_dirname = rule
         .patterns
         .iter()
@@ -191,43 +172,13 @@ pub fn validate_user_rule(rule: &CleanRule) -> Result<(), String> {
             rule.name
         ));
     }
-
-    for pattern in &rule.patterns {
-        match pattern {
-            PathPattern::Exact(p) => {
-                let lp = lower_path(p);
-                for (bl, name) in blacklist_paths.iter().zip(USER_DATA_BLACKLIST.iter()) {
-                    // 双向前缀：lp 落在黑名单内（lp.starts_with(bl)），或 lp 是黑名单祖先
-                    // （bl.starts_with(lp)，如 `~` 或 `/` 会扫入 Documents）——都拒绝。
-                    if lp.starts_with(bl) || bl.starts_with(&lp) {
-                        return Err(format!(
-                            "规则 '{}' 的路径 {} 落在用户数据目录 ~/{name} 内或会扫入它",
-                            rule.name,
-                            p.display()
-                        ));
-                    }
-                }
-            }
-            PathPattern::DirName(dname) => {
-                if USER_DATA_BLACKLIST
-                    .iter()
-                    .any(|n| n.eq_ignore_ascii_case(dname))
-                {
-                    return Err(format!(
-                        "规则 '{}' 的 dir_name '{dname}' 命中用户数据目录名黑名单",
-                        rule.name
-                    ));
-                }
-            }
-        }
-    }
     Ok(())
 }
 
-/// 从 TOML 文本加载用户规则并跑安全门禁。**fail-closed**：解析失败或**任一条**规则违规，
-/// 都跳过整个文件（返回空），并 `log::error!` 打出具体原因——默认安全优先于「尽量加载」。
-/// 所有通过的规则都被无条件强制 `preselect = false`（防「自定义 Safe+预选指向用户数据」毁信任
-/// 场景的主闸；即便声明 preselect=true 也改回 false，仍可手动勾选）。
+/// 从 TOML 文本加载用户规则并跑安全门禁。**fail-closed**：TOML 解析失败或**任一条**规则违反
+/// `DirName` 守卫，都跳过整个文件（返回空），并 `log::error!` 打出具体原因——默认安全优先于「尽量加载」。
+/// 所有通过的规则都被无条件强制 `preselect = false`——这是防自动删除的**唯一且充分**的主闸：
+/// 用户规则永不自动预选，即便声明 preselect=true 也改回 false，仍可在 TUI 手动勾选。
 fn user_rules_from_str(toml_str: &str, source: &str) -> Vec<CleanRule> {
     let rules = match parse_rules_toml(toml_str, source) {
         Ok(r) => r,
@@ -636,59 +587,40 @@ mod tests {
     }
 
     #[test]
-    fn user_rule_targeting_documents_rejected() {
+    fn user_rule_targeting_user_data_now_accepted() {
+        // 黑名单已撤去：指向 ~/Documents 等用户数据的规则不再硬拒——防误删的职责由加载层
+        // preselect=false 强制承担（见下 forces_preselect_false 测试），门禁只保证正确性。
         let rule = user_rule(
             vec![PathPattern::Exact(home().join("Documents/secret"))],
             SafetyLevel::Moderate,
             false,
             vec![],
         );
-        assert!(validate_user_rule(&rule).is_err(), "指向 ~/Documents 应被拒");
+        assert!(
+            validate_user_rule(&rule).is_ok(),
+            "指向用户数据的规则应被受理（防误删靠 preselect=false，非硬拒）"
+        );
     }
 
     #[test]
-    fn user_rule_covers_all_blacklisted_dirs() {
-        // Desktop/Pictures/Movies/Music 与 Documents 一样都是黑名单，逐个验证。
-        for dir in ["Desktop", "Pictures", "Movies", "Music"] {
-            let rule = user_rule(
-                vec![PathPattern::Exact(home().join(dir))],
-                SafetyLevel::Safe,
-                false,
-                vec![],
-            );
-            assert!(validate_user_rule(&rule).is_err(), "指向 ~/{dir} 应被拒");
-        }
-    }
-
-    #[test]
-    fn user_rule_case_insensitive_blacklist() {
-        // macOS 大小写不敏感：`documents` 小写也不能绕过。
-        let rule = user_rule(
-            vec![PathPattern::Exact(home().join("documents/x"))],
-            SafetyLevel::Safe,
-            false,
-            vec![],
+    fn user_data_rule_forced_preselect_false() {
+        // 核心信任闸：即便用户规则指向 ~/Documents 且声明 preselect=true，加载后仍被受理，
+        // 但 preselect 被强制为 false——永不自动预选/自动删除，只能在 TUI 手动勾选。
+        let toml = r#"
+[[rules]]
+name = "My Docs Overlay"
+description = "d"
+category = "c"
+safety = "Safe"
+preselect = true
+patterns = [{ exact = "Documents/old-exports" }]
+"#;
+        let rules = user_rules_from_str(toml, "test");
+        assert_eq!(rules.len(), 1, "指向用户数据的规则应被加载（不再硬拒）");
+        assert!(
+            !rules[0].preselect,
+            "指向用户数据的规则 preselect 必须被强制 false"
         );
-        assert!(validate_user_rule(&rule).is_err(), "小写 documents 应被拒");
-        let dirname = user_rule(
-            vec![PathPattern::DirName("MUSIC".into())],
-            SafetyLevel::Safe,
-            false,
-            vec![RootMarker::Sibling("x".into())],
-        );
-        assert!(validate_user_rule(&dirname).is_err(), "大写 MUSIC dir_name 应被拒");
-    }
-
-    #[test]
-    fn user_rule_home_ancestor_rejected() {
-        // 把 home 本身当模式会扫入 Documents 等——作为黑名单祖先应被拒。
-        let rule = user_rule(
-            vec![PathPattern::Exact(home())],
-            SafetyLevel::Safe,
-            false,
-            vec![],
-        );
-        assert!(validate_user_rule(&rule).is_err(), "指向 ~ 会扫入用户数据，应被拒");
     }
 
     #[test]
@@ -706,23 +638,8 @@ mod tests {
     }
 
     #[test]
-    fn user_rule_safe_preselect_blacklist_still_rejected() {
-        // 声明 Safe + preselect 指向黑名单——门禁不看 safety/preselect，仍必须拒。
-        let rule = user_rule(
-            vec![PathPattern::Exact(home().join("Documents"))],
-            SafetyLevel::Safe,
-            true,
-            vec![],
-        );
-        assert!(
-            validate_user_rule(&rule).is_err(),
-            "Safe+preselect 指向黑名单应被拒"
-        );
-    }
-
-    #[test]
     fn valid_user_rule_passes() {
-        // 合法：Exact 指向缓存目录；DirName 配了 root_markers 且名字不在黑名单。
+        // 合法：Exact 任意路径；DirName 配了 root_markers。
         let exact = user_rule(
             vec![PathPattern::Exact(home().join(".cache/myapp"))],
             SafetyLevel::Safe,
@@ -761,7 +678,7 @@ patterns = [{ exact = ".cache/myapp" }]
 
     #[test]
     fn user_rules_from_str_fail_closed_on_one_bad_rule() {
-        // 一好一坏 → fail-closed，整个文件不加载（返回空）。
+        // 一好一坏（坏 = DirName 无 root_markers）→ fail-closed，整个文件不加载（返回空）。
         let toml = r#"
 [[rules]]
 name = "Good"
@@ -771,11 +688,11 @@ safety = "Safe"
 patterns = [{ exact = ".cache/good" }]
 
 [[rules]]
-name = "Evil"
+name = "Bad DirName"
 description = "d"
 category = "c"
 safety = "Safe"
-patterns = [{ exact = "Documents/private" }]
+patterns = [{ dir_name = "build" }]
 "#;
         let rules = user_rules_from_str(toml, "test");
         assert!(rules.is_empty(), "任一条违规应导致整个文件被拒（fail-closed）");
