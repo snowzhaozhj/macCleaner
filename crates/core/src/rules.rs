@@ -86,11 +86,14 @@ fn home() -> PathBuf {
     crate::platform::get_home_dir()
 }
 
-fn parse_rules_toml(toml_str: &str, source: &str) -> Vec<CleanRule> {
+/// 解析规则 TOML。返回 `Err` 而非 panic：内置规则由调用方 `expect`（编译期烘进二进制的
+/// 坏 TOML 属程序 bug），**用户规则**则据此 fail-closed 优雅跳过而非崩溃整个进程。
+fn parse_rules_toml(toml_str: &str, source: &str) -> Result<Vec<CleanRule>, String> {
     let home = home();
     let file: RuleFile =
-        toml::from_str(toml_str).unwrap_or_else(|e| panic!("{source} 解析失败: {e}"));
-    file.rules
+        toml::from_str(toml_str).map_err(|e| format!("{source} 解析失败: {e}"))?;
+    let rules = file
+        .rules
         .into_iter()
         .map(|entry| {
             let patterns = entry
@@ -124,7 +127,8 @@ fn parse_rules_toml(toml_str: &str, source: &str) -> Vec<CleanRule> {
                 preselect: entry.preselect,
             }
         })
-        .collect()
+        .collect();
+    Ok(rules)
 }
 
 /// 判断按目录名命中的目录是否满足其规则的项目根守卫（默认 AND：全部命中）。
@@ -141,19 +145,85 @@ pub fn matches_root_markers(markers: &[RootMarker], matched_dir: &std::path::Pat
 /// 系统缓存清理规则（从 `clean_rules.toml` 加载）
 pub fn clean_rules() -> Vec<CleanRule> {
     static TOML: &str = include_str!("clean_rules.toml");
-    parse_rules_toml(TOML, "clean_rules.toml")
+    parse_rules_toml(TOML, "clean_rules.toml").expect("内置 clean_rules.toml 应始终有效")
 }
 
 /// 开发产物清理规则（从 `purge_rules.toml` 加载）
 pub fn purge_rules() -> Vec<CleanRule> {
     static TOML: &str = include_str!("purge_rules.toml");
-    parse_rules_toml(TOML, "purge_rules.toml")
+    parse_rules_toml(TOML, "purge_rules.toml").expect("内置 purge_rules.toml 应始终有效")
 }
 
-/// 返回所有规则（系统缓存 + 开发产物）
+/// 用户规则安全 lint 门禁（纯函数，便于单测）。通过返回 `Ok`，违规返回 `Err(原因)`。
+///
+/// 只做一项**正确性**校验：含 `DirName` 模式却无 `root_markers` → 拒绝（否则整树按目录名匹配、
+/// 误报炸裂）。**不做数据目录黑名单**——防「误删用户数据」的职责由加载层无条件的
+/// `preselect = false` 强制承担（见 `user_rules_from_str`）：用户规则永不自动预选、永不被
+/// `--yes`/默认勾选自动删除，需用户在 TUI 里手动逐项勾选。故硬拒绝路径既非必要也无谓限制了
+/// 用户对自己数据的清理自由。同理**不检查 preselect**——它由加载层强制，不是拒绝判据。
+pub fn validate_user_rule(rule: &CleanRule) -> Result<(), String> {
+    let has_dirname = rule
+        .patterns
+        .iter()
+        .any(|p| matches!(p, PathPattern::DirName(_)));
+    if has_dirname && rule.root_markers.is_empty() {
+        return Err(format!(
+            "DirName 规则 '{}' 必须配置非空 root_markers（否则整树按目录名匹配、误报）",
+            rule.name
+        ));
+    }
+    Ok(())
+}
+
+/// 从 TOML 文本加载用户规则并跑安全门禁。**fail-closed**：TOML 解析失败或**任一条**规则违反
+/// `DirName` 守卫，都跳过整个文件（返回空），并 `log::error!` 打出具体原因——默认安全优先于「尽量加载」。
+/// 所有通过的规则都被无条件强制 `preselect = false`——这是防自动删除的**唯一且充分**的主闸：
+/// 用户规则永不自动预选，即便声明 preselect=true 也改回 false，仍可在 TUI 手动勾选。
+fn user_rules_from_str(toml_str: &str, source: &str) -> Vec<CleanRule> {
+    let rules = match parse_rules_toml(toml_str, source) {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("用户规则 {source} 解析失败，已跳过全部用户规则: {e}");
+            return Vec::new();
+        }
+    };
+    for rule in &rules {
+        if let Err(reason) = validate_user_rule(rule) {
+            log::error!("用户规则未通过安全门禁，已跳过全部用户规则（fail-closed）: {reason}");
+            return Vec::new();
+        }
+    }
+    rules
+        .into_iter()
+        .map(|mut r| {
+            r.preselect = false;
+            r
+        })
+        .collect()
+}
+
+/// 加载用户本地叠加规则 `~/.config/mc/rules.toml`（不存在则返回空）。读文件失败/门禁不过均
+/// 优雅降级为空。真正的解析+门禁逻辑在 `user_rules_from_str`（可脱离真实 home 单测）。
+pub fn user_rules() -> Vec<CleanRule> {
+    let path = home().join(".config/mc/rules.toml");
+    if !path.exists() {
+        return Vec::new();
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(s) => user_rules_from_str(&s, "~/.config/mc/rules.toml"),
+        Err(e) => {
+            log::error!("读取用户规则 {} 失败，已跳过: {e}", path.display());
+            Vec::new()
+        }
+    }
+}
+
+/// 返回所有规则（系统缓存 + 开发产物 + 通过门禁的用户叠加规则）。
+/// 用户规则 append 在末尾：Clean 最长前缀归类、evidence 匹配均保持内置优先。
 pub fn all_rules() -> Vec<CleanRule> {
     let mut rules = clean_rules();
     rules.extend(purge_rules());
+    rules.extend(user_rules());
     rules
 }
 
@@ -186,6 +256,16 @@ pub fn matches_pattern(pattern: &PathPattern, path: &std::path::Path) -> bool {
 mod tests {
     use super::*;
     use crate::models::SafetyLevel;
+
+    /// 内置规则全集（clean + purge），**不含**用户叠加规则。内置契约测试验证的是
+    /// 「内置规则的不变量」，不能用 `all_rules()`——那会在测试机存在
+    /// `~/.config/mc/rules.toml` 时被用户规则污染（环境依赖、脆弱）。这不是放宽契约
+    /// （rubric 断言本身不变），只是把被遍历的集合收窄回内置。
+    fn builtin_rules() -> Vec<CleanRule> {
+        let mut r = clean_rules();
+        r.extend(purge_rules());
+        r
+    }
 
     #[test]
     fn clean_rules_all_safe() {
@@ -283,7 +363,7 @@ mod tests {
     // R6: 每条规则 impact/recovery 非空
     #[test]
     fn all_rules_evidence_non_empty() {
-        for rule in all_rules() {
+        for rule in builtin_rules() {
             assert!(!rule.impact.trim().is_empty(), "规则 '{}' impact 不能为空", rule.name);
             assert!(!rule.recovery.trim().is_empty(), "规则 '{}' recovery 不能为空", rule.name);
         }
@@ -293,7 +373,7 @@ mod tests {
     #[test]
     fn gradle_narrowed_to_caches() {
         // .gradle 必须窄化为 exact ~/.gradle/caches，不能整树 dir_name 匹配（否则删签名密钥/配置）。
-        for rule in all_rules() {
+        for rule in builtin_rules() {
             for p in &rule.patterns {
                 if let PathPattern::DirName(name) = p {
                     assert_ne!(name, ".gradle", "不应存在 dir_name '.gradle' 整树规则");
@@ -352,7 +432,7 @@ mod tests {
     #[test]
     fn dirname_rules_have_guards() {
         // 除 __pycache__ 外，每条 dir_name 规则都必须配置项目根守卫。
-        for rule in all_rules() {
+        for rule in builtin_rules() {
             let has_dirname = rule
                 .patterns
                 .iter()
@@ -420,7 +500,7 @@ mod tests {
     #[test]
     fn no_rules_reference_user_data_paths() {
         let forbidden = ["Documents", "Desktop", "Downloads"];
-        for rule in all_rules() {
+        for rule in builtin_rules() {
             for pattern in &rule.patterns {
                 if let PathPattern::Exact(p) = pattern {
                     let path_str = p.to_string_lossy();
@@ -438,16 +518,31 @@ mod tests {
     }
 
     #[test]
-    fn all_rules_combines_clean_and_purge() {
-        let clean_count = clean_rules().len();
-        let purge_count = purge_rules().len();
-        let all_count = all_rules().len();
-        assert_eq!(all_count, clean_count + purge_count);
+    fn all_rules_prefixes_builtin() {
+        // `all_rules()` = clean + purge + user（用户规则 append 在末尾）。为环境非依赖，
+        // 只验证「内置全集是 all_rules() 的前缀」：前 N 条与内置全集逐条同名。测试机若真有
+        // `~/.config/mc/rules.toml`，也只会在末尾多出用户规则，本断言仍成立。
+        let clean = clean_rules();
+        let purge = purge_rules();
+        let builtin_len = clean.len() + purge.len();
+        let all = all_rules();
+        assert!(all.len() >= builtin_len, "all_rules 至少含全部内置规则");
+        let builtin_names: Vec<&str> = clean
+            .iter()
+            .chain(purge.iter())
+            .map(|r| r.name.as_str())
+            .collect();
+        let all_prefix_names: Vec<&str> =
+            all.iter().take(builtin_len).map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            all_prefix_names, builtin_names,
+            "all_rules() 前缀应逐条等于 clean+purge 内置全集"
+        );
     }
 
     #[test]
     fn no_duplicate_rule_names() {
-        let rules = all_rules();
+        let rules = builtin_rules();
         let mut seen = std::collections::HashSet::new();
         for rule in &rules {
             assert!(
@@ -460,12 +555,153 @@ mod tests {
 
     #[test]
     fn no_empty_patterns() {
-        for rule in all_rules() {
+        for rule in builtin_rules() {
             assert!(
                 !rule.patterns.is_empty(),
                 "规则 '{}' 的 patterns 不能为空",
                 rule.name
             );
         }
+    }
+
+    // --- 用户规则安全门禁（issue #22）---
+
+    /// 构造用户规则，避免各测试重复 boilerplate。
+    fn user_rule(
+        patterns: Vec<PathPattern>,
+        safety: SafetyLevel,
+        preselect: bool,
+        markers: Vec<RootMarker>,
+    ) -> CleanRule {
+        CleanRule {
+            name: "用户自定义".into(),
+            description: "d".into(),
+            patterns,
+            safety,
+            category: "c".into(),
+            impact: "i".into(),
+            recovery: "r".into(),
+            root_markers: markers,
+            preselect,
+        }
+    }
+
+    #[test]
+    fn user_rule_targeting_user_data_now_accepted() {
+        // 黑名单已撤去：指向 ~/Documents 等用户数据的规则不再硬拒——防误删的职责由加载层
+        // preselect=false 强制承担（见下 forces_preselect_false 测试），门禁只保证正确性。
+        let rule = user_rule(
+            vec![PathPattern::Exact(home().join("Documents/secret"))],
+            SafetyLevel::Moderate,
+            false,
+            vec![],
+        );
+        assert!(
+            validate_user_rule(&rule).is_ok(),
+            "指向用户数据的规则应被受理（防误删靠 preselect=false，非硬拒）"
+        );
+    }
+
+    #[test]
+    fn user_data_rule_forced_preselect_false() {
+        // 核心信任闸：即便用户规则指向 ~/Documents 且声明 preselect=true，加载后仍被受理，
+        // 但 preselect 被强制为 false——永不自动预选/自动删除，只能在 TUI 手动勾选。
+        let toml = r#"
+[[rules]]
+name = "My Docs Overlay"
+description = "d"
+category = "c"
+safety = "Safe"
+preselect = true
+patterns = [{ exact = "Documents/old-exports" }]
+"#;
+        let rules = user_rules_from_str(toml, "test");
+        assert_eq!(rules.len(), 1, "指向用户数据的规则应被加载（不再硬拒）");
+        assert!(
+            !rules[0].preselect,
+            "指向用户数据的规则 preselect 必须被强制 false"
+        );
+    }
+
+    #[test]
+    fn user_rule_dirname_without_markers_rejected() {
+        let rule = user_rule(
+            vec![PathPattern::DirName("build".into())],
+            SafetyLevel::Moderate,
+            false,
+            vec![],
+        );
+        assert!(
+            validate_user_rule(&rule).is_err(),
+            "DirName 无 root_markers 应被拒"
+        );
+    }
+
+    #[test]
+    fn valid_user_rule_passes() {
+        // 合法：Exact 任意路径；DirName 配了 root_markers。
+        let exact = user_rule(
+            vec![PathPattern::Exact(home().join(".cache/myapp"))],
+            SafetyLevel::Safe,
+            false,
+            vec![],
+        );
+        assert!(validate_user_rule(&exact).is_ok(), "合法 Exact 规则应通过");
+        let dirname = user_rule(
+            vec![PathPattern::DirName(".mybuild".into())],
+            SafetyLevel::Moderate,
+            false,
+            vec![RootMarker::Sibling("myproject.toml".into())],
+        );
+        assert!(
+            validate_user_rule(&dirname).is_ok(),
+            "配了 root_markers 的合法 DirName 规则应通过"
+        );
+    }
+
+    #[test]
+    fn user_rules_from_str_forces_preselect_false() {
+        // 即便声明 preselect=true，加载后也必须强制为 false。
+        let toml = r#"
+[[rules]]
+name = "My Cache"
+description = "d"
+category = "c"
+safety = "Safe"
+preselect = true
+patterns = [{ exact = ".cache/myapp" }]
+"#;
+        let rules = user_rules_from_str(toml, "test");
+        assert_eq!(rules.len(), 1, "合法规则应被加载");
+        assert!(!rules[0].preselect, "用户规则 preselect 必须被强制为 false");
+    }
+
+    #[test]
+    fn user_rules_from_str_fail_closed_on_one_bad_rule() {
+        // 一好一坏（坏 = DirName 无 root_markers）→ fail-closed，整个文件不加载（返回空）。
+        let toml = r#"
+[[rules]]
+name = "Good"
+description = "d"
+category = "c"
+safety = "Safe"
+patterns = [{ exact = ".cache/good" }]
+
+[[rules]]
+name = "Bad DirName"
+description = "d"
+category = "c"
+safety = "Safe"
+patterns = [{ dir_name = "build" }]
+"#;
+        let rules = user_rules_from_str(toml, "test");
+        assert!(rules.is_empty(), "任一条违规应导致整个文件被拒（fail-closed）");
+    }
+
+    #[test]
+    fn user_rules_from_str_fail_closed_on_parse_error() {
+        // 坏 TOML 不 panic，优雅返回空。
+        let rules = user_rules_from_str("this is not = valid toml [[[", "test");
+        assert!(rules.is_empty(), "解析失败应优雅降级为空而非崩溃");
     }
 }
