@@ -4,15 +4,14 @@ mod keymap;
 mod reporter;
 mod theme;
 mod throttle;
-mod tree_builder;
 mod ui;
 
 use std::collections::HashSet;
 
 use app::{ActiveCommand, App, AppState, FlatRow};
 use event::EventHandler;
+use mc_core::IncrementalTreeBuilder;
 use reporter::TuiReporter;
-use tree_builder::IncrementalTreeBuilder;
 
 use anyhow::Result;
 use crossbeam_channel::Receiver;
