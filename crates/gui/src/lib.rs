@@ -5,16 +5,29 @@
 //! commands（命令层）· reporter（`ProgressReporter` → `ipc::Channel` 适配）·
 //! 取消用 managed `Arc<AtomicBool>`（KTD-5）。
 
+pub mod commands;
+pub mod reporter;
+
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-/// 协作式取消的共享标志，放进 Tauri managed state。
-/// 扫描/分析命令进入阻塞闭包前克隆出其中的 `Arc`（KTD-5：async 命令不可持有 `State<'_,_>` 借用）。
-pub struct ScanCancel(pub Arc<AtomicBool>);
+use mc_core::models::ScanResult;
 
-impl Default for ScanCancel {
+/// 应用共享状态（Tauri managed state）。
+/// 命令进入阻塞闭包前克隆其中的 `Arc`（KTD-5：async 命令不可持有 `State<'_,_>` 借用）。
+pub struct AppState {
+    /// 协作式取消标志：`cancel_scan` 置位，reporter 的 `is_cancelled` 读取。
+    pub cancel: Arc<AtomicBool>,
+    /// 最近一次扫描结果，供 `clean` 按路径精确取项（避免前端回传完整 `ScanItem`）。
+    pub last_scan: Arc<Mutex<Option<ScanResult>>>,
+}
+
+impl Default for AppState {
     fn default() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self {
+            cancel: Arc::new(AtomicBool::new(false)),
+            last_scan: Arc::new(Mutex::new(None)),
+        }
     }
 }
 
@@ -22,14 +35,12 @@ impl Default for ScanCancel {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(ScanCancel::default())
-        .invoke_handler(tauri::generate_handler![ping])
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![
+            commands::clean::scan_clean,
+            commands::clean::clean,
+            commands::clean::cancel_scan,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
-}
-
-/// 占位健康检查命令（U2 脚手架）。后续单元补 `scan_clean` / `clean` / `analyze` / FDA 命令。
-#[tauri::command]
-fn ping() -> &'static str {
-    "pong"
 }
