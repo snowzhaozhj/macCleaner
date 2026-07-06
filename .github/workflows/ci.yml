@@ -1,0 +1,47 @@
+# 基础 CI：构建、测试、lint，外加「RULES.md 漂移门禁」。
+# 用 macOS runner——mc 是 Mac 工具，规则里含 macOS 专属路径，且部分逻辑
+# （setiopolicy_np、废纸篓）仅在 macOS 下有意义。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 同一分支的旧运行在有新推送时取消，省 runner 时间。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test-lint:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链（含 clippy）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: 缓存 cargo 构建
+        uses: Swatinem/rust-cache@v2
+
+      - name: 构建
+        run: cargo build --workspace --all-targets
+
+      - name: 测试
+        run: cargo test --workspace
+
+      - name: Clippy（pedantic 全开，见根 Cargo.toml [workspace.lints]）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # 漂移门禁：重新生成 RULES.md，若与提交版本不一致则说明规则改了却没重跑
+      # 生成器——直接失败，强制透明度页与规则源同步。
+      - name: RULES.md 漂移门禁
+        run: |
+          cargo run -p xtask -- gen-rules
+          git diff --exit-code RULES.md
