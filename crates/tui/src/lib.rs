@@ -195,26 +195,30 @@ fn run_app(
                     }
                 },
                 SelectResult::SortDone(result) => {
-                    match result {
-                        Ok(sorted_tree) => {
-                            if let AppState::Sorting =
-                                std::mem::replace(&mut app.state, AppState::Menu)
-                            {
-                                // finalize() 重排了 children，实时态的 discovery-order 索引已失效，
-                                // 故 nav_path/cursor 重置为根；cursor_stack 同步清空以维持
-                                // cursor_stack.len()==nav_path.len() 不变式（审查 F-low）。
-                                app.state = AppState::Analyzing {
-                                    tree_root: Arc::new(sorted_tree),
-                                    nav_path: Vec::new(),
-                                    cursor: 0,
-                                    cursor_stack: Vec::new(),
-                                };
+                    if let Ok(sorted_tree) = result {
+                        if let AppState::Sorting =
+                            std::mem::replace(&mut app.state, AppState::Menu)
+                        {
+                            // finalize() 重排了 children，实时态的 discovery-order 索引已失效，
+                            // 故 nav_path/cursor 重置为根；cursor_stack 同步清空以维持
+                            // cursor_stack.len()==nav_path.len() 不变式（审查 F-low）。
+                            app.state = AppState::Analyzing {
+                                tree_root: Arc::new(sorted_tree),
+                                nav_path: Vec::new(),
+                                cursor: 0,
+                                cursor_stack: Vec::new(),
+                            };
+                            // live 删除的收尾（KTD1）：本次 finalize 是为删除而来（暂存非空），
+                            // 树已稳定，此刻在稳定的 Analyzing 态上执行删除，走既有剪枝恢复路径。
+                            if !app.pending_analyzer_delete.is_empty() {
+                                let items = std::mem::take(&mut app.pending_analyzer_delete);
+                                start_cleaning_from_analyzer(&mut app, items, &events);
                             }
                         }
-                        Err(_) => {
-                            // 排序线程 panic — 回退到 Menu
-                            app.state = AppState::Menu;
-                        }
+                    } else {
+                        // 排序线程 panic — 彻底清态回菜单（back_to_menu 一并清 marked/pending，
+                        // 避免 live 标记漏到下个命令；树已丢失，无从安全剪枝）。
+                        app.back_to_menu();
                     }
                     sort_rx = None;
                     terminal.draw(|f| ui::draw(f, &app))?;
@@ -318,14 +322,16 @@ fn handle_key(
                 KeyCode::Char(c) => {
                     app.confirm_input.push(c);
                     if app.confirm_input.eq_ignore_ascii_case(CONFIRM_TOKEN) {
-                        confirm_accept(app, events);
+                        confirm_accept(app, events, analyze_rx, tree_builder, sort_rx);
                     }
                 }
                 _ => {}
             }
         } else {
             match key {
-                KeyCode::Enter | KeyCode::Char('y') => confirm_accept(app, events),
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    confirm_accept(app, events, analyze_rx, tree_builder, sort_rx);
+                }
                 KeyCode::Esc | KeyCode::Char('n') => {
                     app.confirm_delete = None;
                     app.confirm_input.clear();
@@ -368,33 +374,51 @@ fn handle_key(
     match &app.state {
         AppState::Menu => handle_menu_key(app, key, events, analyze_rx, tree_builder),
         AppState::Scanning { .. } => {
+            // 扫描态现在是可操作工作区：标记按路径（Scanning 列表为稳定插入序，安全），
+            // preselect 已随 Found 增量播种；删除提交时先收尾扫描再清理（KTD1）。
+            let flat_rows = app.build_flat_rows();
             match key {
                 KeyCode::Esc | KeyCode::Backspace => {
                     // 与 q 走同一条返回菜单路径（取消扫描 + back_to_menu 彻底清态），
                     // 不再内联重复实现，避免两处清理逻辑漂移。
                     request_leave_to_menu(app, analyze_rx, tree_builder, sort_rx);
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    app.move_cursor_up();
+                KeyCode::Up | KeyCode::Char('k') => app.move_cursor_up(),
+                KeyCode::Down | KeyCode::Char('j') => app.move_cursor_down(),
+                // 展开：Tab / Enter / l（l 仅展开，不折叠，与 Results 一致，U6/KTD4）
+                KeyCode::Tab | KeyCode::Enter => {
+                    if let Some(FlatRow::Category { cat_idx, .. }) = flat_rows.get(app.result_cursor)
+                    {
+                        app.toggle_expand(*cat_idx);
+                    }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    app.move_cursor_down();
-                }
-                KeyCode::Tab => {
-                    // 扫描中仅允许展开/折叠浏览；标记留到扫描完成后的 Results 页，
-                    // 避免扫描完成时 init_results 重新播种 marked 把用户标记冲掉（假反馈）。
-                    let flat_rows = app.build_flat_rows();
-                    if let Some(FlatRow::Category { cat_idx, .. }) =
+                KeyCode::Right | KeyCode::Char('l') => {
+                    if let Some(FlatRow::Category { cat_idx, expanded: false }) =
                         flat_rows.get(app.result_cursor)
                     {
                         app.toggle_expand(*cat_idx);
                     }
                 }
-                // 扫描中按 Space/x 给提示（对齐 AnalyzingLive 的反馈一致性，KTD9 #5），
-                // 而非静默——标记/删除须待扫描完成进入 Results 后再操作。
-                KeyCode::Char(' ' | 'x') => {
-                    app.status_message =
-                        Some("扫描进行中不可标记/删除，完成后在结果页操作".to_string());
+                // 折叠/回分类头（h/←）：扫描态不借此返回菜单（返回仅 Esc/Backspace/q），
+                // 故无可折叠时静默 no-op。
+                KeyCode::Left | KeyCode::Char('h') => {
+                    app.collapse_or_focus_category(&flat_rows);
+                }
+                // 标记（Space/d）——不移光标；a 全选安全项
+                KeyCode::Char(' ' | 'd') => {
+                    if let Some(row) = flat_rows.get(app.result_cursor) {
+                        let row = row.clone();
+                        app.toggle_selection(&row);
+                    }
+                }
+                KeyCode::Char('a') => app.select_all_safe(),
+                // 删除已标记（x）：弹确认；确认后收尾扫描再清理（见 confirm_accept 的 Scanning 分支）
+                KeyCode::Char('x') => {
+                    let list = app.results_delete_list();
+                    if !list.is_empty() {
+                        app.confirm_delete = Some(list);
+                        app.confirm_scroll = 0;
+                    }
                 }
                 _ => {}
             }
@@ -677,7 +701,7 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
             if category == "__analyze_tree__" {
                 return;
             }
-            use mc_core::models::{CategoryGroup, ScanItem, ScanResult};
+            use mc_core::models::{CategoryGroup, SafetyLevel, ScanItem, ScanResult};
 
             if app.scan_result.is_none() {
                 app.scan_result = Some(ScanResult::default());
@@ -690,7 +714,12 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
             // 当前可合并项恒为最后压入的那一项（新根到来才追加新末项）。Purge/Uninstall 的
             // 每个 Found 都是唯一路径、末项必不匹配→直接 push。由此把每事件的合并从 O(n)
             // 降为 O(1)，避免单分类累积上千项时的 O(n²) 主线程卡顿。
+            // KTD3：预选（selected = safety != Risky && preselect）在**新项首次插入**时
+            // 就地播种到 marked，让扫描期的手动勾选/取消与预选累积到同一集合，
+            // 完成时 init_results 不再重播种冲掉。合并累加分支（既有项）不重复播种。
+            let should_preselect = preselect && safety != SafetyLevel::Risky;
             let mut merged = false;
+            let mut to_preselect: Option<PathBuf> = None;
             if let Some(result) = app.scan_result.as_mut() {
                 if let Some(cat) = result.categories.iter_mut().find(|c| c.name == category) {
                     if let Some(existing) = cat.items.last_mut().filter(|it| it.path == path) {
@@ -698,6 +727,9 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
                         cat.total_size += size;
                         merged = true;
                     } else {
+                        if should_preselect {
+                            to_preselect = Some(path.clone());
+                        }
                         cat.file_count += 1;
                         cat.total_size += size;
                         cat.items.push(
@@ -707,6 +739,9 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
                         );
                     }
                 } else {
+                    if should_preselect {
+                        to_preselect = Some(path.clone());
+                    }
                     result.categories.push(CategoryGroup::new(
                         category.clone(),
                         vec![ScanItem::new(path, size, safety, category.clone())
@@ -719,6 +754,9 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
                 if !merged {
                     result.file_count += 1;
                 }
+            }
+            if let Some(p) = to_preselect {
+                app.marked.insert(p);
             }
             // 已发现项数/总大小不再单独维护：render_scan_header 直接读 scan_result。
         }
@@ -929,13 +967,28 @@ fn handle_results_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers, _eve
     let flat_rows = app.build_flat_rows();
 
     match key {
-        KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
-            // 有激活的过滤词时，先清过滤；否则返回菜单
+        KeyCode::Esc | KeyCode::Backspace => {
+            // 有激活的过滤词时，先清过滤；否则返回菜单（Esc/Backspace 专责清过滤/退出）。
             if app.filter_query.is_empty() {
                 app.back_to_menu();
             } else {
                 app.filter_query.clear();
                 app.clamp_result_cursor();
+            }
+        }
+        // 折叠/回分类头（h/←，KTD4）：无可折叠且无过滤时——根层——返回菜单（对齐 Analyze 根层 h）。
+        // 有过滤词时不清过滤（Esc 专责），保持折叠优先。
+        KeyCode::Left | KeyCode::Char('h') => {
+            if !app.collapse_or_focus_category(&flat_rows) && app.filter_query.is_empty() {
+                app.back_to_menu();
+            }
+        }
+        // 展开/进入（l/→，KTD4）：l 仅展开折叠的分类（方向语义，不折叠）；文件项/已展开为 no-op。
+        KeyCode::Right | KeyCode::Char('l') => {
+            if let Some(FlatRow::Category { cat_idx, expanded: false }) =
+                flat_rows.get(app.result_cursor)
+            {
+                app.toggle_expand(*cat_idx);
             }
         }
         KeyCode::Char('/') => {
@@ -992,7 +1045,13 @@ fn handle_results_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers, _eve
 pub const CONFIRM_TOKEN: &str = "delete";
 
 /// 执行已确认的删除：把确认项映射回 (path, size) 交给删除线程（KTD8：线程签名不变）。
-fn confirm_accept(app: &mut App, events: &EventHandler) {
+fn confirm_accept(
+    app: &mut App,
+    events: &EventHandler,
+    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
+    tree_builder: &mut Option<IncrementalTreeBuilder>,
+    sort_rx: &mut Option<Receiver<DirNode>>,
+) {
     app.confirm_input.clear();
     app.confirm_scroll = 0;
     if let Some(list) = app.confirm_delete.take() {
@@ -1001,7 +1060,26 @@ fn confirm_accept(app: &mut App, events: &EventHandler) {
         if matches!(app.state, AppState::Analyzing { .. }) {
             app.clean_request = Vec::new();
             start_cleaning_from_analyzer(app, items, events);
+        } else if matches!(app.state, AppState::AnalyzingLive { .. }) {
+            // live 态删除（KTD1）：先收尾——停遍历 + finalize 部分树 → Sorting → Analyzing；
+            // 暂存待删清单，待 SortDone 在稳定树上执行（见 run_app 的 SortDone 分支）。
+            app.clean_request = Vec::new();
+            app.pending_analyzer_delete = items;
+            transition_to_sorting(app, analyze_rx, tree_builder, sort_rx);
+        } else if matches!(app.state, AppState::Sorting) {
+            // 竞态：确认框展示期间扫描自然完成已进入 Sorting（finalize 进行中）。此确认必来自
+            // live 态（Sorting 仅由 AnalyzingLive 进入，且 live 删除的 transition 已消费过
+            // confirm_delete），故仍属 live 删除——暂存待删让 SortDone 统一在稳定树上执行，
+            // 不落入 Results 删除路径（否则违背 R3 且丢弃已排序树，审查条目 #1）。
+            app.clean_request = Vec::new();
+            app.pending_analyzer_delete = items;
         } else {
+            // Scanning 态删除：先收尾扫描——置 cancel_flag 停剩余规则，避免边删边扫的
+            // Found 事件混入 Cleaning 态（KTD1）。残留 Found 由 handle_progress 的
+            // 非 Scanning 守卫忽略，无需额外排空。
+            if matches!(app.state, AppState::Scanning { .. }) {
+                app.cancel_flag.store(true, Ordering::Relaxed);
+            }
             // 暂存完整待删清单，供 Done 屏计算成功/失败明细与分类小结（KTD6）。
             app.clean_request = list;
             start_cleaning(app, items, events);
@@ -1341,15 +1419,10 @@ fn handle_analyzer_live_key(
     tree_builder: &mut Option<IncrementalTreeBuilder>,
     sort_rx: &mut Option<Receiver<DirNode>>,
 ) {
-    // 扫描进行中列表在实时按 size 重排，"当前项"随时变化——按位置标记/删除会误标
-    // 此刻恰好最大的项（实测曾误标整个 ~/Library）。故扫描中禁用标记与删除，
-    // 待遍历完成进入稳定的 Analyzing 态再操作。仅给出提示，不改标记集。
-    // 排除 Ctrl 修饰：Ctrl+d 是翻页，不应被当作标记键拦截。
-    if !modifiers.contains(KeyModifiers::CONTROL) && matches!(key, KeyCode::Char(' ' | 'd' | 'x')) {
-        app.status_message =
-            Some("扫描进行中不可标记/删除，完成后再操作".to_string());
-        return;
-    }
+    // live 态现在可标记/删除（KTD2）：标记只动 App.marked（路径集合），与正在生长的树
+    // 完全独立；按路径经 size_desc_order 置换翻译 + .get() 兜底，把实时重排的 TOCTOU
+    // 降为安全 no-op（曾因"按位置标记误标最大项"而被 75eaa4f 一刀切封锁，此处按路径根治）。
+    // 删除（x）见 confirm_accept：提交时先 finalize 部分树再删（KTD1）。
     // 先提取需要的字段进行操作
     if let AppState::AnalyzingLive {
         tree_root,
@@ -1426,7 +1499,49 @@ fn handle_analyzer_live_key(
                     *cursor = cursor_stack.pop().unwrap_or(0);
                 }
             }
-            // 标记/删除（Space/d/x）已在函数入口拦截禁用（扫描中列表实时重排不安全）
+            // 标记（Space/d）：cursor 是显示序，经 size_desc_order 映回存储索引再取 path；
+            // 一律 .get()，把流式重排的 TOCTOU 降为 no-op（KTD2）。不移光标、不改 user_navigated。
+            KeyCode::Char(' ' | 'd') => {
+                let order = crate::ui::analyzer::size_desc_order(&current_node.children);
+                let path = order
+                    .get(*cursor)
+                    .and_then(|&i| current_node.children.get(i))
+                    .map(|c| c.path.clone());
+                if let Some(p) = path {
+                    if !app.marked.remove(&p) {
+                        app.marked.insert(p);
+                    }
+                }
+            }
+            // 删除（x）：与 Analyzing 同款按路径回查规则证据（Risky 触发 type-to-confirm）；
+            // 提交在 confirm_accept 走 finalize→delete（KTD1）。
+            KeyCode::Char('x') => {
+                let mut list = Vec::new();
+                collect_marked(tree_root, &app.marked, &mut list);
+                if !list.is_empty() {
+                    let items = list
+                        .into_iter()
+                        .map(|(path, size)| {
+                            let (safety, impact, recovery) =
+                                mc_core::rules::evidence_for_path(&path).unwrap_or((
+                                    mc_core::models::SafetyLevel::Safe,
+                                    String::new(),
+                                    String::new(),
+                                ));
+                            crate::app::ConfirmItem {
+                                path,
+                                size,
+                                safety,
+                                category: String::new(),
+                                impact,
+                                recovery,
+                            }
+                        })
+                        .collect();
+                    app.confirm_delete = Some(items);
+                    app.confirm_scroll = 0;
+                }
+            }
             _ => {}
         }
     }
@@ -1621,6 +1736,210 @@ mod tests {
     }
 
     #[test]
+    fn found_seeds_preselect_by_safety_and_flag() {
+        // KTD3：Found 首次插入时按 selected(= safety != Risky && preselect) 播种 marked，
+        // 合并累加不重复播种；Risky 与 preselect=false 不播种。
+        use super::{handle_progress, App, AppState};
+        use mc_core::models::SafetyLevel;
+        use mc_core::progress::ProgressEvent;
+
+        let mut app = App::new();
+        app.state = AppState::Scanning {
+            progress_text: String::new(),
+            rule_current: 0,
+            rule_total: 0,
+            rule_name: String::new(),
+        };
+        let found = |cat: &str, path: &str, size: u64, safety, preselect| ProgressEvent::Found {
+            category: cat.to_string(),
+            path: PathBuf::from(path),
+            size,
+            safety,
+            impact: String::new(),
+            recovery: String::new(),
+            preselect,
+        };
+
+        // Safe + preselect=true → 播种
+        handle_progress(&mut app, found("缓存", "/safe", 10, SafetyLevel::Safe, true));
+        // 同 (category, path) 再来一条累加 → 不重复播种（仍是 1 项）
+        handle_progress(&mut app, found("缓存", "/safe", 5, SafetyLevel::Safe, true));
+        // Risky → 不播种
+        handle_progress(&mut app, found("Docker", "/risky", 20, SafetyLevel::Risky, true));
+        // preselect=false → 不播种
+        handle_progress(&mut app, found("构建", "/build", 30, SafetyLevel::Moderate, false));
+
+        assert!(app.marked.contains(&PathBuf::from("/safe")), "Safe+preselect 应播种");
+        assert!(!app.marked.contains(&PathBuf::from("/risky")), "Risky 不应播种");
+        assert!(!app.marked.contains(&PathBuf::from("/build")), "preselect=false 不应播种");
+        assert_eq!(app.marked.len(), 1, "只应有一项，合并累加不重复播种");
+    }
+
+    fn scanning_app_with_items() -> App {
+        use super::AppState;
+        use mc_core::models::{CategoryGroup, SafetyLevel, ScanItem, ScanResult};
+        let items = vec![
+            ScanItem::new(PathBuf::from("/mc_test_ne/a"), 100, SafetyLevel::Safe, "缓存".into()),
+            ScanItem::new(PathBuf::from("/mc_test_ne/b"), 200, SafetyLevel::Safe, "缓存".into()),
+        ];
+        let cat = CategoryGroup::new("缓存".into(), items);
+        let mut app = App::new();
+        app.scan_result = Some(ScanResult::from_categories(vec![cat]));
+        app.expanded = vec![true];
+        app.state = AppState::Scanning {
+            progress_text: String::new(),
+            rule_current: 0,
+            rule_total: 0,
+            rule_name: String::new(),
+        };
+        // rows: [Separator, Category{0}, Item{0,0}, Item{0,1}]；光标落在首个 Item。
+        app.result_cursor = 2;
+        app
+    }
+
+    #[test]
+    fn scanning_space_marks_without_toast() {
+        // U3：扫描态 Space 直接标记（路径绑定），不再弹"扫描中不可标记"提示。
+        let mut app = scanning_app_with_items();
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.marked.contains(&PathBuf::from("/mc_test_ne/a")), "应标记光标项");
+        assert!(app.status_message.is_none(), "不应有封锁提示");
+        press(&mut app, KeyCode::Char(' '));
+        assert!(!app.marked.contains(&PathBuf::from("/mc_test_ne/a")), "再按取消");
+    }
+
+    #[test]
+    fn scanning_x_opens_confirm_when_marked() {
+        let mut app = scanning_app_with_items();
+        app.marked.insert(PathBuf::from("/mc_test_ne/a"));
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.confirm_delete.is_some(), "有标记按 x 应弹确认");
+    }
+
+    #[test]
+    fn scanning_x_noop_when_empty() {
+        let mut app = scanning_app_with_items();
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.confirm_delete.is_none(), "无标记按 x 不弹确认");
+    }
+
+    #[test]
+    fn scanning_delete_confirm_cancels_scan_and_enters_cleaning() {
+        use super::AppState;
+        use std::sync::atomic::Ordering;
+        let mut app = scanning_app_with_items();
+        app.marked.insert(PathBuf::from("/mc_test_ne/a"));
+        press(&mut app, KeyCode::Char('x')); // 弹确认（Safe，非 Risky）
+        press(&mut app, KeyCode::Enter); // 确认 → confirm_accept
+        assert!(app.cancel_flag.load(Ordering::Relaxed), "Scanning 删除应先置 cancel_flag 收尾扫描");
+        assert!(matches!(app.state, AppState::Cleaning { .. }), "应转入 Cleaning");
+    }
+
+    fn live_app(children: Vec<DirNode>) -> App {
+        use super::AppState;
+        let mut root = DirNode::new_dir(PathBuf::from("/r"), "r".into());
+        root.children = children;
+        let mut app = App::new();
+        app.state = AppState::AnalyzingLive {
+            tree_root: root,
+            nav_path: Vec::new(),
+            cursor: 0,
+            cursor_stack: Vec::new(),
+            file_count: 0,
+            total_size: 0,
+            user_navigated: false,
+        };
+        app
+    }
+
+    #[test]
+    fn live_space_marks_by_display_order_not_storage() {
+        // U4/KTD2：cursor 是显示序（体积降序），Space 应标记显示序最大项，而非 children[0]。
+        let mut app = live_app(vec![
+            DirNode::new_file(PathBuf::from("/r/small"), "small".into(), 10),
+            DirNode::new_file(PathBuf::from("/r/big"), "big".into(), 100),
+            DirNode::new_file(PathBuf::from("/r/mid"), "mid".into(), 50),
+        ]);
+        // cursor=0 → 显示序最大 = big（存储序 idx 1）
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.marked.contains(&PathBuf::from("/r/big")), "应标记显示序最大项 big");
+        assert!(!app.marked.contains(&PathBuf::from("/r/small")), "不应误标 children[0]");
+        // 再按取消
+        press(&mut app, KeyCode::Char(' '));
+        assert!(!app.marked.contains(&PathBuf::from("/r/big")));
+    }
+
+    #[test]
+    fn live_space_out_of_range_is_noop() {
+        use super::AppState;
+        let mut app = live_app(vec![DirNode::new_file(PathBuf::from("/r/a"), "a".into(), 1)]);
+        if let AppState::AnalyzingLive { cursor, .. } = &mut app.state {
+            *cursor = 99; // 越界
+        }
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.marked.is_empty(), "越界 cursor 标记应为 no-op，不 panic");
+    }
+
+    #[test]
+    fn live_space_marks_inside_subdirectory() {
+        // U4/R3：钻入子目录后仍可标记（回归修复的核心场景）。
+        let mut sub = DirNode::new_dir(PathBuf::from("/r/sub"), "sub".into());
+        sub.size = 100;
+        sub.children.push(DirNode::new_file(PathBuf::from("/r/sub/f"), "f".into(), 100));
+        let mut app = live_app(vec![sub]);
+        press(&mut app, KeyCode::Char('l')); // 进入 sub
+        press(&mut app, KeyCode::Char(' ')); // 标记 sub/f
+        assert!(app.marked.contains(&PathBuf::from("/r/sub/f")), "子目录内应可标记");
+    }
+
+    #[test]
+    fn live_x_opens_confirm_from_marked() {
+        // U5：live 态 x 从 marked 收集待删并弹确认。
+        let mut app = live_app(vec![DirNode::new_file(PathBuf::from("/r/big"), "big".into(), 100)]);
+        app.marked.insert(PathBuf::from("/r/big"));
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.confirm_delete.is_some(), "有标记按 x 应弹确认");
+    }
+
+    #[test]
+    fn live_x_noop_when_no_marks() {
+        let mut app = live_app(vec![DirNode::new_file(PathBuf::from("/r/big"), "big".into(), 100)]);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.confirm_delete.is_none(), "无标记按 x 不弹确认");
+    }
+
+    #[test]
+    fn live_delete_confirm_finalizes_before_deleting() {
+        // U5/KTD1：live 删除确认 → 暂存待删清单 + 转 Sorting（先 finalize），
+        // 不直接进 Cleaning；实际删除待 SortDone 在稳定树上执行。
+        use super::AppState;
+        let mut app = live_app(vec![DirNode::new_file(PathBuf::from("/r/big"), "big".into(), 100)]);
+        app.marked.insert(PathBuf::from("/r/big"));
+        press(&mut app, KeyCode::Char('x')); // 弹确认（Safe，非 Risky）
+        press(&mut app, KeyCode::Enter); // 确认 → confirm_accept(AnalyzingLive)
+        assert!(matches!(app.state, AppState::Sorting), "应先 finalize 转 Sorting");
+        assert!(!app.pending_analyzer_delete.is_empty(), "待删清单应被暂存");
+    }
+
+    #[test]
+    fn live_delete_confirm_during_sorting_uses_analyzer_path() {
+        // 审查条目 #1 竞态：确认框展示期间扫描自然完成进入 Sorting，此时确认删除
+        // 仍应走 analyzer 暂存路径（由 SortDone 消费），不落入 Results 删除（→ Cleaning）。
+        use super::{confirm_accept, AppState};
+        let mut app = live_app(vec![DirNode::new_file(PathBuf::from("/r/big"), "big".into(), 100)]);
+        app.marked.insert(PathBuf::from("/r/big"));
+        press(&mut app, KeyCode::Char('x')); // 打开确认框（live x）
+        assert!(app.confirm_delete.is_some());
+        // 模拟扫描自然完成、finalize 进行中：状态已切到 Sorting，confirm_delete 仍 Some。
+        app.state = AppState::Sorting;
+        let events = EventHandler::new();
+        confirm_accept(&mut app, &events, &mut None, &mut None, &mut None);
+        assert!(matches!(app.state, AppState::Sorting), "应仍在 Sorting 等 finalize，不转 Cleaning");
+        assert!(!app.pending_analyzer_delete.is_empty(), "应暂存待删走 analyzer 路径");
+        assert!(app.confirm_delete.is_none(), "确认框应关闭");
+    }
+
+    #[test]
     fn found_ignored_outside_scanning_state() {
         // 防污染守卫：非扫描态（如已返回 Menu）收到残留 Found 应被忽略，
         // 不得重建 scan_result 让下一个命令看到上一个命令的检测结果。
@@ -1750,6 +2069,60 @@ mod tests {
         assert!(matches!(app.state, AppState::Menu));
         assert!(app.marked.is_empty());
         assert!(!app.pending_leave);
+    }
+
+    fn results_app(expanded: bool) -> App {
+        use super::AppState;
+        use mc_core::models::{CategoryGroup, SafetyLevel, ScanItem, ScanResult};
+        let items = vec![
+            ScanItem::new(PathBuf::from("/r/a"), 10, SafetyLevel::Safe, "缓存".into()),
+            ScanItem::new(PathBuf::from("/r/b"), 20, SafetyLevel::Safe, "缓存".into()),
+        ];
+        let cat = CategoryGroup::new("缓存".into(), items);
+        let mut app = App::new();
+        app.scan_result = Some(ScanResult::from_categories(vec![cat]));
+        app.expanded = vec![expanded];
+        app.state = AppState::Results;
+        app
+    }
+
+    #[test]
+    fn results_l_expands_collapsed_category() {
+        // U6：l 展开折叠的分类（方向语义）。
+        let mut app = results_app(false);
+        app.result_cursor = 1; // rows: [Separator, Category]
+        press(&mut app, KeyCode::Char('l'));
+        assert!(app.expanded[0], "l 应展开折叠分类");
+    }
+
+    #[test]
+    fn results_h_on_item_collapses_parent_not_menu() {
+        use super::AppState;
+        let mut app = results_app(true);
+        app.result_cursor = 2; // rows: [Separator, Category, Item, Item] → 首个 Item
+        press(&mut app, KeyCode::Char('h'));
+        assert!(!app.expanded[0], "h 于子项应折叠父分类");
+        assert!(matches!(app.state, AppState::Results), "不应返回菜单");
+    }
+
+    #[test]
+    fn results_h_on_root_head_returns_to_menu() {
+        use super::AppState;
+        let mut app = results_app(false);
+        app.result_cursor = 1; // 折叠的分类头
+        press(&mut app, KeyCode::Char('h'));
+        assert!(matches!(app.state, AppState::Menu), "根层无可折叠+无过滤，h 返回菜单");
+    }
+
+    #[test]
+    fn results_esc_still_clears_filter() {
+        // Esc 仍专责清过滤（不被 h/l 语义改动影响）。
+        let mut app = results_app(true);
+        app.filter_query = "a".into();
+        app.result_cursor = 1;
+        press(&mut app, KeyCode::Esc);
+        assert!(app.filter_query.is_empty(), "Esc 应清过滤");
+        assert!(matches!(app.state, super::AppState::Results), "清过滤不返回菜单");
     }
 
     #[test]

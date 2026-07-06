@@ -35,8 +35,13 @@ pub fn hints_for(state: &AppState) -> Vec<KeyHint> {
         ],
         AppState::Scanning { .. } => &[
             KeyHint { keys: "↑↓ / jk", desc: "移动", priority: 3 },
+            KeyHint { keys: "h / l", desc: "折叠 / 展开", priority: 3 },
+            KeyHint { keys: "Space / d", desc: "标记", priority: 1 },
+            KeyHint { keys: "a", desc: "全选安全项", priority: 1 },
             KeyHint { keys: "Tab", desc: "展开/折叠", priority: 2 },
-            KeyHint { keys: "Esc / Backspace / q", desc: "取消扫描并返回", priority: 0 },
+            KeyHint { keys: "x", desc: "删除已标记(移废纸篓)", priority: 0 },
+            // 与 Results 一致：x 删除与 ? 帮助是 footer 两条硬保留(priority 0)，取消返回让位为 1。
+            KeyHint { keys: "Esc / Backspace / q", desc: "取消扫描并返回", priority: 1 },
         ],
         AppState::Results => &[
             KeyHint { keys: "↑↓ / jk", desc: "移动", priority: 3 },
@@ -45,6 +50,7 @@ pub fn hints_for(state: &AppState) -> Vec<KeyHint> {
             KeyHint { keys: "/", desc: "过滤", priority: 1 },
             KeyHint { keys: "Space / d", desc: "标记", priority: 1 },
             KeyHint { keys: "Tab / Enter", desc: "展开/折叠", priority: 2 },
+            KeyHint { keys: "h / l", desc: "折叠 / 展开", priority: 3 },
             KeyHint { keys: "a", desc: "全选安全项", priority: 1 },
             KeyHint { keys: "x", desc: "删除已标记(移废纸篓)", priority: 0 },
             // 返回/清过滤降为 1：x 删除与 ? 帮助是 footer 的两条硬保留（priority 0），
@@ -72,8 +78,9 @@ pub fn hints_for(state: &AppState) -> Vec<KeyHint> {
             KeyHint { keys: "g / G", desc: "首行 / 末行", priority: 3 },
             KeyHint { keys: "Enter / l", desc: "进入目录", priority: 2 },
             KeyHint { keys: "Backspace / h", desc: "返回上级", priority: 2 },
-            KeyHint { keys: "", desc: "扫描完成后可标记与删除", priority: 1 },
-            KeyHint { keys: "q", desc: "返回菜单", priority: 0 },
+            KeyHint { keys: "Space / d", desc: "标记", priority: 1 },
+            KeyHint { keys: "x", desc: "删除已标记(移废纸篓)", priority: 0 },
+            KeyHint { keys: "q", desc: "返回菜单", priority: 1 },
         ],
         AppState::Sorting => &[KeyHint { keys: "Esc / Backspace", desc: "取消并返回", priority: 0 }],
     };
@@ -161,5 +168,59 @@ mod tests {
         assert!(display_width(&line) <= 60, "应适配宽度：{}", display_width(&line));
         assert!(line.contains('x'), "删除应保留");
         assert!(!line.contains("翻页") || !line.contains("首行"), "低优先项应先被剔除");
+    }
+
+    fn scanning_state() -> AppState {
+        AppState::Scanning {
+            progress_text: String::new(),
+            rule_current: 0,
+            rule_total: 0,
+            rule_name: String::new(),
+        }
+    }
+
+    fn analyzing_live_state() -> AppState {
+        use mc_core::models::DirNode;
+        use std::path::PathBuf;
+        AppState::AnalyzingLive {
+            tree_root: DirNode::new_dir(PathBuf::from("/"), "/".into()),
+            nav_path: Vec::new(),
+            cursor: 0,
+            cursor_stack: Vec::new(),
+            file_count: 0,
+            total_size: 0,
+            user_navigated: false,
+        }
+    }
+
+    #[test]
+    fn scanning_footer_exposes_mark_and_delete() {
+        // 扫描态现在可标记/删除：宽屏应展示，且 x/? 是窄屏硬保留。
+        let wide = footer_line(&scanning_state(), 200);
+        assert!(wide.contains("标记"), "扫描态应展示标记：{wide}");
+        assert!(wide.contains("删除"), "扫描态应展示删除：{wide}");
+        let narrow = footer_line(&scanning_state(), 80);
+        assert!(display_width(&narrow) <= 80);
+        assert!(narrow.contains('x'), "x 删除窄屏硬保留：{narrow}");
+        assert!(narrow.contains('?'), "? 帮助窄屏硬保留：{narrow}");
+    }
+
+    #[test]
+    fn analyzing_live_footer_exposes_mark_and_delete_not_locked_hint() {
+        // live 态恢复标记/删除，不再展示"扫描完成后可标记与删除"的封锁提示。
+        let line = footer_line(&analyzing_live_state(), 200);
+        assert!(line.contains("标记"), "live 应展示标记：{line}");
+        assert!(line.contains("删除"), "live 应展示删除：{line}");
+        assert!(!line.contains("扫描完成后"), "不应再有封锁提示：{line}");
+    }
+
+    #[test]
+    fn results_hints_include_hl_folding() {
+        // h/l 是 priority-3（窄屏会被裁），故直接查键位表而非 footer_line。
+        let hints = hints_for(&AppState::Results);
+        assert!(
+            hints.iter().any(|h| h.keys.contains("h / l")),
+            "Results 键位表应含 h/l 折叠展开"
+        );
     }
 }
