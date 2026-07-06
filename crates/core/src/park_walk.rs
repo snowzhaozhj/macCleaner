@@ -73,19 +73,25 @@ enum Job {
 /// - `on_read_dir`：每读完一个目录的 children 后调用一次（在 worker 线程上），用于
 ///   `retain` 剪枝 + 可选 [`prefetch_sizes`]。**剪掉的目录不会被深入**。需 `Sync`
 ///   （多 worker 并发调用）。
+/// - `on_read_error`：某个目录 `read_dir` 失败时调用一次（在 worker 线程上，故需 `Sync`），
+///   传入 `(出错目录路径, io::Error)`。引擎本身不区分错误种类、失败目录一律跳过（不深入、
+///   不产 entry，与 jwalk 一致）；是否把某类错误升为结构化事件（如权限跳过 #23）由调用方决定，
+///   使本模块保持通用。传 `|_, _| {}` 即恢复"静默跳过读不到的目录"的原行为（如 analyze）。
 /// - `is_cancelled`：主线程每收到一批 entry 查一次；返回 true 即尽快中止遍历。
 /// - `consume`：主线程按**完成序**逐个收到 [`WalkEntry`]（含根、所有子目录、所有文件）。
 ///   在单一线程上调用，故其捕获状态无需 `Send`。
 ///
 /// `threads` 会被夹到 `>=1`。整个遍历在 `thread::scope` 内完成，返回即全部 worker 已 join。
-pub fn park_walk<F, X, C>(
+pub fn park_walk<F, E, X, C>(
     root: &Path,
     threads: usize,
     on_read_dir: F,
+    on_read_error: E,
     is_cancelled: X,
     mut consume: C,
 ) where
     F: Fn(&mut Vec<DirChild>) + Sync,
+    E: Fn(&Path, &std::io::Error) + Sync,
     X: Fn() -> bool,
     C: FnMut(WalkEntry),
 {
@@ -105,13 +111,14 @@ pub fn park_walk<F, X, C>(
             let job_tx = job_tx.clone();
             let res_tx = res_tx.clone();
             let on_read_dir = &on_read_dir;
+            let on_read_error = &on_read_error;
             let pending = &pending;
             let cancelled = &cancelled;
             scope.spawn(move || {
                 while let Ok(job) = job_rx.recv() {
                     let Job::Dir(dir) = job else { break };
                     if !cancelled.load(Ordering::Relaxed) {
-                        let (batch, subdirs) = read_one_dir(&dir, on_read_dir);
+                        let (batch, subdirs) = read_one_dir(&dir, on_read_dir, on_read_error);
                         // **先发批、后入队子目录**：保证父目录（作为 entry 在本批内）先于其
                         // 任何子目录的批到达消费端。否则多 worker 下，子目录可能被另一 worker
                         // 抢先读完并发出其批，早于本批——analyze 键控插入会找不到父（issue #20
@@ -152,12 +159,19 @@ pub fn park_walk<F, X, C>(
 
 /// 读取单个目录：`on_read_dir` 剪枝/预取后，返回 `(该目录全部保留 child 攒成的一批, 需入队的子目录)`。
 /// **不**在此入队/改 pending——由 worker 在**发批之后**再入队，以保证父先于子到达消费端。
-fn read_one_dir<F>(dir: &Path, on_read_dir: &F) -> (Vec<WalkEntry>, Vec<PathBuf>)
+/// `read_dir` 失败时通过 `on_read_error` 回调把 `(路径, 错误)` 交给调用方分流（如权限跳过 #23），
+/// 然后一律跳过该目录（返回空，与 jwalk "读不到的目录跳过" 一致）。
+fn read_one_dir<F, E>(dir: &Path, on_read_dir: &F, on_read_error: &E) -> (Vec<WalkEntry>, Vec<PathBuf>)
 where
     F: Fn(&mut Vec<DirChild>),
+    E: Fn(&Path, &std::io::Error),
 {
-    let Ok(read_dir) = std::fs::read_dir(dir) else {
-        return (Vec::new(), Vec::new()); // 与 jwalk 一致：读不到的目录跳过
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(err) => {
+            on_read_error(dir, &err);
+            return (Vec::new(), Vec::new()); // 与 jwalk 一致：读不到的目录跳过
+        }
     };
     let mut children: Vec<DirChild> = Vec::new();
     for entry in read_dir.flatten() {
@@ -215,6 +229,7 @@ mod tests {
             root,
             threads,
             |children| prefetch_sizes(children),
+            |_p, _err| {},
             || false,
             |e| {
                 if e.is_dir {
@@ -325,6 +340,7 @@ mod tests {
                 children.retain(|c| !(c.is_dir && c.file_name() == "skipme"));
                 prefetch_sizes(children);
             },
+            |_p, _err| {},
             || false,
             |e| {
                 if !e.is_dir {
@@ -399,6 +415,7 @@ mod tests {
                 }
                 prefetch_sizes(children);
             },
+            |_p, _err| {}, // #23：on_read_error（本取消测试不关心读错误）
             || {
                 // main 消费完根那一批后第一次进来：与 worker 在 Barrier 交汇后再请求取消。
                 // 仅交汇一次——worker 后续目录会被跳过、不再撞 Barrier，若这里重复 wait 会死锁。
@@ -434,11 +451,51 @@ mod tests {
                 *dir_reads.lock().unwrap() += 1;
                 prefetch_sizes(children);
             },
+            |_p, _err| {},
             || false,
             |_e| {},
         );
         // 目录数 = 1(root 不经 on_read_dir，但其 children 读一次) ... on_read_dir 每个被读目录调一次。
         // 造树 dirs = top + top*mid = 3 + 9 = 12，加根 = 13 个目录被 read_dir。
         assert_eq!(*dir_reads.lock().unwrap(), 13, "每个目录 read 一次 on_read_dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn park_read_error_callback_fires_for_permission_denied() {
+        // #23：无权限读取的子目录 read_dir 失败时，应通过 on_read_error 回调把 (路径, 错误)
+        // 交给调用方（错误 kind = PermissionDenied），而非静默吞掉；该子树被跳过、不产 entry。
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        std::fs::write(base.join("ok.txt"), vec![b'a'; 3]).unwrap();
+        let locked = base.join("locked_dir");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("secret.bin"), vec![b'x'; 100]).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // root 可穿透 0o000：若当前进程仍能读，环境不适合断言，复原后跳过。
+        if std::fs::read_dir(&locked).is_ok() {
+            let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+            return;
+        }
+
+        let errors: Mutex<Vec<(PathBuf, std::io::ErrorKind)>> = Mutex::new(Vec::new());
+        park_walk(
+            base,
+            3,
+            |children| prefetch_sizes(children),
+            |p, err| errors.lock().unwrap().push((p.to_path_buf(), err.kind())),
+            || false,
+            |_e| {},
+        );
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+
+        let errs = errors.lock().unwrap();
+        assert!(
+            errs.iter().any(|(p, kind)| p == &locked
+                && *kind == std::io::ErrorKind::PermissionDenied),
+            "无权限子目录应触发 on_read_error(PermissionDenied)，实际: {errs:?}"
+        );
     }
 }

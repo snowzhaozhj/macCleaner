@@ -829,6 +829,10 @@ fn handle_progress(app: &mut App, evt: ProgressEvent) {
                 };
             }
         }
+        // 权限跳过（#23）：CLI 端会单列「跳过（需授权）」区并引导 mc doctor；
+        // TUI 侧的跳过区渲染属独立范围，本批不做，此处显式 no-op（收下事件不改状态，
+        // 保持穷尽 match 与取消/契约语义不变）。
+        ProgressEvent::SkippedNoPermission { .. } => {}
     }
 }
 

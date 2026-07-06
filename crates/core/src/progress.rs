@@ -14,6 +14,10 @@ pub enum ProgressEvent {
     },
     CategoryDone { category: String, total_size: u64, count: usize },
     RuleProgress { current: usize, total: usize, name: String },
+    /// 因权限（`PermissionDenied`）读不到某目录/条目而**跳过**它（#23）。
+    /// 与静默 `warn!` 吞错的区别：这是结构化事件，UI 可单列「跳过（需授权）」区并引导授权。
+    /// **只承载权限类跳过**——其它 IO 错误不走这个变体，避免把"文件系统坏了"误报成"缺授权"。
+    SkippedNoPermission { path: PathBuf },
     Complete,
     Error(String),
     CleaningFile { path: PathBuf },
