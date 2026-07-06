@@ -2,10 +2,15 @@
 .DS_Store
 *.swp
 *.swo
-.agents/
 .idea/
 
 # .claude 纳入版本管理（共享 hooks / settings / CE 工作流配置）；仅忽略个人与本地生成物
 .claude/worktrees/
-.claude/skills/
 .claude/settings.local.json
+
+# impeccable 插件的本地生成物（缓存/待处理/本地配置）——共享忽略，避免误提交。
+# 插件另在 .git/info/exclude 自管一份（每机重建）；此处是插件无关的可移植兜底。
+# 注意：.impeccable/critique/ 下的体检报告是要入库的产物，不在此列。
+.impeccable/hook.cache.json
+.impeccable/hook.pending.json
+.impeccable/config.local.json
