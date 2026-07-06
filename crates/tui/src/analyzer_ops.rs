@@ -15,7 +15,8 @@ use mc_core::progress::AnalyzeEvent;
 
 use crate::app::{self, App, AppState};
 use crate::tree_builder::IncrementalTreeBuilder;
-use crate::{cancel_analyze_to_menu, resolve_nav_node, toggle_marked, PAGE_STEP};
+use crate::progress::cancel_analyze_to_menu;
+use crate::{resolve_nav_node, toggle_marked, PAGE_STEP};
 
 /// 递归收集树中被标记路径的 (路径, 大小)；命中标记目录即整体计入、不再深入
 pub(crate) fn collect_marked(node: &DirNode, marked: &HashSet<PathBuf>, out: &mut Vec<(PathBuf, u64)>) {
