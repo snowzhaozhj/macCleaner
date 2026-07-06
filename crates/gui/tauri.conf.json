@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "macCleaner",
+  "version": "0.1.0",
+  "identifier": "com.zhaohejie.maccleaner",
+  "build": {
+    "beforeDevCommand": "npm --prefix frontend run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm --prefix frontend run build",
+    "frontendDist": "frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "macCleaner",
+        "width": 960,
+        "height": 680,
+        "minWidth": 720,
+        "minHeight": 520
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "12.3",
+      "entitlements": "macos.entitlements"
+    }
+  }
+}

@@ -1,0 +1,12 @@
+/* 语义 token 层占位（U2 脚手架）。U5 按 DESIGN.md §2 OKLCH 暗色基准补全全量变量。 */
+:root {
+  --surface-base: oklch(0.18 0.008 250);
+  --ink-primary: oklch(0.93 0.005 250);
+}
+
+body {
+  margin: 0;
+  background: var(--surface-base);
+  color: var(--ink-primary);
+  font-family: system-ui, -apple-system, sans-serif;
+}

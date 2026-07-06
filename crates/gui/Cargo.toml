@@ -1,0 +1,25 @@
+[package]
+name = "mc-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# lib 名带 _lib 后缀避免与 bin 名冲突（Tauri 官方约定，见 rust-lang/cargo#8519）。
+[lib]
+name = "mc_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+mc-core = { path = "../core" }
+tauri = { workspace = true }
+tauri-plugin-opener = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+crossbeam-channel = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true
