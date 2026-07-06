@@ -49,17 +49,10 @@ pub fn render_flat_list(f: &mut Frame, app: &App, area: Rect, title: &str) {
     // 是过滤，且各 filter 编辑处都已调 clamp_result_cursor，故 total>0 时恒不越界；此处再兜一层，
     // 让未来任何"渲染前收缩 flat_rows 却漏 clamp"的路径也只滑动窗口、不显示空白。
     let cursor = app.result_cursor.min(total.saturating_sub(1));
-    let visible_height = (area.height as usize).saturating_sub(2);
-    let (window_start, window_end) = if visible_height == 0 {
-        (0, 0)
-    } else {
-        let start = if cursor >= visible_height {
-            cursor + 1 - visible_height
-        } else {
-            0
-        };
-        (start, (start + visible_height).min(total))
-    };
+    let visible_height = chrome::list_visible_height(area);
+    // 视口起始行走 chrome::window_start 单一真源，与鼠标命中测试同源（避免公式漂移）。
+    let window_start = chrome::window_start(cursor, visible_height);
+    let window_end = (window_start + visible_height).min(total);
 
     // 仅构建可见区间的行；is_cursor 用**绝对**索引判断（cursor 是全局坐标）。
     // 越界一律走 .get() 降为跳过，防御流式重排下的 TOCTOU。
