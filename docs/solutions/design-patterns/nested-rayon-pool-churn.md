@@ -81,9 +81,62 @@ dir_size_pool(4).install(|| dirs.par_iter().map(|d| dir_size(d)))
   而不是回退到 `RayonNewPool`。
 - 若外层**没有**并行（单任务场景），内层用池并行是对的——本坑特指"外层已并行、内层再建池"的嵌套。
 
+## 续篇：真凶是「消费端固定自旋」，不是过度订阅——解法是 park 引擎（非 Serial）（2026-07-05 后续探测）
+
+> **结论修订（issue #20）**：本节最初写「解法=walk 改默认 `Serial`」——**已推翻**。Serial 确实消自旋，但让
+> **analyze 慢 76%**（`analyze ~` 串行 100s vs 并行 56s：全树每文件 stat 被 EDR 拖慢的 syscall 全被串起来）。
+> Serial 只适合 **walk 很轻的 purge 剪枝遍历**，不适合 analyze/clean 的全树遍历。真解是**自写 park 式阻塞
+> work-queue 遍历器**（空闲 worker 挂起、0 CPU，而非取消并行）——既消自旋又不损墙钟。下方诊断部分仍成立，
+> 仅"解法"一段按此修订。见 [[../../plans/2026-07-05-010-perf-park-walker-scan-engine-plan]] 与 issue #20。
+
+对 `purge ~` 全程 `sample` 发现：U6 后仍有 **~25%+ on-CPU 在 `sched_yield`（`swtch_pri`）自旋**，
+最大一簇 31869 样本在**主线程** `cthread_yield→swtch_pri`。
+
+**一度误判为「过度订阅」，实测证伪。** 关键 A/B（深常规目录树，暖缓存交替）——把 walk 池线程数从
+2 扫到 10：
+
+| walk 并行度 | CPU% | 墙钟 |
+|---|---|---|
+| RayonNewPool(2) | ~130% | ~4.6s |
+| RayonNewPool(3)（macOS 旧默认） | ~129% | ~4.7s |
+| RayonNewPool(4) | ~138% | ~4.7s |
+| RayonNewPool(10) | ~134% | ~4.5s |
+| **Serial（新默认）** | **31%** | **5.05s** |
+
+**2~10 线程 CPU 全是 ~130%，一点没差**——自旋**与池大小无关**，不是"线程太多"。真凶是 jwalk 并行迭代器的
+**消费端**：`for entry in walker` 拉取 in-order 结果时**忙等 ~1 核**，加再多 producer 也消不掉这份消费自旋。
+（此前误以为默认走 10 线程全局池——其实 macOS 旧默认是 `RayonNewPool(3)`；线程数根本不是变量。）
+
+**解法（修订）：自写 park 式阻塞 work-queue 遍历器**（`crates/core/src/park_walk.rs`，`MC_WALK_ENGINE=park` 门控，
+默认仍 jwalk）。空闲 worker **阻塞在 channel recv（park，0 CPU）而非自旋**，把那份消费自旋变成 0-CPU 挂起等待，
+同时保留并行度（不牺牲墙钟）。实测（issue #20）：
+- **冻结合成树 `purge` CPU 秒 1.24→0.61（−51%）**，user 态 0.38→0.06（自旋消除）；墙钟持平。
+- **`sample analyze ~/workspace` 顶栈自旋占比 40.1%→0.6%**——jwalk 的 `swtch_pri` 4452 样本槽在 park 里
+  变成 `semaphore_wait_trap`（worker 挂起）。
+- **发现结果逐字节一致**（合成冻结树单测跨 worker 1/2/8；`analyze --json` 静默树逐字节一致）。
+
+**为什么 Serial 不行而 park 行**：Serial 用"取消并行"消自旋——全树遍历的 I/O 无法重叠，EDR close 税一串到底
+（analyze +76%）。park 用"空闲挂起"消自旋——**保留 N 线程 I/O 重叠**（快），空闲时不烧 CPU（省）。二者都消自旋，
+但 park 不付墙钟代价。`MC_WALK_ENGINE=park` 开、`MC_WALK_THREADS=N` 调 worker 数。
+
+**衡量自旋收益要看 profiler `swtch_pri` 占比或 CPU 秒，别看墙钟**——单次墙钟被 EDR 的 close 噪声淹没
+（本机 `purge ~` 默认 CPU 在 102%~225% 间跳，见 [[edr-syscall-tax-distorts-cpu-measurement]]）。
+
+**对标 dua-cli**（`/Users/zhaohejie/workspace/explore/dua-cli`）：`options.rs` 写 *"on macOS too many threads are bad,
+3 is best on M4"*、`main.rs` 刻意避开全局 rayon 池——方向一致（macOS 少线程）。注意 dua 在装 EDR 的机器上
+**CPU 同样偏高**（同一套 open/close 遍历吃同样的 EDR 税），佐证高 CPU 的另一半是环境而非并行策略。
+
 ## Takeaways
 
-- **诊断信号**：CPU% 远超核数 + sys 时间畸高 + 墙钟并不更快 = 强烈提示线程过度订阅 / 池 churn，而非有效并行。
+- **诊断信号**：CPU% 远超核数 + sys 时间畸高 + 墙钟并不更快 = 强烈提示自旋/协调开销，而非有效并行。
+- **自旋不一定来自"线程太多"**：本例扫遍 2~10 线程 CPU 不变，真凶是**并行迭代器消费端的固定忙等**。
+  先用 profiler 定位自旋的**调用栈**（是消费端还是 idle worker），再决定修法。
+- **消自旋有两条路，别只想到"取消并行"**：① 去并行（Serial）——消自旋但 I/O 不重叠、全树遍历变慢（analyze +76%），
+  只适合 walk 很轻的场景；② **空闲挂起（park）**——worker 阻塞在 channel/condvar（0 CPU）而非自旋，**保留并行 I/O
+  重叠**，既省 CPU 又不损墙钟。库若把"空闲即自旋"焊死（jwalk 的 `yield_now`、`busy_timeout` 仅死锁检测不可调），
+  自写一个 park 式 work-queue 池往往比迁就它更省。
+- **churn / 过度订阅 / 消费端自旋是三种不同的浪费**：churn 靠"内层串行/复用池"修；过度订阅靠"限池大小"修；
+  消费端自旋靠"空闲挂起（park）"修（而非"改串行"——那会牺牲并行 I/O）。别把它们混为一谈。
 - **测量前提**：CPU/并发结论只在 **release** 下可信（LTO + opt-level=3）；用**合成固定目录树**（tempfile）而非真实 home 做基准，才能跨配置复现；`MC_WALK_THREADS`/`MC_DIRSIZE_THREADS` env 旋钮支持线程数扫参。
 - **并行只加一层**：嵌套并行要么共享一个池（且避免同池自锁），要么内层串行让外层负责并行；切忌"每个元素新建一个池"。
 - 相关：`docs/plans/2026-07-05-009-perf-scan-cpu-optimization-plan.md`（本次计划与完整测量）、`docs/solutions/tooling-decisions/rust-workspace-pedantic-clippy-and-release-profile.md`（release 测量前提）。

@@ -111,15 +111,19 @@ fn build_dir_tree_recursive(path: &Path, depth: usize, max_depth: usize) -> Resu
 }
 
 fn dir_size_fast(path: &Path) -> u64 {
-    mc_core::create_walker(path)
-        .process_read_dir(|_depth, _path, _state, children| {
-            mc_core::prefetch_metadata(children);
-        })
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-        .filter(|e| !e.file_type().is_dir())
-        .map(|e| e.client_state.unwrap_or(0))
-        .sum()
+    // 经 analyze_walk 求和：内部按 MC_WALK_ENGINE 选 jwalk/park 后端，两者逐字节一致。
+    // 语义与旧 create_walker 求和相同（lstat 取大小、不跟随符号链接、含隐藏项）。
+    let mut total = 0u64;
+    mc_core::analyze_walk(
+        path,
+        || false,
+        |_name, _path, size, is_file| {
+            if is_file {
+                total += size;
+            }
+        },
+    );
+    total
 }
 
 fn print_tree(node: &DirNode, indent: usize, threshold: u64) {
