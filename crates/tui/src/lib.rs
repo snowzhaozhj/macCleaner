@@ -16,11 +16,15 @@ use tree_builder::IncrementalTreeBuilder;
 
 use anyhow::Result;
 use crossbeam_channel::Receiver;
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, KeyCode, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
+use ratatui::layout::Rect;
 use humansize::{format_size, DECIMAL};
 use mc_core::engine::Engine;
 use mc_core::models::{DeleteMode, DirNode};
@@ -36,6 +40,10 @@ use std::time::Duration;
 /// 翻页/Ctrl+d/Ctrl+u 一次移动的行数
 const PAGE_STEP: usize = 10;
 
+/// 确认清单每项估算渲染行数——滚动上界 = 项数 × 此值（粗 clamp，防按住/滚过头后空滚）。
+/// 键盘与鼠标 confirm 滚动共用此常量，避免两处魔法值漂移（每 Risky 项 ≤4 视觉行、每分类 ≤5 行）。
+const CONFIRM_ROWS_PER_ITEM: usize = 5;
+
 // ===== 导航辅助函数 =====
 
 // ===== 核心运行逻辑 =====
@@ -48,6 +56,8 @@ pub fn run() -> Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
+        // 先关鼠标捕获再离开备用屏，与初始化逆序；不还原会残留捕获污染外层 shell。
+        let _ = stdout().execute(DisableMouseCapture);
         let _ = stdout().execute(LeaveAlternateScreen);
         original_hook(info);
     }));
@@ -55,6 +65,8 @@ pub fn run() -> Result<()> {
     // 初始化终端
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
+    // 开启鼠标捕获：由应用自处理滚轮/点击，跨终端行为一致（否则终端把滚动翻译成方向键爆发）。
+    stdout().execute(EnableMouseCapture)?;
 
     let backend =
         ratatui::backend::CrosstermBackend::new(BufWriter::with_capacity(8192, stdout()));
@@ -62,8 +74,9 @@ pub fn run() -> Result<()> {
 
     let result = run_app(&mut terminal);
 
-    // 恢复终端
+    // 恢复终端（与初始化逆序：先关捕获，再离开备用屏）
     disable_raw_mode()?;
+    stdout().execute(DisableMouseCapture)?;
     stdout().execute(LeaveAlternateScreen)?;
 
     result
@@ -79,6 +92,7 @@ fn needs_animation(app: &App) -> bool {
 
 enum SelectResult {
     Key(crossterm::event::KeyEvent),
+    Mouse(MouseEvent),
     Progress(ProgressEvent),
     Analyze(AnalyzeEvent),
     SortDone(std::result::Result<DirNode, crossbeam_channel::RecvError>),
@@ -119,6 +133,7 @@ fn run_app(
             let select_result = {
                 let mut sel = crossbeam_channel::Select::new();
                 let key_idx = sel.recv(&events.key_rx);
+                let mouse_idx = sel.recv(&events.mouse_rx);
                 let progress_idx = sel.recv(&events.progress_rx);
                 let analyze_idx = analyze_rx.as_ref().map(|rx| sel.recv(rx));
                 let sort_idx = sort_rx.as_ref().map(|rx| sel.recv(rx));
@@ -127,6 +142,9 @@ fn run_app(
                     Ok(oper) if oper.index() == key_idx => oper
                         .recv(&events.key_rx)
                         .map_or(SelectResult::Timeout, SelectResult::Key),
+                    Ok(oper) if oper.index() == mouse_idx => oper
+                        .recv(&events.mouse_rx)
+                        .map_or(SelectResult::Timeout, SelectResult::Mouse),
                     Ok(oper) if oper.index() == progress_idx => oper
                         .recv(&events.progress_rx)
                         .map_or(SelectResult::Timeout, SelectResult::Progress),
@@ -165,6 +183,11 @@ fn run_app(
                         &mut tree_builder,
                         &mut sort_rx,
                     );
+                    terminal.draw(|f| ui::draw(f, &app))?;
+                }
+                SelectResult::Mouse(m) => {
+                    let size = terminal.size()?;
+                    handle_mouse(&mut app, m, Rect::new(0, 0, size.width, size.height));
                     terminal.draw(|f| ui::draw(f, &app))?;
                 }
                 SelectResult::Progress(evt) => {
@@ -243,6 +266,12 @@ fn run_app(
                         handle_key(&mut app, key.code, key.modifiers, &events, &mut analyze_rx, &mut tree_builder, &mut sort_rx);
                     }
                 }
+                recv(events.mouse_rx) -> m => {
+                    if let Ok(m) = m {
+                        let size = terminal.size()?;
+                        handle_mouse(&mut app, m, Rect::new(0, 0, size.width, size.height));
+                    }
+                }
                 recv(events.progress_rx) -> evt => {
                     if let Ok(evt) = evt {
                         handle_progress(&mut app, evt);
@@ -298,7 +327,11 @@ fn handle_key(
     if app.confirm_delete.is_some() {
         // 清单滚动上界（粗 clamp，防按住翻页时 confirm_scroll 无限膨胀致后续上滚"空按"；
         // 渲染侧再按可见高度精确 clamp）。每 Risky 项 ≤4 视觉行、每分类 ≤5 行，×5 足够宽松。
-        let scroll_cap = app.confirm_delete.as_ref().map_or(0, Vec::len).saturating_mul(5);
+        let scroll_cap = app
+            .confirm_delete
+            .as_ref()
+            .map_or(0, Vec::len)
+            .saturating_mul(CONFIRM_ROWS_PER_ITEM);
         let scroll_up = |app: &mut App, n: usize| app.confirm_scroll = app.confirm_scroll.saturating_sub(n);
         let scroll_down =
             |app: &mut App, n: usize| app.confirm_scroll = (app.confirm_scroll + n).min(scroll_cap);
@@ -440,6 +473,223 @@ fn handle_key(
                 _ => {}
             }
         }
+    }
+}
+
+// ===== 鼠标处理 =====
+
+/// 滚轮/触控板单次滚动移动的行数（固定步进，跨终端一致，取代终端惯性放大导致的"飞行"）。
+const MOUSE_SCROLL_STEP: usize = 3;
+
+/// 切换某路径在统一标记集中的标记态（remove-else-insert 的单一真源）。
+/// 取 `&mut HashSet` 而非 `&mut App`：便于在 `&mut app.state` 借用块内（键盘 analyzer 处理）
+/// 对 disjoint 字段 `app.marked` 调用而不触发整体借用冲突。
+fn toggle_marked(marked: &mut HashSet<PathBuf>, path: PathBuf) {
+    if !marked.remove(&path) {
+        marked.insert(path);
+    }
+}
+
+/// 处理鼠标事件：滚轮步进 + 左键点击（定位光标 + 切换标记）。
+///
+/// `term_area` 为事件时的终端全区，用于重算与渲染同源的 list 布局做命中测试
+/// （渲染函数签名为 `&App` 不可变，改成 `&mut` 过度侵入，故按当前尺寸重跑纯布局函数）。
+fn handle_mouse(app: &mut App, mouse: MouseEvent, term_area: Rect) {
+    // Cleaning 态吞掉所有鼠标（对齐键盘"清理中不响应"守卫，避免中断删除）。
+    if matches!(app.state, AppState::Cleaning { .. }) {
+        return;
+    }
+    // 删除确认覆盖层：仅滚轮调 confirm_scroll，点击忽略（type-to-confirm 保持键盘）。
+    if app.confirm_delete.is_some() {
+        let cap = app
+            .confirm_delete
+            .as_ref()
+            .map_or(0, Vec::len)
+            .saturating_mul(CONFIRM_ROWS_PER_ITEM);
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                app.confirm_scroll = (app.confirm_scroll + MOUSE_SCROLL_STEP).min(cap);
+            }
+            MouseEventKind::ScrollUp => {
+                app.confirm_scroll = app.confirm_scroll.saturating_sub(MOUSE_SCROLL_STEP);
+            }
+            _ => {}
+        }
+        return;
+    }
+    // 帮助/过滤覆盖层：忽略鼠标，保持键盘语义。
+    if app.show_help || app.filter_active {
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollDown => mouse_scroll(app, true),
+        MouseEventKind::ScrollUp => mouse_scroll(app, false),
+        MouseEventKind::Down(MouseButton::Left) => {
+            mouse_click(app, term_area, mouse.column, mouse.row);
+        }
+        _ => {}
+    }
+}
+
+/// 对显示序/存储序光标做步进 clamp；返回是否有变化（供 Live 置 `user_navigated`）。
+fn scroll_cursor(cursor: &mut usize, len: usize, down: bool) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let new = if down {
+        (*cursor + MOUSE_SCROLL_STEP).min(len - 1)
+    } else {
+        cursor.saturating_sub(MOUSE_SCROLL_STEP)
+    };
+    let changed = new != *cursor;
+    *cursor = new;
+    changed
+}
+
+/// 滚轮移动光标（按当前状态）。语义与键盘方向键一致（含 clamp / 分隔行跳过）。
+fn mouse_scroll(app: &mut App, down: bool) {
+    // Results/Scanning 复用既有翻页方法（含分隔行跳过 + clamp，且每次只 build 一次 flat_rows，
+    // 避免逐行 move ×N 重复重建）——需整体 `&mut app`，故先用 matches! 判定（不持借用）再处理，
+    // 避免与下方 `&mut app.state` 借用冲突。
+    if matches!(app.state, AppState::Results | AppState::Scanning { .. }) {
+        if down {
+            app.move_cursor_page_down(MOUSE_SCROLL_STEP);
+        } else {
+            app.move_cursor_page_up(MOUSE_SCROLL_STEP);
+        }
+        return;
+    }
+    match &mut app.state {
+        AppState::Analyzing {
+            tree_root,
+            nav_path,
+            cursor,
+            ..
+        } => {
+            let len = resolve_nav_node(tree_root, nav_path).children.len();
+            scroll_cursor(cursor, len, down);
+        }
+        AppState::AnalyzingLive {
+            tree_root,
+            nav_path,
+            cursor,
+            user_navigated,
+            ..
+        } => {
+            let len = resolve_nav_node(tree_root, nav_path).children.len();
+            if scroll_cursor(cursor, len, down) {
+                *user_navigated = true;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 命中测试：全局 (col,row) → 列表数据的显示序索引。边框/区域外/超出数据 → None。
+/// `cursor`/`total` 用于复算与渲染**同源**的 `window_start`（`chrome::window_start`），
+/// 保证"点击落在第几行"与"实际画在第几行"一致。
+fn hit_row(list_area: Rect, col: u16, row: u16, cursor: usize, total: usize) -> Option<usize> {
+    if total == 0 {
+        return None;
+    }
+    // 水平：落在列表区域外忽略（不细分列，整行选中）。
+    if col < list_area.x || col >= list_area.x.saturating_add(list_area.width) {
+        return None;
+    }
+    // 垂直：排除上下边框（各 1 行）。
+    let top = list_area.y;
+    let bottom = list_area.y.saturating_add(list_area.height.saturating_sub(1));
+    if row <= top || row >= bottom {
+        return None;
+    }
+    let visible_height = crate::ui::chrome::list_visible_height(list_area);
+    if visible_height == 0 {
+        return None;
+    }
+    let cursor = cursor.min(total - 1);
+    let window_start = crate::ui::chrome::window_start(cursor, visible_height);
+    let visible_row = (row - top - 1) as usize;
+    let idx = window_start + visible_row;
+    // 点击落在最后一项之后的空白区（idx>=total）视为 no-op。
+    if idx < total {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
+/// 左键点击：命中测试定位到项 → 移动光标 + 切换标记（分隔行/区域外 no-op）。
+fn mouse_click(app: &mut App, term_area: Rect, col: u16, row: u16) {
+    let [_, body, _] = crate::ui::chrome::three_row_layout(term_area);
+
+    // Results/Scanning：走 flat_rows + toggle_selection（需整体 &mut app，用 matches! 判分支）。
+    if matches!(app.state, AppState::Results | AppState::Scanning { .. }) {
+        // Results 的 body 再分列表+详情；Scanning 用整块 body 作列表（无详情面板）。
+        let list_area = if matches!(app.state, AppState::Results) {
+            crate::ui::results::split_body(body).0
+        } else {
+            body
+        };
+        let flat_rows = app.build_flat_rows();
+        if let Some(idx) = hit_row(list_area, col, row, app.result_cursor, flat_rows.len()) {
+            if let Some(fr) = flat_rows.get(idx) {
+                if matches!(fr, FlatRow::Separator { .. }) {
+                    return; // 分隔行不可选
+                }
+                let fr = fr.clone();
+                app.result_cursor = idx;
+                app.toggle_selection(&fr);
+            }
+        }
+        return;
+    }
+
+    // Analyzer/Live：命中后先 clone path（结束对 tree_root 的借用）再改 marked。
+    let clicked_path: Option<PathBuf> = match &mut app.state {
+        AppState::Analyzing {
+            tree_root,
+            nav_path,
+            cursor,
+            ..
+        } => {
+            let node = resolve_nav_node(tree_root, nav_path);
+            let total = node.children.len();
+            if let Some(idx) = hit_row(body, col, row, *cursor, total) {
+                node.children.get(idx).map(|c| {
+                    let p = c.path.clone();
+                    *cursor = idx;
+                    p
+                })
+            } else {
+                None
+            }
+        }
+        AppState::AnalyzingLive {
+            tree_root,
+            nav_path,
+            cursor,
+            user_navigated,
+            ..
+        } => {
+            let node = resolve_nav_node(tree_root, nav_path);
+            let total = node.children.len();
+            if let Some(idx) = hit_row(body, col, row, *cursor, total) {
+                // idx 是显示序，经 size_desc_order 映回存储索引再取 path（与键盘标记同源）。
+                let path = crate::ui::analyzer::path_at_display_index(&node.children, idx);
+                if path.is_some() {
+                    *cursor = idx;
+                    *user_navigated = true;
+                }
+                path
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(p) = clicked_path {
+        toggle_marked(&mut app.marked, p);
     }
 }
 
@@ -1374,9 +1624,7 @@ fn handle_analyzer_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
             KeyCode::Char(' ' | 'd') => {
                 let path = current_node.children.get(*cursor).map(|c| c.path.clone());
                 if let Some(p) = path {
-                    if !app.marked.remove(&p) {
-                        app.marked.insert(p);
-                    }
+                    toggle_marked(&mut app.marked, p);
                 }
             }
             KeyCode::Char('x') => {
@@ -1503,18 +1751,12 @@ fn handle_analyzer_live_key(
                     *cursor = cursor_stack.pop().unwrap_or(0);
                 }
             }
-            // 标记（Space/d）：cursor 是显示序，经 size_desc_order 映回存储索引再取 path；
-            // 一律 .get()，把流式重排的 TOCTOU 降为 no-op（KTD2）。不移光标、不改 user_navigated。
+            // 标记（Space/d）：cursor 是显示序，经 path_at_display_index 置换映回存储索引取 path
+            // （一律 .get()，把流式重排的 TOCTOU 降为 no-op，KTD2）。不移光标、不改 user_navigated。
             KeyCode::Char(' ' | 'd') => {
-                let order = crate::ui::analyzer::size_desc_order(&current_node.children);
-                let path = order
-                    .get(*cursor)
-                    .and_then(|&i| current_node.children.get(i))
-                    .map(|c| c.path.clone());
+                let path = crate::ui::analyzer::path_at_display_index(&current_node.children, *cursor);
                 if let Some(p) = path {
-                    if !app.marked.remove(&p) {
-                        app.marked.insert(p);
-                    }
+                    toggle_marked(&mut app.marked, p);
                 }
             }
             // 删除（x）：与 Analyzing 同款按路径回查规则证据（Risky 触发 type-to-confirm）；
@@ -2138,5 +2380,86 @@ mod tests {
         request_leave_to_menu(&mut app, &mut None, &mut None, &mut None);
         assert!(matches!(app.state, AppState::Menu));
         assert!(!app.pending_leave);
+    }
+
+    // ===== 鼠标：命中测试 / 滚动 / 视口起始行 =====
+
+    #[test]
+    fn window_start_matches_liststate_offset_zero() {
+        use crate::ui::chrome::window_start;
+        // 光标在第一屏：窗口从 0 开始
+        assert_eq!(window_start(0, 10), 0);
+        assert_eq!(window_start(9, 10), 0);
+        // 光标超出一屏：钉在窗口末行 → start = cursor+1-vh
+        assert_eq!(window_start(10, 10), 1);
+        assert_eq!(window_start(50, 10), 41);
+        // 可见高度 0：退化为 0，不 panic
+        assert_eq!(window_start(5, 0), 0);
+    }
+
+    #[test]
+    fn hit_row_maps_visible_rows_and_rejects_borders() {
+        use super::hit_row;
+        use ratatui::layout::Rect;
+        // y=3, height=12 → 上下边框各 1 行，可见内容行 = 10（全局行 4..=13）
+        let area = Rect::new(0, 3, 40, 12);
+        // 首个可见行 → idx 0
+        assert_eq!(hit_row(area, 5, 4, 0, 100), Some(0));
+        // 末个可见行 → idx 9
+        assert_eq!(hit_row(area, 5, 13, 0, 100), Some(9));
+        // 上边框 / 下边框 → None
+        assert_eq!(hit_row(area, 5, 3, 0, 100), None);
+        assert_eq!(hit_row(area, 5, 14, 0, 100), None);
+        // 水平越界（col == x+width）→ None
+        assert_eq!(hit_row(area, 40, 4, 0, 100), None);
+        // 空列表 → None
+        assert_eq!(hit_row(area, 5, 4, 0, 0), None);
+    }
+
+    #[test]
+    fn hit_row_accounts_for_scroll_offset() {
+        use super::hit_row;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 3, 40, 12); // 可见 10 行
+        // cursor=50 → window_start = 41；点首个可见行 → idx 41
+        assert_eq!(hit_row(area, 5, 4, 50, 100), Some(41));
+        // cursor=50 点末个可见行 → idx 50
+        assert_eq!(hit_row(area, 5, 13, 50, 100), Some(50));
+    }
+
+    #[test]
+    fn hit_row_click_below_last_item_is_none() {
+        use super::hit_row;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 3, 40, 12); // 可见 10 行
+        // 仅 5 项，点第 8 个可见行（visible_row=7 → idx 7 ≥ total）→ None
+        assert_eq!(hit_row(area, 5, 11, 0, 5), None);
+        // 点第 5 个可见行（idx 4，最后一项）→ Some(4)
+        assert_eq!(hit_row(area, 5, 8, 0, 5), Some(4));
+    }
+
+    #[test]
+    fn scroll_cursor_steps_and_clamps() {
+        use super::scroll_cursor;
+        // 向下步进 3，不越界
+        let mut c = 0;
+        assert!(scroll_cursor(&mut c, 100, true));
+        assert_eq!(c, 3);
+        // 接近末尾时 clamp 到 len-1
+        let mut c = 98;
+        assert!(scroll_cursor(&mut c, 100, true));
+        assert_eq!(c, 99);
+        // 向上 saturating 到 0
+        let mut c = 1;
+        assert!(scroll_cursor(&mut c, 100, false));
+        assert_eq!(c, 0);
+        // 已在 0 上滚：无变化
+        let mut c = 0;
+        assert!(!scroll_cursor(&mut c, 100, false));
+        assert_eq!(c, 0);
+        // 空列表：无变化、不 panic
+        let mut c = 0;
+        assert!(!scroll_cursor(&mut c, 0, true));
+        assert_eq!(c, 0);
     }
 }

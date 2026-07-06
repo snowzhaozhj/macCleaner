@@ -73,6 +73,29 @@ pub fn render_footer(f: &mut Frame, area: Rect, hint: &str) {
     f.render_widget(para, area);
 }
 
+/// 列表可见内容高度：扣除 Block 上下边框各 1 行。
+/// 与 `window_start` 同源——渲染与鼠标命中测试都用它，避免"边框行数"魔法值散落漂移。
+#[must_use]
+pub fn list_visible_height(area: Rect) -> usize {
+    (area.height as usize).saturating_sub(2)
+}
+
+/// 列表视口起始行：复刻 ratatui `ListState(offset=0)` 的滚动行为——
+/// 光标在第一屏时窗口从 0 开始，超出一屏时把光标钉在窗口末行。
+///
+/// 单一真源：`rows.rs` 与 `analyzer.rs` 的渲染、以及鼠标命中测试都调用它，
+/// 保证"点击落到第几行"与"实际画在第几行"永远一致（否则二者公式漂移即错位）。
+#[must_use]
+pub fn window_start(cursor: usize, visible_height: usize) -> usize {
+    if visible_height == 0 {
+        0
+    } else if cursor >= visible_height {
+        cursor + 1 - visible_height
+    } else {
+        0
+    }
+}
+
 /// 三段布局：[header(Length 3), body(Min), footer(Length 1)]，供各页复用。
 #[must_use]
 pub fn three_row_layout(area: Rect) -> [Rect; 3] {

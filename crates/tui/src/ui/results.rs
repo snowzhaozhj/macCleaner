@@ -79,7 +79,8 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 /// 把 body 区细分为 (列表, 详情面板)。列表可用高度不足时折叠详情面板（返回 None）。
-fn split_body(body: Rect) -> (Rect, Option<Rect>) {
+/// `pub(crate)`：鼠标命中测试需在事件时复算同一 list 区域（与渲染同源）。
+pub(crate) fn split_body(body: Rect) -> (Rect, Option<Rect>) {
     if body.height <= DETAIL_HEIGHT + 3 {
         return (body, None);
     }

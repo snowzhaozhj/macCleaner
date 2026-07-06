@@ -24,6 +24,15 @@ pub(crate) fn size_desc_order(children: &[DirNode]) -> Vec<usize> {
     order
 }
 
+/// 显示序索引 → 底层 child 路径（经 `size_desc_order` 置换 + `.get()` 兜底）。
+/// `AnalyzingLive` 的键盘标记与鼠标点击共用，避免置换取值路径写两遍、演进时漏改一处。
+pub(crate) fn path_at_display_index(children: &[DirNode], display_idx: usize) -> Option<PathBuf> {
+    size_desc_order(children)
+        .get(display_idx)
+        .and_then(|&stored| children.get(stored))
+        .map(|c| c.path.clone())
+}
+
 pub(crate) fn resolve_node<'a>(root: &'a DirNode, nav_path: &[usize]) -> &'a DirNode {
     let mut node = root;
     for &idx in nav_path {
@@ -80,8 +89,8 @@ fn render_children_list(
     // 固定列预算：导航符 2 + 复选框 4 + 名称 24 + 大小 11 + 百分比 5 + 边距 ≈ 54。
     let bar_width = (area.width as usize).saturating_sub(54).max(10);
 
-    // Block 边框占 2 行（上下各 1）
-    let visible_height = (area.height as usize).saturating_sub(2);
+    // Block 边框占 2 行（上下各 1）——走 chrome 单一真源，与命中测试同源
+    let visible_height = chrome::list_visible_height(area);
     if visible_height == 0 {
         return;
     }
@@ -97,13 +106,8 @@ fn render_children_list(
         (0..total).collect()
     };
 
-    // 复刻 ratatui ListState(offset=0) 的滚动行为：
-    // cursor 在第一屏时 window_start=0，超出时 cursor 置于窗口末行
-    let window_start = if cursor >= visible_height {
-        cursor + 1 - visible_height
-    } else {
-        0
-    };
+    // 视口起始行走 chrome::window_start 单一真源，与鼠标命中测试同源（避免公式漂移）。
+    let window_start = chrome::window_start(cursor, visible_height);
     let window_end = (window_start + visible_height).min(total);
 
     // 仅为可见区间构建 ListItem（经 order 映射到底层 children）
