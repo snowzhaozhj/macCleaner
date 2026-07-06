@@ -1,7 +1,8 @@
 //! 分析器（Analyzing / AnalyzingLive）子系统：删除后剪树+导航校正、及两态键盘处理。
 //!
 //! 剪树/导航校正为纯 `DirNode` 逻辑；键盘处理触碰 `App`/`AppState`。共享符号
-//! `resolve_nav_node` / `toggle_marked` / `PAGE_STEP` / `cancel_analyze_to_menu` 保留在 crate 根。
+//! `resolve_nav_node` / `toggle_marked` / `PAGE_STEP` 保留在 crate 根，
+//! `cancel_analyze_to_menu` 来自 `crate::progress`。
 
 use std::collections::HashSet;
 use std::path::PathBuf;

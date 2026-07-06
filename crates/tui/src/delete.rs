@@ -1,7 +1,7 @@
 //! 删除执行子系统：确认接受 → 后台废纸篓线程 → 启动清理（Results / 分析器两条发起路径）。
 //!
-//! `CONFIRM_TOKEN`（type-to-confirm 令牌）与删除线程收敛于此；`transition_to_sorting`
-//! 保留在 crate 根（live 删除先收尾建树再删）。
+//! `CONFIRM_TOKEN`（type-to-confirm 令牌）与删除线程收敛于此；live 删除先收尾建树再删，
+//! 经 `crate::progress::transition_to_sorting` 过渡到 Sorting。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
