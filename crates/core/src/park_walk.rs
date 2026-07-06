@@ -185,7 +185,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Barrier, Mutex};
     use tempfile::tempdir;
 
     /// 参照实现：串行 jwalk 遍历，返回 (files, dirs, bytes)——作为逐字节对账基线。
@@ -361,22 +362,56 @@ mod tests {
 
     #[test]
     fn park_cancellation_stops_early() {
-        // 覆盖 R4：置取消后遍历及时停止，已发现项 < 全量且无 panic。
+        // 覆盖 R4：置取消后遍历及时停止，已发现项 < 全量、无 panic、无死锁。
+        //
+        // ## 为什么用 `threads=1` + `Barrier`（消除 CI 时序 flake）
+        // park_walk 的 worker→main entry 通道是 **unbounded**：main 每消费完一批才查
+        // `is_cancelled` 并置内部 `cancelled`，worker 每处理一个目录前才查一次 `cancelled`。
+        // 若树小 / CI 机快，worker 会在 main 置 `cancelled` **之前**就把全部 entry 灌进
+        // unbounded 通道 → main 全部消费 → `discovered == total`，`<` 断言失败（历史 flake：
+        // `discovered=883 应 < 全量 883`）。仅靠「把树造大」只是降低概率，并非确定性。
+        //
+        // 这里用 `threads=1` 让 on_read_dir 调用序确定为 root→t0→…，再用一个 `Barrier(2)`
+        // 建立唯一交汇点：
+        //   - worker 在**第 2 次** on_read_dir（读根下第一个子目录 t0 的内容时）撞 Barrier 挂起；
+        //   - main 消费完「根那一批」后，第一次 `is_cancelled` 也撞同一 Barrier；
+        //   - 两者同时释放 → `is_cancelled` 返回 true → park_walk 置 `cancelled`；
+        //   - worker 恢复、发完 t0 那批后回到取消检查点，观察到 `cancelled` → 跳过其余全部目录。
+        // 于是只会发现「根 + 根的直接子目录 + t0 的内容」，其余 t/m 子树全部跳过，
+        // `discovered < total` **确定成立**（不依赖调度速度）。改用单 worker 只为让交汇点唯一、
+        // 顺序可追、无死锁；R4 的「取消早停」性质不依赖 worker 数，故仍被如实验证。
         let tmp = tempdir().unwrap();
-        mktree(tmp.path(), 6, 6, 20); // 足够大
+        mktree(tmp.path(), 6, 6, 20); // total 远大于早停发现量（见断言）
         let full = jwalk_reference(tmp.path());
 
+        let barrier = Barrier::new(2);
+        let read_calls = AtomicUsize::new(0); // on_read_dir 调用序号（单 worker，无竞争）
+        let main_arrived = AtomicBool::new(false); // main 是否已交汇（仅交汇一次，防死锁）
         let seen = Mutex::new(0u64);
-        // 收到第一批后即取消：worker 应跳过后续目录，最终发现项远小于全量。
+
         park_walk(
             tmp.path(),
-            3,
-            |children| prefetch_sizes(children),
-            || *seen.lock().unwrap() > 0, // 一旦消费过任何 entry 即请求取消
+            1, // 单 worker：on_read_dir 调用序确定（root→t0→…），Barrier 交汇点唯一
+            |children| {
+                // 第 2 次调用（== 读 t0 内容）时挂起，等 main 置 cancelled 后再放行。
+                if read_calls.fetch_add(1, Ordering::Relaxed) == 1 {
+                    barrier.wait();
+                }
+                prefetch_sizes(children);
+            },
+            || {
+                // main 消费完根那一批后第一次进来：与 worker 在 Barrier 交汇后再请求取消。
+                // 仅交汇一次——worker 后续目录会被跳过、不再撞 Barrier，若这里重复 wait 会死锁。
+                if !main_arrived.swap(true, Ordering::Relaxed) {
+                    barrier.wait();
+                }
+                true
+            },
             |_e| {
                 *seen.lock().unwrap() += 1;
             },
         );
+
         let discovered = *seen.lock().unwrap();
         let total = full.0 + full.1;
         assert!(discovered > 0, "至少发现根 entry");
