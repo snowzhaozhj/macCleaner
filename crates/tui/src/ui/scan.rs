@@ -14,11 +14,17 @@ const SCAN_LIST_TITLE: &str = " 已发现 (扫描中...) ";
 pub fn draw(f: &mut Frame, app: &App) {
     // Analyze 模式不再经过 scan::draw()，直接由 mod.rs 分发到 analyzer::draw_live()。
     //
-    // 布局与 Analyze/Results 页统一——[header(3), 列表(Min), footer(1)]，扫描进度放在
-    // 顶部 header（与 Analyze 一致），扫描完成切到 Results 时 header/列表/footer 均不位移。
-    let [header_area, list_area, footer_area] = chrome::three_row_layout(f.area());
+    // 布局与 Analyze/Results 页统一——[header(3), body(Min), footer(1)]（body 再分 列表+详情，
+    // 见下），扫描进度放在顶部 header（与 Analyze 一致），扫描完成切到 Results 时各区均不位移。
+    let [header_area, body_area, footer_area] = chrome::three_row_layout(f.area());
 
     render_scan_header(f, app, header_area);
+
+    // 与 Results 同源切分 body → (列表, 详情)：扫描态即渲染详情面板，让每项的
+    // 路径/影响/恢复在扫描进行中就可见，而非等完成切 Results 才出现。current_detail()
+    // 与状态解耦；Scanning 列表按发现序稳定（不逐帧按体积重排），光标停项即安全显示其详情。
+    // 复用 results::split_body/render_detail 保证两页布局同源——扫描完成切 Results 时详情面板零位移。
+    let (list_area, detail_area) = crate::ui::results::split_body(body_area);
 
     let has_results = app
         .scan_result
@@ -28,6 +34,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         crate::ui::rows::render_flat_list(f, app, list_area, SCAN_LIST_TITLE);
     } else {
         render_scanning_placeholder(f, list_area);
+    }
+
+    if let Some(area) = detail_area {
+        crate::ui::results::render_detail(f, area, &app.current_detail());
     }
 
     chrome::render_footer(f, footer_area, &crate::keymap::footer_line(&app.state, footer_area.width as usize));
@@ -179,4 +189,59 @@ fn truncate_path(path: &str, max_len: usize) -> String {
     let keep = max_len - 3;
     let suffix: String = path.chars().skip(char_count - keep).collect();
     format!("...{suffix}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{AppState, FlatRow};
+    use mc_core::models::{CategoryGroup, SafetyLevel, ScanItem, ScanResult};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::path::PathBuf;
+
+    /// 回归：扫描态应即渲染详情面板（路径/影响/恢复），不必等切 Results 才可见。
+    #[test]
+    fn scanning_renders_detail_panel_for_cursor_item() {
+        let items = vec![ScanItem::new(
+            PathBuf::from("/x/nm"),
+            20,
+            SafetyLevel::Moderate,
+            "c".into(),
+        )
+        .with_evidence("依赖被清空".into(), "npm install".into())];
+        let cat = CategoryGroup::new("c".into(), items);
+        let mut app = App::new();
+        app.scan_result = Some(ScanResult::from_categories(vec![cat]));
+        app.expanded = vec![true];
+        app.state = AppState::Scanning {
+            progress_text: String::new(),
+            rule_current: 0,
+            rule_total: 0,
+            rule_name: String::new(),
+        };
+        // 光标落到 Item 行
+        let rows = app.build_flat_rows();
+        app.result_cursor = rows
+            .iter()
+            .position(|r| matches!(r, FlatRow::Item { .. }))
+            .expect("应有 Item 行");
+
+        let backend = TestBackend::new(90, 44);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        // 去空格归一：TestBackend 用空格填充 CJK 次单元。
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>()
+            .replace(' ', "");
+
+        assert!(text.contains("详情"), "扫描态应渲染详情面板标题");
+        assert!(text.contains("依赖被清空"), "扫描态详情应含光标项 impact");
+        assert!(text.contains("npminstall"), "扫描态详情应含光标项 recovery");
+    }
 }
