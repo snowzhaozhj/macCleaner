@@ -55,7 +55,12 @@
 
 <ul class="cats">
   {#each cats as cat (cat.name)}
-    <li class="cat" animate:flip={{ duration: 250 }}>
+    <!--
+      flip 仅用于「完成时一次体积降序 settle」。扫描期强制 duration:0——flip 以视口绝对坐标
+      测量，任何上方摘要区高度变化都会让它把列表整体滑动，故扫描期必须让它成为 no-op，
+      保证「恰好一次 settle」（async-UI review P1/P2）。
+    -->
+    <li class="cat" animate:flip={{ duration: scanning ? 0 : 250 }}>
       <button
         class="cat-head"
         class:interactive={!scanning}

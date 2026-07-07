@@ -117,18 +117,20 @@ describe("computeSegments", () => {
     expect(segs.reduce((s, x) => s + x.fraction, 0)).toBeCloseTo(1, 10);
   });
 
-  it("过滤 0 体积分类", () => {
+  it("保留 0 体积分类（图例行数稳定，防跳变），其 fraction=0", () => {
     const aggs = aggregateByCategory([mkItem("系统缓存", "/s", 100, true)], [
       "系统缓存",
       "浏览器缓存",
     ]);
     const segs = computeSegments(aggs);
-    expect(segs).toHaveLength(1);
-    expect(segs[0].name).toBe("系统缓存");
+    expect(segs.map((s) => s.name)).toEqual(["系统缓存", "浏览器缓存"]);
+    expect(segs.find((s) => s.name === "浏览器缓存")!.fraction).toBe(0);
   });
 
-  it("总量为 0 返回空数组（空态横条）", () => {
+  it("空分类列表返回空数组；全 0 体积时各段 fraction=0", () => {
     expect(computeSegments([])).toEqual([]);
+    const zero = aggregateByCategory([], ["系统缓存", "浏览器缓存"]);
+    expect(computeSegments(zero).every((s) => s.fraction === 0)).toBe(true);
   });
 });
 

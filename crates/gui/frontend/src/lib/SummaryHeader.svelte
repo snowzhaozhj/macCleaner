@@ -45,6 +45,7 @@
       <span class="bar-empty"></span>
     {:else}
       {#each segments as seg, i (seg.name)}
+        <!-- 0 占比段渲染为 0 宽（不可见）但保留在 DOM，条高恒定不跳变 -->
         <span
           class="seg"
           style="width: {seg.fraction * 100}%; background: {colorAt(i)}"
@@ -54,6 +55,7 @@
   </div>
 
   {#if segments.length > 0}
+    <!-- 图例渲染**全部**已知分类（含 0 值），行数稳定：扫描期首个命中不会新增图例行而推动列表 -->
     <ul class="legend">
       {#each segments as seg, i (seg.name)}
         <li>

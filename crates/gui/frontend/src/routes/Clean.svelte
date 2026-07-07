@@ -18,6 +18,7 @@
   } from "../lib/format";
   import { withViewTransition } from "../lib/transition";
   import { nextToast, dismissToast, type ToastState } from "../lib/toast";
+  import { KNOWN_CATEGORIES } from "../lib/categories";
   import Shell from "../lib/Shell.svelte";
   import SummaryHeader from "../lib/SummaryHeader.svelte";
   import StreamingList from "../lib/StreamingList.svelte";
@@ -25,12 +26,6 @@
   import UndoToast from "../lib/UndoToast.svelte";
   import ConfirmDelete from "../lib/ConfirmDelete.svelte";
   import type { ConfirmItem } from "../lib/ConfirmDelete.svelte";
-
-  /**
-   * clean_rules 的已知分类（预印占位行的顺序，防跳变基座 R2/KTD2）。
-   * 与 `crates/core/src/clean_rules.toml` 的 category 保持一致——新增品类时同步此处。
-   */
-  const KNOWN_CATEGORIES = ["系统缓存", "浏览器缓存"] as const;
 
   type Phase = "idle" | "scanning" | "results" | "cleaning" | "done";
 
@@ -72,6 +67,12 @@
 
   function flush() {
     rafId = 0;
+    // 只在扫描期消费缓冲：resolve 后 items 已被权威 ScanResult 重建、index 失效，
+    // 迟到的 Found 若再走 upsertFound 会按空 index 误建重复项/越界（correctness review P3）。
+    if (phase !== "scanning") {
+      buffer = [];
+      return;
+    }
     for (const f of buffer) upsertFound(items, index, f);
     buffer = [];
   }
@@ -125,6 +126,9 @@
           selected: it.selected,
         })),
       );
+      // items 已权威重建，流式索引/缓冲随之失效——清空避免迟到 Found 误用旧索引（P3）。
+      index.clear();
+      buffer = [];
     } else {
       flush();
     }
@@ -202,6 +206,9 @@
     void startScan();
     return () => {
       if (rafId) cancelAnimationFrame(rafId);
+      // 切走 tab 会销毁本组件——协作取消在途扫描，避免后台空扫 + 两次扫描并发写 last_scan
+      // 致其被旧结果覆盖、后续 clean 静默漏删（correctness review P2）。cancelScan 幂等，安全。
+      void cancelScan();
     };
   });
 </script>
@@ -212,7 +219,8 @@
       <CleanReceipt report={lastReport} onRestore={restoreInFinder} />
     {:else}
       <SummaryHeader {selectedSize} {segments} {scanning} />
-      {#if error}<p class="error" role="alert">出错：{error}</p>{/if}
+      <!-- 扫描期不在摘要区显示错误横幅：其高度变化会推动列表位移（防跳变）；错误在完成后呈现 -->
+      {#if error && !scanning}<p class="error" role="alert">出错：{error}</p>{/if}
     {/if}
   {/snippet}
 
@@ -224,7 +232,7 @@
         {scanning}
         onToggle={toggle}
       />
-      {#if phase === "results" && items.length === 0}
+      {#if phase === "results" && items.length === 0 && !error}
         <p class="empty">未发现可清理项——系统很干净。</p>
       {/if}
       {#if phase === "results" && skipped.length > 0}
