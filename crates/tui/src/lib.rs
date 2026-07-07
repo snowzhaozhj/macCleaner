@@ -9,7 +9,6 @@ mod progress;
 mod reporter;
 mod theme;
 mod throttle;
-mod tree_builder;
 mod ui;
 
 pub use delete::CONFIRM_TOKEN;
@@ -18,7 +17,6 @@ use std::collections::HashSet;
 
 use app::{App, AppState, FlatRow};
 use event::EventHandler;
-use tree_builder::IncrementalTreeBuilder;
 
 use anyhow::Result;
 use crossbeam_channel::Receiver;
@@ -31,6 +29,7 @@ use crossterm::terminal::{
 use crossterm::ExecutableCommand;
 use ratatui::layout::Rect;
 use mc_core::models::DirNode;
+use mc_core::IncrementalTreeBuilder;
 use mc_core::progress::{AnalyzeEvent, ProgressEvent};
 use std::io::{self, stdout, BufWriter};
 use std::path::PathBuf;

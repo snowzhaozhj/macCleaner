@@ -1,0 +1,73 @@
+/*
+ * 语义 token 层（唯一事实来源）——DESIGN.md §1/§2 的 OKLCH 暗色基准列全量。
+ * 命名 kebab：--safety-safe / --state-danger / --surface-base …
+ * 角色不变、值随后端变；改视觉改这里，不要在组件里散落硬编码颜色。
+ */
+:root {
+  /* 安全轴（招牌视觉语言，三通道之一：色） */
+  --safety-safe: oklch(0.7 0.1 150);
+  --safety-moderate: oklch(0.78 0.11 90);
+  --safety-risky: oklch(0.62 0.18 25);
+
+  /* 状态轴（反馈与操作语义）——与 safety 同色相家族但更亮更艳以区分 */
+  --state-success: oklch(0.76 0.15 150);
+  --state-activity: oklch(0.8 0.13 90);
+  --state-warning: oklch(0.82 0.14 75);
+  --state-danger: oklch(0.6 0.2 25);
+  --state-info: oklch(0.75 0.11 210);
+
+  /* 结构轴：中性前景层 */
+  --ink-primary: oklch(0.93 0.005 250); /* 正文，对比 ≥ 12:1 */
+  --ink-muted: oklch(0.68 0.01 250); /* 次要信息，对比 ≥ 4.5:1 */
+  --ink-faint: oklch(0.52 0.01 250); /* 占位/禁用 */
+
+  /* 交互强调 */
+  --accent: oklch(0.75 0.11 210); /* 边框/选中/焦点 */
+  --accent-explore: oklch(0.66 0.13 250); /* 分析器边框 + 体积条 */
+
+  /* 表面层级 */
+  --surface-base: oklch(0.18 0.008 250); /* 近黑、微冷 */
+  --surface-raised: oklch(0.22 0.01 250); /* 面板层 */
+  --surface-overlay: oklch(0.25 0.012 250); /* 模态浮层 */
+
+  --border-subtle: oklch(0.34 0.01 250);
+  --cursor: oklch(0.3 0.012 250);
+
+  /* 间距阶（4px 基准，DESIGN.md §5.3） */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+
+  /* 排版：数据列等宽（产品排版签名），UI 标签用系统无衬线 */
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  --font-ui: system-ui, -apple-system, "SF Pro", sans-serif;
+
+  --row-height: 28px;
+  --radius: 6px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--surface-base);
+  color: var(--ink-primary);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 减少动效降级（DESIGN.md §7）：过渡瞬切、spinner 停转 */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

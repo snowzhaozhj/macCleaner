@@ -17,7 +17,7 @@ use mc_core::progress::{AnalyzeEvent, ProgressEvent, ProgressReporter};
 use crate::app::{ActiveCommand, App, AppState};
 use crate::event::EventHandler;
 use crate::reporter::TuiReporter;
-use crate::tree_builder::IncrementalTreeBuilder;
+use mc_core::IncrementalTreeBuilder;
 
 /// 菜单页键盘处理
 pub(crate) fn handle_menu_key(

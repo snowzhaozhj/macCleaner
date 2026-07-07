@@ -16,7 +16,7 @@ use mc_core::progress::{AnalyzeEvent, ProgressEvent};
 
 use crate::analyzer_ops::restore_analyzer_after_delete;
 use crate::app::{self, ActiveCommand, App, AppState};
-use crate::tree_builder::IncrementalTreeBuilder;
+use mc_core::IncrementalTreeBuilder;
 
 // ===== 进度事件处理 =====
 

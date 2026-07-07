@@ -12,7 +12,7 @@
 //! 故正常情况下父必先在。但为兜底并发交付的任何乱序（以及未来后端变化），
 //! 额外用 `orphans` 缓存「父尚未到达」的 entry，父到达时回填——正确性不依赖到达顺序。
 
-use mc_core::models::DirNode;
+use crate::models::DirNode;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -24,7 +24,8 @@ struct PendingEntry {
     is_file: bool,
 }
 
-pub(crate) struct IncrementalTreeBuilder {
+#[derive(Default)]
+pub struct IncrementalTreeBuilder {
     /// `路径 → 从 root 到达该节点的 children 索引链`。root 映射到空链 `[]`。
     /// 仅记录**目录**节点（文件不会成为别人的父）。
     locator: HashMap<PathBuf, Vec<usize>>,
@@ -35,7 +36,7 @@ pub(crate) struct IncrementalTreeBuilder {
 }
 
 impl IncrementalTreeBuilder {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             locator: HashMap::new(),
             orphans: HashMap::new(),
@@ -45,7 +46,7 @@ impl IncrementalTreeBuilder {
 
     /// 将一个 entry 集成到 `tree_root`。交付顺序无关：父未到达则缓存为孤儿，父到达时回填。
     /// 返回 `Option` 仅为兼容旧签名；异常（无父路径）时静默跳过，不 panic。
-    pub(crate) fn integrate_entry(
+    pub fn integrate_entry(
         &mut self,
         tree_root: &mut DirNode,
         name: String,
@@ -119,7 +120,7 @@ impl IncrementalTreeBuilder {
     }
 
     /// 遍历完成后递归排序所有 children（按 size 降序）。
-    pub(crate) fn finalize(tree_root: &mut DirNode) {
+    pub fn finalize(tree_root: &mut DirNode) {
         fn sort_recursive(node: &mut DirNode) {
             node.children.sort_by_key(|c| std::cmp::Reverse(c.size));
             for child in &mut node.children {

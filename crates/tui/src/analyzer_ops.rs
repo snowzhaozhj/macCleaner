@@ -15,7 +15,7 @@ use mc_core::models::DirNode;
 use mc_core::progress::AnalyzeEvent;
 
 use crate::app::{self, App, AppState};
-use crate::tree_builder::IncrementalTreeBuilder;
+use mc_core::IncrementalTreeBuilder;
 use crate::progress::cancel_analyze_to_menu;
 use crate::{resolve_nav_node, toggle_marked, PAGE_STEP};
 

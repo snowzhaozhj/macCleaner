@@ -1,0 +1,5 @@
+# Tauri 生成物
+/gen/schemas
+# 前端构建产物与依赖
+/frontend/dist
+/frontend/node_modules

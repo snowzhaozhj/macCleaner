@@ -16,7 +16,7 @@ use mc_core::progress::{AnalyzeEvent, ProgressEvent, ProgressReporter};
 use crate::app::{self, App, AppState};
 use crate::event::EventHandler;
 use crate::reporter::TuiReporter;
-use crate::tree_builder::IncrementalTreeBuilder;
+use mc_core::IncrementalTreeBuilder;
 use crate::progress::transition_to_sorting;
 
 /// 后台删除线程：把 (路径, 大小) 清单移入废纸篓，完成后 send `CleaningDone`。
