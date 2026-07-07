@@ -140,6 +140,7 @@
     confirmItems = null;
     if (paths.length === 0) return;
     phase = "deleting";
+    error = null; // 清空上一轮分析期可能残留的错误横幅（R-review）
     deletingPath = "";
     let deleted: string[] = [];
     try {
@@ -160,8 +161,14 @@
       const set = new Set(deleted);
       pruneTree(tree, set);
       tree = { ...tree }; // 触发依赖 currentNode/trail 的重算
+      // 删除祖先目录会连带移除其整棵子树；marked 里被独立标记的**后代**路径也随之失效，
+      // 必须一并清出，否则残留陈旧标记（计数虚高、确认列表出现已不存在的路径，R-review codex-P2）。
       const nextMarked = new Map(marked);
-      for (const p of deleted) nextMarked.delete(p);
+      for (const key of [...nextMarked.keys()]) {
+        if (deleted.some((d) => key === d || key.startsWith(`${d}/`))) {
+          nextMarked.delete(key);
+        }
+      }
       marked = nextMarked;
     }
     phase = "ready";
@@ -213,6 +220,7 @@
               type="checkbox"
               checked={isMarked}
               onchange={() => toggleMark(node)}
+              aria-label={node.path}
             />
           </label>
           <button

@@ -60,12 +60,12 @@ pub async fn analyze(
     root: PathBuf,
     on_event: Channel<AnalyzeEvent>,
 ) -> Result<DirNode, String> {
+    // begin_operation 安装本次分析专属取消 flag（R-review：不再复位共享 flag）。
     let (cancelled, last_analyze) = {
         let state = app.state::<AppState>();
-        state.cancel.store(false, Ordering::Relaxed);
-        (state.cancel.clone(), state.last_analyze.clone())
+        (state.begin_operation(), state.last_analyze.clone())
     };
-    let tree = tauri::async_runtime::spawn_blocking(move || {
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
         let mut tree = DirNode::new_dir(root.clone(), dir_name(&root));
         let mut builder = IncrementalTreeBuilder::new();
         let mut file_count: u64 = 0;
@@ -85,12 +85,18 @@ pub async fn analyze(
                 }
             },
         );
+        // 取消后 analyze_walk 提前返回，树是**不完整**的——此时不 finalize、不发 Finished、
+        // 不存树，返回 None，避免前端把半截结果当完整分析继续删除（R-review codex-P1）。
+        if cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
         IncrementalTreeBuilder::finalize(&mut tree);
         let _ = on_event.send(AnalyzeEvent::Finished);
-        tree
+        Some(tree)
     })
     .await
     .map_err(|e| format!("分析线程异常: {e}"))?;
+    let tree = outcome.ok_or_else(|| "分析已取消".to_string())?;
     *last_analyze.lock().map_err(|_| "状态锁毒化".to_string())? = Some(tree.clone());
     Ok(tree)
 }
@@ -105,14 +111,17 @@ pub async fn delete_marked(
 ) -> Result<CleanReport, String> {
     let (cancelled, last_analyze) = {
         let state = app.state::<AppState>();
-        state.cancel.store(false, Ordering::Relaxed);
-        (state.cancel.clone(), state.last_analyze.clone())
+        (state.begin_operation(), state.last_analyze.clone())
     };
     let marked: HashSet<PathBuf> = paths.into_iter().collect();
     tauri::async_runtime::spawn_blocking(move || {
-        let guard = last_analyze.lock().map_err(|_| "状态锁毒化".to_string())?;
-        let tree = guard.as_ref().ok_or_else(|| "无分析结果可删除".to_string())?;
-        let items = marked_items(tree, &marked);
+        // 先在短临界区内收集 owned 待删项，随即 drop 锁——避免删除全程持锁，
+        // 一旦 Engine::clean panic 会毒化 last_analyze，永久使后续 analyze/删除失败（R-review）。
+        let items = {
+            let guard = last_analyze.lock().map_err(|_| "状态锁毒化".to_string())?;
+            let tree = guard.as_ref().ok_or_else(|| "无分析结果可删除".to_string())?;
+            marked_items(tree, &marked)
+        };
         let refs: Vec<&ScanItem> = items.iter().collect();
         let reporter = TauriReporter::new(on_event, cancelled);
         Engine::clean(&refs, DeleteMode::Trash, &reporter).map_err(|e| format!("删除失败: {e}"))

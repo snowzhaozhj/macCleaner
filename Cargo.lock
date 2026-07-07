@@ -2500,11 +2500,8 @@ dependencies = [
 name = "mc-gui"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "crossbeam-channel",
  "mc-core",
  "serde",
- "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",

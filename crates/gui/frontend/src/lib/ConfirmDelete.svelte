@@ -12,7 +12,8 @@
     onCancel,
   }: {
     items: ConfirmItem[];
-    onConfirm: () => void;
+    // 回传用户输入的确认口令（无 Risky 时为空串）；调用方转发给后端二次校验。
+    onConfirm: (token: string) => void;
     onCancel: () => void;
   } = $props();
 
@@ -25,7 +26,7 @@
 
   function handleDelete() {
     // 不绑定 Enter：必须点已启用按钮（DESIGN.md §6 / U8）。
-    if (canDelete) onConfirm();
+    if (canDelete) onConfirm(input);
   }
 </script>
 

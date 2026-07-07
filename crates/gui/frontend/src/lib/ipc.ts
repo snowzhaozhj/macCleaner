@@ -92,14 +92,19 @@ export function scanClean(onEvent: (e: ProgressEvent) => void): Promise<ScanResu
   return invoke<ScanResult>("scan_clean", { onEvent: channel });
 }
 
-/** 删除选中/确认路径（恒移废纸篓）。 */
+/**
+ * 删除选中/确认路径（恒移废纸篓）。
+ * `confirmToken`：含 Risky 项时须传用户输入的确认口令，后端会二次校验（防绕过 type-to-confirm）。
+ * 纯非 Risky 删除传空串即可。
+ */
 export function clean(
   paths: string[],
+  confirmToken: string,
   onEvent: (e: ProgressEvent) => void,
 ): Promise<CleanReport> {
   const channel = new Channel<ProgressEvent>();
   channel.onmessage = onEvent;
-  return invoke<CleanReport>("clean", { paths, onEvent: channel });
+  return invoke<CleanReport>("clean", { paths, confirmToken, onEvent: channel });
 }
 
 /** 协作式取消（scan_clean / clean / analyze 通用）。 */

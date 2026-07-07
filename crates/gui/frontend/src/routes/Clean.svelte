@@ -54,6 +54,10 @@
     skipped = [];
     error = null;
     currentPath = "";
+    // core 的 Found.size 是同一 (category, path) 的**增量 delta**（scanner.rs:736，
+    // 大目录会分多次 flush 重复上报同一基路径）；必须按 (category, path) 合并累加，
+    // 否则会产生重复行、Svelte 重复 key、选择碎片化（R-review，对齐 TUI 的合并语义）。
+    const indexByKey = new Map<string, number>();
     try {
       await scanClean((e) => {
         if (typeof e === "string") return; // "Complete"
@@ -61,16 +65,24 @@
           currentPath = e.Scanning.path;
         } else if ("Found" in e) {
           const f = e.Found;
-          // 默认预选：非 Risky 且 preselect（Risky 永不预选）
-          items.push({
-            path: f.path,
-            size: f.size,
-            safety: f.safety,
-            category: f.category,
-            impact: f.impact,
-            recovery: f.recovery,
-            selected: f.safety !== "Risky" && f.preselect,
-          });
+          const key = `${f.category}\u0000${f.path}`;
+          const idx = indexByKey.get(key);
+          if (idx !== undefined) {
+            // 已存在同一基路径：累加 delta（不改动已计算的预选/元数据）。
+            items[idx].size += f.size;
+          } else {
+            // 首次出现：建项。默认预选：非 Risky 且 preselect（Risky 永不预选）。
+            indexByKey.set(key, items.length);
+            items.push({
+              path: f.path,
+              size: f.size,
+              safety: f.safety,
+              category: f.category,
+              impact: f.impact,
+              recovery: f.recovery,
+              selected: f.safety !== "Risky" && f.preselect,
+            });
+          }
         } else if ("SkippedNoPermission" in e) {
           skipped.push(e.SkippedNoPermission.path);
         } else if ("Error" in e) {
@@ -106,16 +118,17 @@
     }));
   }
 
-  async function runClean() {
+  async function runClean(token: string) {
     const paths = (confirmItems ?? []).map((i) => i.path);
     confirmItems = null;
     if (paths.length === 0) return;
     phase = "cleaning";
+    error = null; // 清空上一轮扫描期可能残留的错误横幅（R-review）
     freed = 0;
     cleanedCount = 0;
     cleaningPath = "";
     try {
-      await clean(paths, (e) => {
+      await clean(paths, token, (e) => {
         if (typeof e === "string") return;
         if ("CleaningFile" in e) {
           cleaningPath = e.CleaningFile.path;
@@ -176,6 +189,7 @@
                     type="checkbox"
                     checked={item.selected}
                     onchange={() => toggle(item)}
+                    aria-label={item.path}
                   />
                 </label>
                 <Safety safety={item.safety} />
@@ -187,6 +201,10 @@
         </section>
       {/each}
     </div>
+  {/if}
+
+  {#if phase === "results" && groups.length === 0}
+    <p class="empty">未发现可清理项——系统很干净。</p>
   {/if}
 
   {#if phase === "results"}
@@ -260,6 +278,11 @@
     flex-direction: column;
     gap: var(--sp-4);
     align-items: center;
+    color: var(--ink-muted);
+  }
+  .empty {
+    padding: var(--sp-6) 0;
+    text-align: center;
     color: var(--ink-muted);
   }
   .freed {
