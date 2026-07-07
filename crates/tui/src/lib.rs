@@ -1,47 +1,47 @@
+mod analyzer_ops;
 mod app;
+mod command;
+mod delete;
 mod event;
 mod keymap;
+mod mouse;
+mod progress;
 mod reporter;
 mod theme;
 mod throttle;
 mod ui;
 
+pub use delete::CONFIRM_TOKEN;
+
 use std::collections::HashSet;
 
-use app::{ActiveCommand, App, AppState, FlatRow};
+use app::{App, AppState, FlatRow};
 use event::EventHandler;
-use mc_core::IncrementalTreeBuilder;
-use reporter::TuiReporter;
 
 use anyhow::Result;
 use crossbeam_channel::Receiver;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyCode, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture, KeyCode, KeyModifiers, MouseEvent,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
 use ratatui::layout::Rect;
-use humansize::{format_size, DECIMAL};
-use mc_core::engine::Engine;
-use mc_core::models::{DeleteMode, DirNode};
-use mc_core::platform;
-use mc_core::progress::{AnalyzeEvent, ProgressEvent, ProgressReporter};
+use mc_core::models::DirNode;
+use mc_core::IncrementalTreeBuilder;
+use mc_core::progress::{AnalyzeEvent, ProgressEvent};
 use std::io::{self, stdout, BufWriter};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 /// 翻页/Ctrl+d/Ctrl+u 一次移动的行数
-const PAGE_STEP: usize = 10;
+pub(crate) const PAGE_STEP: usize = 10;
 
 /// 确认清单每项估算渲染行数——滚动上界 = 项数 × 此值（粗 clamp，防按住/滚过头后空滚）。
 /// 键盘与鼠标 confirm 滚动共用此常量，避免两处魔法值漂移（每 Risky 项 ≤4 视觉行、每分类 ≤5 行）。
-const CONFIRM_ROWS_PER_ITEM: usize = 5;
+pub(crate) const CONFIRM_ROWS_PER_ITEM: usize = 5;
 
 // ===== 导航辅助函数 =====
 
@@ -186,11 +186,11 @@ fn run_app(
                 }
                 SelectResult::Mouse(m) => {
                     let size = terminal.size()?;
-                    handle_mouse(&mut app, m, Rect::new(0, 0, size.width, size.height));
+                    mouse::handle_mouse(&mut app, m, Rect::new(0, 0, size.width, size.height));
                     terminal.draw(|f| ui::draw(f, &app))?;
                 }
                 SelectResult::Progress(evt) => {
-                    handle_progress(&mut app, evt);
+                    progress::handle_progress(&mut app, evt);
                     if throttle.as_ref().is_none_or(throttle::Throttle::can_update) {
                         app.tick = app.tick.wrapping_add(1);
                         terminal.draw(|f| ui::draw(f, &app))?;
@@ -198,7 +198,7 @@ fn run_app(
                 }
                 SelectResult::Analyze(evt) => match evt {
                     AnalyzeEvent::Finished => {
-                        handle_analyze_finished(
+                        progress::handle_analyze_finished(
                             &mut app,
                             &mut tree_builder,
                             &mut analyze_rx,
@@ -208,7 +208,7 @@ fn run_app(
                     }
                     other => {
                         if let Some(ref mut builder) = tree_builder {
-                            handle_analyze_entry(&mut app, other, builder);
+                            progress::handle_analyze_entry(&mut app, other, builder);
                         }
                         if throttle.as_ref().is_none_or(throttle::Throttle::can_update) {
                             app.tick = app.tick.wrapping_add(1);
@@ -234,7 +234,7 @@ fn run_app(
                             // 树已稳定，此刻在稳定的 Analyzing 态上执行删除，走既有剪枝恢复路径。
                             if !app.pending_analyzer_delete.is_empty() {
                                 let items = std::mem::take(&mut app.pending_analyzer_delete);
-                                start_cleaning_from_analyzer(&mut app, items, &events);
+                                delete::start_cleaning_from_analyzer(&mut app, items, &events);
                             }
                         }
                     } else {
@@ -268,12 +268,12 @@ fn run_app(
                 recv(events.mouse_rx) -> m => {
                     if let Ok(m) = m {
                         let size = terminal.size()?;
-                        handle_mouse(&mut app, m, Rect::new(0, 0, size.width, size.height));
+                        mouse::handle_mouse(&mut app, m, Rect::new(0, 0, size.width, size.height));
                     }
                 }
                 recv(events.progress_rx) -> evt => {
                     if let Ok(evt) = evt {
-                        handle_progress(&mut app, evt);
+                        progress::handle_progress(&mut app, evt);
                     }
                 }
             }
@@ -354,7 +354,7 @@ fn handle_key(
                 KeyCode::Char(c) => {
                     app.confirm_input.push(c);
                     if app.confirm_input.eq_ignore_ascii_case(CONFIRM_TOKEN) {
-                        confirm_accept(app, events, analyze_rx, tree_builder, sort_rx);
+                        delete::confirm_accept(app, events, analyze_rx, tree_builder, sort_rx);
                     }
                 }
                 _ => {}
@@ -362,7 +362,7 @@ fn handle_key(
         } else {
             match key {
                 KeyCode::Enter | KeyCode::Char('y') => {
-                    confirm_accept(app, events, analyze_rx, tree_builder, sort_rx);
+                    delete::confirm_accept(app, events, analyze_rx, tree_builder, sort_rx);
                 }
                 KeyCode::Esc | KeyCode::Char('n') => {
                     app.confirm_delete = None;
@@ -399,12 +399,12 @@ fn handle_key(
         if matches!(app.state, AppState::Menu) {
             app.should_quit = true;
         } else {
-            request_leave_to_menu(app, analyze_rx, tree_builder, sort_rx);
+            progress::request_leave_to_menu(app, analyze_rx, tree_builder, sort_rx);
         }
         return;
     }
     match &app.state {
-        AppState::Menu => handle_menu_key(app, key, events, analyze_rx, tree_builder),
+        AppState::Menu => command::handle_menu_key(app, key, events, analyze_rx, tree_builder),
         AppState::Scanning { .. } => {
             // 扫描态现在是可操作工作区：标记按路径（Scanning 列表为稳定插入序，安全），
             // preselect 已随 Found 增量播种；删除提交时先收尾扫描再清理（KTD1）。
@@ -413,7 +413,7 @@ fn handle_key(
                 KeyCode::Esc | KeyCode::Backspace => {
                     // 与 q 走同一条返回菜单路径（取消扫描 + back_to_menu 彻底清态），
                     // 不再内联重复实现，避免两处清理逻辑漂移。
-                    request_leave_to_menu(app, analyze_rx, tree_builder, sort_rx);
+                    progress::request_leave_to_menu(app, analyze_rx, tree_builder, sort_rx);
                 }
                 KeyCode::Up | KeyCode::Char('k') => app.move_cursor_up(),
                 KeyCode::Down | KeyCode::Char('j') => app.move_cursor_down(),
@@ -460,14 +460,14 @@ fn handle_key(
             // 清理中不响应按键
         }
         AppState::Done { .. } => handle_done_key(app, key),
-        AppState::Analyzing { .. } => handle_analyzer_key(app, key, modifiers),
+        AppState::Analyzing { .. } => analyzer_ops::handle_analyzer_key(app, key, modifiers),
         AppState::AnalyzingLive { .. } => {
-            handle_analyzer_live_key(app, key, modifiers, analyze_rx, tree_builder, sort_rx);
+            analyzer_ops::handle_analyzer_live_key(app, key, modifiers, analyze_rx, tree_builder, sort_rx);
         }
         AppState::Sorting => {
             match key {
                 KeyCode::Esc | KeyCode::Backspace => {
-                    request_leave_to_menu(app, analyze_rx, tree_builder, sort_rx);
+                    progress::request_leave_to_menu(app, analyze_rx, tree_builder, sort_rx);
                 }
                 _ => {}
             }
@@ -475,741 +475,14 @@ fn handle_key(
     }
 }
 
-// ===== 鼠标处理 =====
-
-/// 滚轮/触控板单次滚动移动的行数（固定步进，跨终端一致，取代终端惯性放大导致的"飞行"）。
-const MOUSE_SCROLL_STEP: usize = 3;
+// ===== 标记辅助（鼠标与键盘共用） =====
 
 /// 切换某路径在统一标记集中的标记态（remove-else-insert 的单一真源）。
 /// 取 `&mut HashSet` 而非 `&mut App`：便于在 `&mut app.state` 借用块内（键盘 analyzer 处理）
 /// 对 disjoint 字段 `app.marked` 调用而不触发整体借用冲突。
-fn toggle_marked(marked: &mut HashSet<PathBuf>, path: PathBuf) {
+pub(crate) fn toggle_marked(marked: &mut HashSet<PathBuf>, path: PathBuf) {
     if !marked.remove(&path) {
         marked.insert(path);
-    }
-}
-
-/// 处理鼠标事件：滚轮步进 + 左键点击（定位光标 + 切换标记）。
-///
-/// `term_area` 为事件时的终端全区，用于重算与渲染同源的 list 布局做命中测试
-/// （渲染函数签名为 `&App` 不可变，改成 `&mut` 过度侵入，故按当前尺寸重跑纯布局函数）。
-fn handle_mouse(app: &mut App, mouse: MouseEvent, term_area: Rect) {
-    // Cleaning 态吞掉所有鼠标（对齐键盘"清理中不响应"守卫，避免中断删除）。
-    if matches!(app.state, AppState::Cleaning { .. }) {
-        return;
-    }
-    // 删除确认覆盖层：仅滚轮调 confirm_scroll，点击忽略（type-to-confirm 保持键盘）。
-    if app.confirm_delete.is_some() {
-        let cap = app
-            .confirm_delete
-            .as_ref()
-            .map_or(0, Vec::len)
-            .saturating_mul(CONFIRM_ROWS_PER_ITEM);
-        match mouse.kind {
-            MouseEventKind::ScrollDown => {
-                app.confirm_scroll = (app.confirm_scroll + MOUSE_SCROLL_STEP).min(cap);
-            }
-            MouseEventKind::ScrollUp => {
-                app.confirm_scroll = app.confirm_scroll.saturating_sub(MOUSE_SCROLL_STEP);
-            }
-            _ => {}
-        }
-        return;
-    }
-    // 帮助/过滤覆盖层：忽略鼠标，保持键盘语义。
-    if app.show_help || app.filter_active {
-        return;
-    }
-
-    match mouse.kind {
-        MouseEventKind::ScrollDown => mouse_scroll(app, true),
-        MouseEventKind::ScrollUp => mouse_scroll(app, false),
-        MouseEventKind::Down(MouseButton::Left) => {
-            mouse_click(app, term_area, mouse.column, mouse.row);
-        }
-        _ => {}
-    }
-}
-
-/// 对显示序/存储序光标做步进 clamp；返回是否有变化（供 Live 置 `user_navigated`）。
-fn scroll_cursor(cursor: &mut usize, len: usize, down: bool) -> bool {
-    if len == 0 {
-        return false;
-    }
-    let new = if down {
-        (*cursor + MOUSE_SCROLL_STEP).min(len - 1)
-    } else {
-        cursor.saturating_sub(MOUSE_SCROLL_STEP)
-    };
-    let changed = new != *cursor;
-    *cursor = new;
-    changed
-}
-
-/// 滚轮移动光标（按当前状态）。语义与键盘方向键一致（含 clamp / 分隔行跳过）。
-fn mouse_scroll(app: &mut App, down: bool) {
-    // Results/Scanning 复用既有翻页方法（含分隔行跳过 + clamp，且每次只 build 一次 flat_rows，
-    // 避免逐行 move ×N 重复重建）——需整体 `&mut app`，故先用 matches! 判定（不持借用）再处理，
-    // 避免与下方 `&mut app.state` 借用冲突。
-    if matches!(app.state, AppState::Results | AppState::Scanning { .. }) {
-        if down {
-            app.move_cursor_page_down(MOUSE_SCROLL_STEP);
-        } else {
-            app.move_cursor_page_up(MOUSE_SCROLL_STEP);
-        }
-        return;
-    }
-    match &mut app.state {
-        AppState::Analyzing {
-            tree_root,
-            nav_path,
-            cursor,
-            ..
-        } => {
-            let len = resolve_nav_node(tree_root, nav_path).children.len();
-            scroll_cursor(cursor, len, down);
-        }
-        AppState::AnalyzingLive {
-            tree_root,
-            nav_path,
-            cursor,
-            user_navigated,
-            ..
-        } => {
-            let len = resolve_nav_node(tree_root, nav_path).children.len();
-            if scroll_cursor(cursor, len, down) {
-                *user_navigated = true;
-            }
-        }
-        _ => {}
-    }
-}
-
-/// 命中测试：全局 (col,row) → 列表数据的显示序索引。边框/区域外/超出数据 → None。
-/// `cursor`/`total` 用于复算与渲染**同源**的 `window_start`（`chrome::window_start`），
-/// 保证"点击落在第几行"与"实际画在第几行"一致。
-fn hit_row(list_area: Rect, col: u16, row: u16, cursor: usize, total: usize) -> Option<usize> {
-    if total == 0 {
-        return None;
-    }
-    // 水平：落在列表区域外忽略（不细分列，整行选中）。
-    if col < list_area.x || col >= list_area.x.saturating_add(list_area.width) {
-        return None;
-    }
-    // 垂直：排除上下边框（各 1 行）。
-    let top = list_area.y;
-    let bottom = list_area.y.saturating_add(list_area.height.saturating_sub(1));
-    if row <= top || row >= bottom {
-        return None;
-    }
-    let visible_height = crate::ui::chrome::list_visible_height(list_area);
-    if visible_height == 0 {
-        return None;
-    }
-    let cursor = cursor.min(total - 1);
-    let window_start = crate::ui::chrome::window_start(cursor, visible_height);
-    let visible_row = (row - top - 1) as usize;
-    let idx = window_start + visible_row;
-    // 点击落在最后一项之后的空白区（idx>=total）视为 no-op。
-    if idx < total {
-        Some(idx)
-    } else {
-        None
-    }
-}
-
-/// 左键点击：命中测试定位到项 → 移动光标 + 切换标记（分隔行/区域外 no-op）。
-fn mouse_click(app: &mut App, term_area: Rect, col: u16, row: u16) {
-    let [_, body, _] = crate::ui::chrome::three_row_layout(term_area);
-
-    // Results/Scanning：走 flat_rows + toggle_selection（需整体 &mut app，用 matches! 判分支）。
-    if matches!(app.state, AppState::Results | AppState::Scanning { .. }) {
-        // Results 的 body 再分列表+详情；Scanning 用整块 body 作列表（无详情面板）。
-        let list_area = if matches!(app.state, AppState::Results) {
-            crate::ui::results::split_body(body).0
-        } else {
-            body
-        };
-        let flat_rows = app.build_flat_rows();
-        if let Some(idx) = hit_row(list_area, col, row, app.result_cursor, flat_rows.len()) {
-            if let Some(fr) = flat_rows.get(idx) {
-                if matches!(fr, FlatRow::Separator { .. }) {
-                    return; // 分隔行不可选
-                }
-                let fr = fr.clone();
-                app.result_cursor = idx;
-                app.toggle_selection(&fr);
-            }
-        }
-        return;
-    }
-
-    // Analyzer/Live：命中后先 clone path（结束对 tree_root 的借用）再改 marked。
-    let clicked_path: Option<PathBuf> = match &mut app.state {
-        AppState::Analyzing {
-            tree_root,
-            nav_path,
-            cursor,
-            ..
-        } => {
-            let node = resolve_nav_node(tree_root, nav_path);
-            let total = node.children.len();
-            if let Some(idx) = hit_row(body, col, row, *cursor, total) {
-                node.children.get(idx).map(|c| {
-                    let p = c.path.clone();
-                    *cursor = idx;
-                    p
-                })
-            } else {
-                None
-            }
-        }
-        AppState::AnalyzingLive {
-            tree_root,
-            nav_path,
-            cursor,
-            user_navigated,
-            ..
-        } => {
-            let node = resolve_nav_node(tree_root, nav_path);
-            let total = node.children.len();
-            if let Some(idx) = hit_row(body, col, row, *cursor, total) {
-                // idx 是显示序，经 size_desc_order 映回存储索引再取 path（与键盘标记同源）。
-                let path = crate::ui::analyzer::path_at_display_index(&node.children, idx);
-                if path.is_some() {
-                    *cursor = idx;
-                    *user_navigated = true;
-                }
-                path
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
-    if let Some(p) = clicked_path {
-        toggle_marked(&mut app.marked, p);
-    }
-}
-
-/// 菜单页键盘处理
-fn handle_menu_key(
-    app: &mut App,
-    key: KeyCode,
-    events: &EventHandler,
-    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
-    tree_builder: &mut Option<IncrementalTreeBuilder>,
-) {
-    match key {
-        KeyCode::Esc => {
-            app.should_quit = true;
-        }
-        KeyCode::Up | KeyCode::Char('k')
-            if app.menu_index > 0 => {
-                app.menu_index -= 1;
-            }
-        KeyCode::Down | KeyCode::Char('j')
-            if app.menu_index < 3 => {
-                app.menu_index += 1;
-            }
-        KeyCode::Enter => {
-            let cmd = match app.menu_index {
-                0 => ActiveCommand::Clean,
-                1 => ActiveCommand::Uninstall,
-                2 => ActiveCommand::Analyze,
-                3 => ActiveCommand::Purge,
-                _ => return,
-            };
-            app.active_command = Some(cmd);
-            start_command(app, cmd, events, analyze_rx, tree_builder);
-        }
-        _ => {}
-    }
-}
-
-/// 启动命令执行
-fn start_command(
-    app: &mut App,
-    cmd: ActiveCommand,
-    events: &EventHandler,
-    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
-    tree_builder: &mut Option<IncrementalTreeBuilder>,
-) {
-    // 每次命令从干净状态开始：清掉上一次可能残留的结果/标记/展开态/光标，
-    // 确保新命令不会看到上一次命令的检测结果（与 reporter 丢弃取消事件形成双保险）。
-    app.scan_result = None;
-    app.expanded.clear();
-    app.marked.clear();
-    app.result_cursor = 0;
-    // 排空进度队列：丢弃上一次扫描（可能刚被取消）残留在 channel 中、尚未消费的事件，
-    // 否则它们会在本次扫描的 Scanning 态被消费、串入新命令的列表。
-    while events.progress_rx.try_recv().is_ok() {}
-
-    match cmd {
-        ActiveCommand::Clean => {
-            app.cancel_flag = Arc::new(AtomicBool::new(false));
-            app.state = AppState::Scanning {
-                progress_text: "准备扫描...".into(),
-                rule_current: 0,
-                rule_total: 0,
-                rule_name: String::new(),
-            };
-            let tx = events.progress_sender();
-            let cancel = app.cancel_flag.clone();
-            thread::spawn(move || {
-                let reporter = TuiReporter::new(tx, cancel);
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    match Engine::scan_clean(&reporter) {
-                        Ok(_result) => {}
-                        Err(e) => {
-                            reporter.on_event(ProgressEvent::Error(e.to_string()));
-                        }
-                    }
-                }));
-                if let Err(e) = result {
-                    reporter.on_event(ProgressEvent::Error(format!("内部错误: {e:?}")));
-                }
-            });
-        }
-        ActiveCommand::Purge => {
-            app.cancel_flag = Arc::new(AtomicBool::new(false));
-            app.state = AppState::Scanning {
-                progress_text: "准备扫描...".into(),
-                rule_current: 0,
-                rule_total: 0,
-                rule_name: String::new(),
-            };
-            let tx = events.progress_sender();
-            let path = app.purge_path.clone();
-            let cancel = app.cancel_flag.clone();
-            thread::spawn(move || {
-                let reporter = TuiReporter::new(tx, cancel);
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    match Engine::scan_purge(&path, &reporter) {
-                        Ok(_result) => {}
-                        Err(e) => {
-                            reporter.on_event(ProgressEvent::Error(e.to_string()));
-                        }
-                    }
-                }));
-                if let Err(e) = result {
-                    reporter.on_event(ProgressEvent::Error(format!("内部错误: {e:?}")));
-                }
-            });
-        }
-        ActiveCommand::Analyze => {
-            // 通过独立 AnalyzeEvent channel + IncrementalTreeBuilder 实现增量构建
-            let (tx, rx) = crossbeam_channel::bounded::<AnalyzeEvent>(4096);
-            *analyze_rx = Some(rx);
-            *tree_builder = Some(IncrementalTreeBuilder::new());
-
-            let home = platform::get_home_dir();
-            let root_name = home
-                .file_name().map_or_else(|| "~".into(), |f| f.to_string_lossy().to_string());
-            app.state = AppState::AnalyzingLive {
-                tree_root: DirNode::new_dir(home.clone(), root_name),
-                nav_path: Vec::new(),
-                cursor: 0,
-                cursor_stack: Vec::new(),
-                file_count: 0,
-                total_size: 0,
-                user_navigated: false,
-            };
-
-            thread::spawn(move || {
-                // 用 catch_unwind 包裹遍历，确保 Finished 始终被发送
-                let tx_clone = tx.clone();
-                let result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                        // 取消信号：Receiver drop（用户离开 analyze）→ send 失败 → 置 stop。
-                        // jwalk 按 entry、park 按批查此 flag 及时中止遍历。
-                        let stop = std::sync::atomic::AtomicBool::new(false);
-                        let mut count = 0u64;
-                        let mut total = 0u64;
-                        mc_core::analyze_walk(
-                            &home,
-                            || stop.load(std::sync::atomic::Ordering::Relaxed),
-                            |name, path, size, is_file| {
-                                if tx_clone
-                                    .send(AnalyzeEvent::Entry { name, path, size, is_file })
-                                    .is_err()
-                                {
-                                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    return;
-                                }
-                                if is_file {
-                                    count += 1;
-                                    total += size;
-                                    if count.is_multiple_of(500) {
-                                        let _ = tx_clone.send(AnalyzeEvent::Progress {
-                                            file_count: count,
-                                            total_size: total,
-                                        });
-                                    }
-                                }
-                            },
-                        );
-                    }));
-                // 无论正常完成还是 panic，都发送 Finished
-                let _ = tx.send(AnalyzeEvent::Finished);
-                if let Err(e) = result {
-                    eprintln!("Analyze 遍历线程 panic: {e:?}");
-                }
-            });
-        }
-        ActiveCommand::Uninstall => {
-            // Uninstall 与 Clean/Purge 同款后台流式：list_apps 的 calc_app_size 重活
-            // 不再同步阻塞主线程（曾致按 Enter 后菜单冻结），而是边扫边 Found 追加。
-            app.cancel_flag = Arc::new(AtomicBool::new(false));
-            app.state = AppState::Scanning {
-                progress_text: "扫描应用中...".into(),
-                rule_current: 0,
-                rule_total: 0,
-                rule_name: String::new(),
-            };
-            let tx = events.progress_sender();
-            let cancel = app.cancel_flag.clone();
-            thread::spawn(move || {
-                let reporter = TuiReporter::new(tx, cancel);
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    Engine::scan_uninstall(&reporter);
-                }));
-                if let Err(e) = result {
-                    reporter.on_event(ProgressEvent::Error(format!("内部错误: {e:?}")));
-                }
-            });
-        }
-    }
-}
-
-// ===== 进度事件处理 =====
-
-/// 处理引擎进度事件
-fn handle_progress(app: &mut App, evt: ProgressEvent) {
-    match evt {
-        ProgressEvent::Scanning { path } => {
-            if let AppState::Scanning {
-                ref mut progress_text,
-                ..
-            } = app.state
-            {
-                // 显示相对 home 的当前扫描目录（末尾若干字符），随遍历实时移动，
-                // 让用户看到"正在扫描哪里"而非静止的顶层名。渲染节流已限制刷新频率，
-                // 不会狂闪；相比只显示顶层名，深层路径更能传达"在动"。
-                let home = platform::get_home_dir();
-                // home 之下的路径显示为 ~/…；不在 home 下的绝对路径（如 /Applications）
-                // 原样显示，避免误拼成 "~//Applications"。
-                let (prefix, s) = match path.strip_prefix(&home) {
-                    Ok(rel) => ("~/", rel.to_string_lossy()),
-                    Err(_) => ("", path.to_string_lossy()),
-                };
-                let char_count = s.chars().count();
-                let new_text = if char_count > 46 {
-                    let tail: String = s.chars().skip(char_count - 43).collect();
-                    format!("当前: …{tail}")
-                } else {
-                    format!("当前: {prefix}{s}")
-                };
-                if *progress_text != new_text {
-                    *progress_text = new_text;
-                }
-            }
-        }
-        ProgressEvent::RuleProgress {
-            current,
-            total,
-            name,
-        } => {
-            if let AppState::Scanning {
-                ref mut rule_current,
-                ref mut rule_total,
-                ref mut rule_name,
-                ..
-            } = app.state
-            {
-                *rule_current = current;
-                *rule_total = total;
-                *rule_name = name;
-            }
-        }
-        ProgressEvent::Found {
-            category,
-            path,
-            size,
-            safety,
-            impact,
-            recovery,
-            preselect,
-        } => {
-            // 仅在扫描态接受 Found：防止已取消/已结束扫描的残留事件在返回菜单等
-            // 非扫描态重建 scan_result（会让下个命令看到上个命令的检测结果）。
-            if !matches!(app.state, AppState::Scanning { .. }) {
-                return;
-            }
-            // __analyze_tree__ 路径已废弃，但保留兼容处理避免数据丢失
-            if category == "__analyze_tree__" {
-                return;
-            }
-            use mc_core::models::{CategoryGroup, SafetyLevel, ScanItem, ScanResult};
-
-            if app.scan_result.is_none() {
-                app.scan_result = Some(ScanResult::default());
-            }
-
-            // Clean 流式上报同一 (category, root.path) 的增量，此处按 path 合并到既有聚合项，
-            // 避免重复插入。merged=true 表示只是给既有项累加 size（不新增计数）。
-            //
-            // 只比对**末项**而非线性查找全部 items：scan_with_rules 顺序处理各根，某分类的
-            // 当前可合并项恒为最后压入的那一项（新根到来才追加新末项）。Purge/Uninstall 的
-            // 每个 Found 都是唯一路径、末项必不匹配→直接 push。由此把每事件的合并从 O(n)
-            // 降为 O(1)，避免单分类累积上千项时的 O(n²) 主线程卡顿。
-            // KTD3：预选（selected = safety != Risky && preselect）在**新项首次插入**时
-            // 就地播种到 marked，让扫描期的手动勾选/取消与预选累积到同一集合，
-            // 完成时 init_results 不再重播种冲掉。合并累加分支（既有项）不重复播种。
-            let should_preselect = preselect && safety != SafetyLevel::Risky;
-            let mut merged = false;
-            let mut to_preselect: Option<PathBuf> = None;
-            if let Some(result) = app.scan_result.as_mut() {
-                if let Some(cat) = result.categories.iter_mut().find(|c| c.name == category) {
-                    if let Some(existing) = cat.items.last_mut().filter(|it| it.path == path) {
-                        existing.size += size;
-                        cat.total_size += size;
-                        merged = true;
-                    } else {
-                        if should_preselect {
-                            to_preselect = Some(path.clone());
-                        }
-                        cat.file_count += 1;
-                        cat.total_size += size;
-                        cat.items.push(
-                            ScanItem::new(path, size, safety, category.clone())
-                                .with_evidence(impact, recovery)
-                                .with_preselect(preselect),
-                        );
-                    }
-                } else {
-                    if should_preselect {
-                        to_preselect = Some(path.clone());
-                    }
-                    result.categories.push(CategoryGroup::new(
-                        category.clone(),
-                        vec![ScanItem::new(path, size, safety, category.clone())
-                            .with_evidence(impact, recovery)
-                            .with_preselect(preselect)],
-                    ));
-                    app.expanded.push(false);
-                }
-                result.total_size += size;
-                if !merged {
-                    result.file_count += 1;
-                }
-            }
-            if let Some(p) = to_preselect {
-                app.marked.insert(p);
-            }
-            // 已发现项数/总大小不再单独维护：render_scan_header 直接读 scan_result。
-        }
-        ProgressEvent::CategoryDone {
-            category,
-            total_size,
-            count,
-        } => {
-            if let Some(ref mut result) = app.scan_result {
-                if let Some(cat) = result.categories.iter_mut().find(|c| c.name == category) {
-                    cat.total_size = total_size;
-                    cat.file_count = count;
-                }
-            }
-        }
-        ProgressEvent::Complete => {
-            if let AppState::Scanning { .. } = &app.state {
-                if app.active_command == Some(ActiveCommand::Analyze) {
-                    return;
-                }
-                if let Some(ref result) = app.scan_result {
-                    if result.file_count == 0 {
-                        app.state = AppState::Done {
-                            message: "未发现可清理的文件。".into(),
-                        };
-                        return;
-                    }
-                } else {
-                    app.state = AppState::Done {
-                        message: "未发现可清理的文件。".into(),
-                    };
-                    return;
-                }
-                if let Some(ref mut result) = app.scan_result {
-                    result.total_size = result.categories.iter().map(|c| c.total_size).sum();
-                    result.file_count = result.categories.iter().map(|c| c.file_count).sum();
-                    // 不再 sort_by(name) 重排底层 vec：display 顺序由 build_flat_rows 决定，
-                    // 重排会打乱 expanded/marked 的按 cat_idx 对齐，造成完成瞬间展开态跳变。
-                }
-                app.init_results();
-                // 进入 Results 时清除扫描态残留提示（如 Scanning 态按 Space 的 toast，KTD7）。
-                app.status_message = None;
-                app.state = AppState::Results;
-            }
-        }
-        ProgressEvent::CleaningFile { path } => {
-            if let AppState::Cleaning {
-                ref mut progress_text,
-            } = app.state
-            {
-                *progress_text = path.display().to_string();
-            }
-        }
-        ProgressEvent::CleaningDone { freed, count, deleted_paths } => {
-            if let Some(ret) = app.analyzer_return.take() {
-                // 分析器发起的删除：仅剪除成功删除的节点并原地返回，不拆树回菜单
-                restore_analyzer_after_delete(app, ret, freed, count, &deleted_paths);
-            } else {
-                // Results 路径：由暂存待删清单派生成功/失败明细 + 分类小结，Done 屏完整复述（KTD6）。
-                let request = std::mem::take(&mut app.clean_request);
-                app.done_report =
-                    Some(app::DoneReport::from_request(&request, freed, &deleted_paths));
-                app.state = AppState::Done { message: String::new() };
-            }
-        }
-        ProgressEvent::Error(msg) => {
-            if matches!(app.state, AppState::Scanning { .. } | AppState::Cleaning { .. }) {
-                app.state = AppState::Done {
-                    message: format!("错误: {msg}"),
-                };
-            }
-        }
-        // 权限跳过（#23）：CLI 端会单列「跳过（需授权）」区并引导 mc doctor；
-        // TUI 侧的跳过区渲染属独立范围，本批不做，此处显式 no-op（收下事件不改状态，
-        // 保持穷尽 match 与取消/契约语义不变）。
-        ProgressEvent::SkippedNoPermission { .. } => {}
-    }
-}
-
-// ===== Analyze 事件处理（拆分为 entry 和 finished 解决借用冲突）=====
-
-/// 处理 `AnalyzeEvent::Entry` 和 Progress（不修改 `analyze_rx`）
-fn handle_analyze_entry(
-    app: &mut App,
-    evt: AnalyzeEvent,
-    builder: &mut IncrementalTreeBuilder,
-) {
-    match evt {
-        AnalyzeEvent::Entry {
-            name,
-            path,
-            size,
-            is_file,
-        } => {
-            if let AppState::AnalyzingLive {
-                tree_root,
-                file_count,
-                total_size,
-                user_navigated,
-                cursor,
-                ..
-            } = &mut app.state
-            {
-                let _ = builder.integrate_entry(tree_root, name, path, size, is_file);
-                if is_file {
-                    *file_count += 1;
-                    *total_size += size;
-                }
-                if !*user_navigated {
-                    // 跟随最大项：显示层按 size 降序排列，最大项恒在显示序 0，
-                    // 故未手动导航时把光标钉在 0 即自动跟随当前最大子项。
-                    *cursor = 0;
-                }
-            }
-        }
-        AnalyzeEvent::Progress { .. } => { /* 统计已在 Entry 中更新 */ }
-        AnalyzeEvent::Finished => {
-            // Finished 应由 handle_analyze_finished 处理，此处不应到达
-        }
-    }
-}
-
-/// 从 `AnalyzingLive` 过渡到 Sorting：提取树、启动后台排序线程、清理 analyze 资源
-fn transition_to_sorting(
-    app: &mut App,
-    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
-    tree_builder: &mut Option<IncrementalTreeBuilder>,
-    sort_rx: &mut Option<Receiver<DirNode>>,
-) {
-    // 进入新 AppState 时主动清除瞬时提示：AnalyzingLive 的"扫描进行中不可标记/删除"toast
-    // 不应残留到 Sorting/Analyzing（KTD7）。放在转换点而非按键处，故静态态提示仍走"下次按键清除"。
-    app.status_message = None;
-    if let AppState::AnalyzingLive { .. } = &app.state {
-        let old = std::mem::replace(&mut app.state, AppState::Menu);
-        if let AppState::AnalyzingLive { tree_root, .. } = old {
-            app.state = AppState::Sorting;
-
-            let (tx, rx) = crossbeam_channel::bounded::<DirNode>(1);
-            *sort_rx = Some(rx);
-
-            thread::spawn(move || {
-                let mut tree = tree_root;
-                IncrementalTreeBuilder::finalize(&mut tree);
-                let _ = tx.send(tree);
-            });
-        }
-    }
-    app.active_command = None;
-    *analyze_rx = None;
-    *tree_builder = None;
-}
-
-fn handle_analyze_finished(
-    app: &mut App,
-    tree_builder: &mut Option<IncrementalTreeBuilder>,
-    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
-    sort_rx: &mut Option<Receiver<DirNode>>,
-) {
-    transition_to_sorting(app, analyze_rx, tree_builder, sort_rx);
-}
-
-/// 取消分析扫描并干净地返回菜单（不保留部分树、不进入排序浏览器）。
-fn cancel_analyze_to_menu(
-    app: &mut App,
-    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
-    tree_builder: &mut Option<IncrementalTreeBuilder>,
-    sort_rx: &mut Option<Receiver<DirNode>>,
-) {
-    app.back_to_menu();
-    *analyze_rx = None; // drop Receiver 让扫描线程 send 失败而退出
-    *tree_builder = None;
-    *sort_rx = None;
-}
-
-/// 子界面按 q：返回菜单。若存在已标记项，先置 `pending_leave` 提示，再按一次才真正返回，
-/// 避免手滑一个 q 丢掉辛苦标记（对齐 dua `pending_exit`）。按状态选择干净的收尾方式。
-fn request_leave_to_menu(
-    app: &mut App,
-    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
-    tree_builder: &mut Option<IncrementalTreeBuilder>,
-    sort_rx: &mut Option<Receiver<DirNode>>,
-) {
-    if !app.marked.is_empty() && !app.pending_leave {
-        app.pending_leave = true;
-        app.status_message = Some(format!(
-            "已标记 {} 项未删除，再按一次 q 放弃并返回菜单",
-            app.marked.len()
-        ));
-        return;
-    }
-    match app.state {
-        AppState::AnalyzingLive { .. } => {
-            cancel_analyze_to_menu(app, analyze_rx, tree_builder, sort_rx);
-        }
-        AppState::Scanning { .. } => {
-            app.cancel_flag.store(true, Ordering::Relaxed);
-            app.back_to_menu();
-            app.cancel_flag = Arc::new(AtomicBool::new(false));
-        }
-        AppState::Sorting => {
-            *sort_rx = None;
-            app.back_to_menu();
-        }
-        _ => app.back_to_menu(),
     }
 }
 
@@ -1293,125 +566,6 @@ fn handle_results_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers, _eve
     }
 }
 
-/// 后台删除线程：把 (路径, 大小) 清单移入废纸篓，完成后 send `CleaningDone`。
-/// 含 Risky 项时需输入的确认 token（type-to-confirm，D4）。确认框提示文案复用此常量避免漂移。
-pub const CONFIRM_TOKEN: &str = "delete";
-
-/// 执行已确认的删除：把确认项映射回 (path, size) 交给删除线程（KTD8：线程签名不变）。
-fn confirm_accept(
-    app: &mut App,
-    events: &EventHandler,
-    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
-    tree_builder: &mut Option<IncrementalTreeBuilder>,
-    sort_rx: &mut Option<Receiver<DirNode>>,
-) {
-    app.confirm_input.clear();
-    app.confirm_scroll = 0;
-    if let Some(list) = app.confirm_delete.take() {
-        let items: Vec<(PathBuf, u64)> = list.iter().map(|i| (i.path.clone(), i.size)).collect();
-        // 分析器发起的删除：删后原地留在树内（暂存树剪枝恢复）；其余（Results）：删后走 Done → 菜单。
-        if matches!(app.state, AppState::Analyzing { .. }) {
-            app.clean_request = Vec::new();
-            start_cleaning_from_analyzer(app, items, events);
-        } else if matches!(app.state, AppState::AnalyzingLive { .. }) {
-            // live 态删除（KTD1）：先收尾——停遍历 + finalize 部分树 → Sorting → Analyzing；
-            // 暂存待删清单，待 SortDone 在稳定树上执行（见 run_app 的 SortDone 分支）。
-            app.clean_request = Vec::new();
-            app.pending_analyzer_delete = items;
-            transition_to_sorting(app, analyze_rx, tree_builder, sort_rx);
-        } else if matches!(app.state, AppState::Sorting) {
-            // 竞态：确认框展示期间扫描自然完成已进入 Sorting（finalize 进行中）。此确认必来自
-            // live 态（Sorting 仅由 AnalyzingLive 进入，且 live 删除的 transition 已消费过
-            // confirm_delete），故仍属 live 删除——暂存待删让 SortDone 统一在稳定树上执行，
-            // 不落入 Results 删除路径（否则违背 R3 且丢弃已排序树，审查条目 #1）。
-            app.clean_request = Vec::new();
-            app.pending_analyzer_delete = items;
-        } else {
-            // Scanning 态删除：先收尾扫描——置 cancel_flag 停剩余规则，避免边删边扫的
-            // Found 事件混入 Cleaning 态（KTD1）。残留 Found 由 handle_progress 的
-            // 非 Scanning 守卫忽略，无需额外排空。
-            if matches!(app.state, AppState::Scanning { .. }) {
-                app.cancel_flag.store(true, Ordering::Relaxed);
-            }
-            // 暂存完整待删清单，供 Done 屏计算成功/失败明细与分类小结（KTD6）。
-            app.clean_request = list;
-            start_cleaning(app, items, events);
-        }
-    }
-}
-
-fn spawn_trash_thread(items: Vec<(PathBuf, u64)>, events: &EventHandler) {
-    let tx = events.progress_sender();
-    let cancel = Arc::new(AtomicBool::new(false));
-    thread::spawn(move || {
-        let reporter = TuiReporter::new(tx, cancel);
-        use mc_core::models::{SafetyLevel, ScanItem};
-        let scan_items: Vec<ScanItem> = items
-            .iter()
-            .map(|(path, size)| ScanItem::new(path.clone(), *size, SafetyLevel::Safe, String::new()))
-            .collect();
-        let refs: Vec<&ScanItem> = scan_items.iter().collect();
-
-        // 与四条扫描线程一致，用 catch_unwind 包裹删除，确保 panic 也回发 Error。
-        // 否则 Cleaner::execute 恒返回 Ok 使 panic 成为唯一失败出口，一旦 panic，
-        // 主线程收不到 CleaningDone/Error，而 Cleaning 态屏蔽除 Ctrl+C 外全部按键 → 卡死
-        // （经分析器删除路径触发时还会连带丢失暂存的整棵树）。Error 分支在 Cleaning 态会转 Done 解卡。
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Engine::clean(&refs, DeleteMode::Trash, &reporter)
-        }));
-        match result {
-            Ok(Ok(_report)) => {}
-            Ok(Err(e)) => {
-                reporter.on_event(ProgressEvent::Error(e.to_string()));
-            }
-            Err(_) => {
-                reporter.on_event(ProgressEvent::Error("删除线程内部错误（panic）".into()));
-            }
-        }
-    });
-}
-
-/// 启动清理（Results 页发起）：转入 Cleaning，完成后走 Done → 菜单。
-fn start_cleaning(app: &mut App, items: Vec<(PathBuf, u64)>, events: &EventHandler) {
-    if items.is_empty() {
-        return;
-    }
-    app.marked.clear();
-    app.state = AppState::Cleaning {
-        progress_text: "准备清理...".into(),
-    };
-    spawn_trash_thread(items, events);
-}
-
-/// 启动清理（磁盘分析器发起）：先把当前树与导航暂存到 `analyzer_return`（含待删路径），
-/// 再转入 Cleaning 后台删除。完成后由 `CleaningDone` 分支剪除已删节点并**原地返回分析器**，
-/// 而非像 Results 那样走 Done → 菜单（修复"删除后莫名退出、整棵树丢失"）。
-fn start_cleaning_from_analyzer(app: &mut App, items: Vec<(PathBuf, u64)>, events: &EventHandler) {
-    if items.is_empty() {
-        return;
-    }
-    let placeholder = AppState::Cleaning {
-        progress_text: "准备清理...".into(),
-    };
-    if let AppState::Analyzing {
-        tree_root,
-        nav_path,
-        cursor,
-        cursor_stack,
-    } = std::mem::replace(&mut app.state, placeholder)
-    {
-        app.analyzer_return = Some(app::AnalyzerReturn {
-            tree: tree_root,
-            nav_path,
-            cursor,
-            cursor_stack,
-            deleted: items.iter().map(|(p, _)| p.clone()).collect(),
-        });
-    }
-    app.marked.clear();
-    spawn_trash_thread(items, events);
-}
-
 /// 完成页键盘处理
 fn handle_done_key(app: &mut App, key: KeyCode) {
     match key {
@@ -1423,378 +577,14 @@ fn handle_done_key(app: &mut App, key: KeyCode) {
 }
 
 /// 获取 `nav_path` 指向的当前节点
-fn resolve_nav_node<'a>(root: &'a DirNode, nav_path: &[usize]) -> &'a DirNode {
+pub(crate) fn resolve_nav_node<'a>(root: &'a DirNode, nav_path: &[usize]) -> &'a DirNode {
     ui::analyzer::resolve_node(root, nav_path)
-}
-
-/// 递归收集树中被标记路径的 (路径, 大小)；命中标记目录即整体计入、不再深入
-fn collect_marked(node: &DirNode, marked: &HashSet<PathBuf>, out: &mut Vec<(PathBuf, u64)>) {
-    if marked.contains(&node.path) {
-        out.push((node.path.clone(), node.size));
-        return;
-    }
-    for child in &node.children {
-        collect_marked(child, marked, out);
-    }
-}
-
-/// 分析器删除完成：从暂存树剪除已删路径、修正各层大小，校正导航后原地恢复 Analyzing。
-fn restore_analyzer_after_delete(
-    app: &mut App,
-    ret: app::AnalyzerReturn,
-    freed: u64,
-    count: usize,
-    deleted_paths: &[PathBuf],
-) {
-    let app::AnalyzerReturn {
-        tree,
-        mut nav_path,
-        mut cursor,
-        mut cursor_stack,
-        deleted,
-    } = ret;
-    // 仅按**成功**删除的路径剪树：失败项（权限/SIP/占用等）保留在树中，
-    // 界面显示的用量与磁盘保持一致，用户仍能看到并重试。
-    let failed = deleted.len().saturating_sub(deleted_paths.len());
-    let deleted_set: HashSet<PathBuf> = deleted_paths.iter().cloned().collect();
-    // 剪枝前记录 nav_path 各层目标的路径快照：剪枝后按**路径**（而非裸索引）恢复导航，
-    // 避免删除某祖先层靠前兄弟致索引左移后 nav_path 静默指向另一目录。
-    let nav_target_paths = nav_path_target_paths(&tree, &nav_path);
-    let mut tree = tree;
-    {
-        let root = Arc::make_mut(&mut tree);
-        prune_paths(root, &deleted_set);
-        clamp_nav_after_prune(
-            root,
-            &nav_target_paths,
-            &mut nav_path,
-            &mut cursor,
-            &mut cursor_stack,
-        );
-    }
-    app.state = AppState::Analyzing {
-        tree_root: tree,
-        nav_path,
-        cursor,
-        cursor_stack,
-    };
-    if failed > 0 {
-        app.status_message = Some(format!(
-            "已删除 {} 项，释放 {}；{} 项失败，仍保留",
-            count,
-            format_size(freed, DECIMAL),
-            failed
-        ));
-        return;
-    }
-    app.status_message = Some(format!(
-        "已删除 {} 项，释放 {}",
-        count,
-        format_size(freed, DECIMAL)
-    ));
-}
-
-/// 递归剪除 children 中路径命中 `deleted` 的节点，并自底向上按剩余 children 重算目录 size。
-fn prune_paths(node: &mut DirNode, deleted: &HashSet<PathBuf>) {
-    node.children.retain(|c| !deleted.contains(&c.path));
-    for child in &mut node.children {
-        if !child.is_file {
-            prune_paths(child, deleted);
-        }
-    }
-    if !node.is_file {
-        node.size = node.children.iter().map(|c| c.size).sum();
-    }
-}
-
-/// 剪枝前沿 `nav_path` 逐层解析出每一层目标目录的路径快照，供剪枝后按路径恢复导航。
-fn nav_path_target_paths(root: &DirNode, nav_path: &[usize]) -> Vec<PathBuf> {
-    let mut node = root;
-    let mut paths = Vec::with_capacity(nav_path.len());
-    for &idx in nav_path {
-        match node.children.get(idx) {
-            Some(c) => {
-                paths.push(c.path.clone());
-                node = c;
-            }
-            None => break,
-        }
-    }
-    paths
-}
-
-/// 剪枝后校正导航：按剪枝前记录的**路径**逐层重新定位索引（而非沿用可能左移的裸索引），
-/// 某层目标已删或不再是目录则在该层截断，最后把 cursor 夹回当前层范围。
-fn clamp_nav_after_prune(
-    root: &DirNode,
-    nav_target_paths: &[PathBuf],
-    nav_path: &mut Vec<usize>,
-    cursor: &mut usize,
-    cursor_stack: &mut Vec<usize>,
-) {
-    let mut node = root;
-    let mut new_nav = Vec::with_capacity(nav_target_paths.len());
-    for target in nav_target_paths {
-        match node
-            .children
-            .iter()
-            .position(|c| !c.is_file && &c.path == target)
-        {
-            Some(idx) => {
-                new_nav.push(idx);
-                node = &node.children[idx];
-            }
-            None => break,
-        }
-    }
-    let valid = new_nav.len();
-    *nav_path = new_nav;
-    cursor_stack.truncate(valid);
-    let current = resolve_nav_node(root, nav_path);
-    let len = current.children.len();
-    *cursor = if len == 0 { 0 } else { (*cursor).min(len - 1) };
-}
-
-/// 磁盘分析器键盘处理（Analyzing 状态，完成后的纯内存导航）
-fn handle_analyzer_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
-    if let AppState::Analyzing {
-        tree_root,
-        nav_path,
-        cursor,
-        cursor_stack,
-        ..
-    } = &mut app.state
-    {
-        let current_node = resolve_nav_node(tree_root, nav_path);
-        let len = current_node.children.len();
-        match key {
-            KeyCode::Up | KeyCode::Char('k')
-                if *cursor > 0 => {
-                    *cursor -= 1;
-                }
-            KeyCode::Down | KeyCode::Char('j')
-                if !current_node.children.is_empty() && *cursor < current_node.children.len() - 1 => {
-                    *cursor += 1;
-                }
-            // 翻页：PageDown / Ctrl+d 下移、PageUp / Ctrl+u 上移
-            KeyCode::PageDown => {
-                if len > 0 {
-                    *cursor = (*cursor + PAGE_STEP).min(len - 1);
-                }
-            }
-            KeyCode::PageUp => {
-                *cursor = cursor.saturating_sub(PAGE_STEP);
-            }
-            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if len > 0 {
-                    *cursor = (*cursor + PAGE_STEP).min(len - 1);
-                }
-            }
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                *cursor = cursor.saturating_sub(PAGE_STEP);
-            }
-            // 跳转：Home / g 首行、End / G 末行
-            KeyCode::Home | KeyCode::Char('g') => {
-                *cursor = 0;
-            }
-            KeyCode::End | KeyCode::Char('G') => {
-                if len > 0 {
-                    *cursor = len - 1;
-                }
-            }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if let Some(child) = current_node.children.get(*cursor) {
-                    if !child.is_file && !child.children.is_empty() {
-                        cursor_stack.push(*cursor);
-                        nav_path.push(*cursor);
-                        *cursor = 0;
-                    }
-                }
-            }
-            KeyCode::Backspace | KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
-                if nav_path.is_empty() {
-                    app.back_to_menu();
-                } else {
-                    nav_path.pop();
-                    *cursor = cursor_stack.pop().unwrap_or(0);
-                }
-            }
-            // 标记（统一键位：Space，d 为别名）
-            KeyCode::Char(' ' | 'd') => {
-                let path = current_node.children.get(*cursor).map(|c| c.path.clone());
-                if let Some(p) = path {
-                    toggle_marked(&mut app.marked, p);
-                }
-            }
-            KeyCode::Char('x') => {
-                let mut list = Vec::new();
-                collect_marked(tree_root, &app.marked, &mut list);
-                if !list.is_empty() {
-                    // 分析器项来自 DirNode，无规则元数据：按路径回查规则证据（evidence_for_path），
-                    // 使 Risky 路径（Docker 卷/Xcode Archives 等）经分析器删除时也触发 type-to-confirm；
-                    // 未命中任何规则的普通路径默认 Safe、空证据（KTD8）。
-                    let items = list
-                        .into_iter()
-                        .map(|(path, size)| {
-                            let (safety, impact, recovery) =
-                                mc_core::rules::evidence_for_path(&path).unwrap_or((
-                                    mc_core::models::SafetyLevel::Safe,
-                                    String::new(),
-                                    String::new(),
-                                ));
-                            crate::app::ConfirmItem {
-                                path,
-                                size,
-                                safety,
-                                category: String::new(),
-                                impact,
-                                recovery,
-                            }
-                        })
-                        .collect();
-                    app.confirm_delete = Some(items);
-                    app.confirm_scroll = 0;
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// `AnalyzingLive` 状态键盘处理（增量构建中的可导航界面）
-fn handle_analyzer_live_key(
-    app: &mut App,
-    key: KeyCode,
-    modifiers: KeyModifiers,
-    analyze_rx: &mut Option<Receiver<AnalyzeEvent>>,
-    tree_builder: &mut Option<IncrementalTreeBuilder>,
-    sort_rx: &mut Option<Receiver<DirNode>>,
-) {
-    // live 态现在可标记/删除（KTD2）：标记只动 App.marked（路径集合），与正在生长的树
-    // 完全独立；按路径经 size_desc_order 置换翻译 + .get() 兜底，把实时重排的 TOCTOU
-    // 降为安全 no-op（曾因"按位置标记误标最大项"而被 75eaa4f 一刀切封锁，此处按路径根治）。
-    // 删除（x）见 confirm_accept：提交时先 finalize 部分树再删（KTD1）。
-    // 先提取需要的字段进行操作
-    if let AppState::AnalyzingLive {
-        tree_root,
-        nav_path,
-        cursor,
-        cursor_stack,
-        user_navigated,
-        ..
-    } = &mut app.state
-    {
-        let current_node = resolve_nav_node(tree_root, nav_path);
-        let len = current_node.children.len();
-        match key {
-            KeyCode::Up | KeyCode::Char('k')
-                if *cursor > 0 => {
-                    *cursor -= 1;
-                    *user_navigated = true;
-                }
-            KeyCode::Down | KeyCode::Char('j')
-                if !current_node.children.is_empty() && *cursor < current_node.children.len() - 1 => {
-                    *cursor += 1;
-                    *user_navigated = true;
-                }
-            // 翻页：PageDown / Ctrl+d 下移、PageUp / Ctrl+u 上移（均置 user_navigated）
-            KeyCode::PageDown => {
-                if len > 0 {
-                    *cursor = (*cursor + PAGE_STEP).min(len - 1);
-                    *user_navigated = true;
-                }
-            }
-            KeyCode::PageUp => {
-                *cursor = cursor.saturating_sub(PAGE_STEP);
-                *user_navigated = true;
-            }
-            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if len > 0 {
-                    *cursor = (*cursor + PAGE_STEP).min(len - 1);
-                    *user_navigated = true;
-                }
-            }
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                *cursor = cursor.saturating_sub(PAGE_STEP);
-                *user_navigated = true;
-            }
-            // 跳转：Home / g 首行、End / G 末行
-            KeyCode::Home | KeyCode::Char('g') => {
-                *cursor = 0;
-                *user_navigated = true;
-            }
-            KeyCode::End | KeyCode::Char('G') => {
-                if len > 0 {
-                    *cursor = len - 1;
-                    *user_navigated = true;
-                }
-            }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                // cursor 是显示序位置，经 order 映回底层存储索引再入 nav_path
-                let order = crate::ui::analyzer::size_desc_order(&current_node.children);
-                if let Some(&stored_idx) = order.get(*cursor) {
-                    if current_node.children.get(stored_idx).is_some_and(|c| !c.is_file) {
-                        *user_navigated = true;
-                        cursor_stack.push(*cursor);
-                        nav_path.push(stored_idx);
-                        *cursor = 0;
-                    }
-                }
-            }
-            KeyCode::Backspace | KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
-                if nav_path.is_empty() {
-                    cancel_analyze_to_menu(app, analyze_rx, tree_builder, sort_rx);
-                } else {
-                    *user_navigated = true;
-                    nav_path.pop();
-                    *cursor = cursor_stack.pop().unwrap_or(0);
-                }
-            }
-            // 标记（Space/d）：cursor 是显示序，经 path_at_display_index 置换映回存储索引取 path
-            // （一律 .get()，把流式重排的 TOCTOU 降为 no-op，KTD2）。不移光标、不改 user_navigated。
-            KeyCode::Char(' ' | 'd') => {
-                let path = crate::ui::analyzer::path_at_display_index(&current_node.children, *cursor);
-                if let Some(p) = path {
-                    toggle_marked(&mut app.marked, p);
-                }
-            }
-            // 删除（x）：与 Analyzing 同款按路径回查规则证据（Risky 触发 type-to-confirm）；
-            // 提交在 confirm_accept 走 finalize→delete（KTD1）。
-            KeyCode::Char('x') => {
-                let mut list = Vec::new();
-                collect_marked(tree_root, &app.marked, &mut list);
-                if !list.is_empty() {
-                    let items = list
-                        .into_iter()
-                        .map(|(path, size)| {
-                            let (safety, impact, recovery) =
-                                mc_core::rules::evidence_for_path(&path).unwrap_or((
-                                    mc_core::models::SafetyLevel::Safe,
-                                    String::new(),
-                                    String::new(),
-                                ));
-                            crate::app::ConfirmItem {
-                                path,
-                                size,
-                                safety,
-                                category: String::new(),
-                                impact,
-                                recovery,
-                            }
-                        })
-                        .collect();
-                    app.confirm_delete = Some(items);
-                    app.confirm_scroll = 0;
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_marked, handle_key, CONFIRM_TOKEN};
+    use super::{handle_key, CONFIRM_TOKEN};
+    use crate::analyzer_ops::collect_marked;
     use crate::app::{App, ConfirmItem};
     use crate::event::EventHandler;
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -1895,7 +685,8 @@ mod tests {
 
     #[test]
     fn found_merges_repeated_category_path_and_counts_distinct_items() {
-        use super::{handle_progress, App, AppState};
+        use super::{App, AppState};
+        use crate::progress::handle_progress;
         use mc_core::models::SafetyLevel;
         use mc_core::progress::ProgressEvent;
 
@@ -1944,7 +735,8 @@ mod tests {
     fn restore_analyzer_prunes_only_succeeded_and_keeps_failed() {
         // 部分移废纸篓失败时：只剪除成功项，失败项保留在树中、size 据实重算，
         // 并提示失败数 —— 避免界面与磁盘发散（评审 P2）。
-        use super::{restore_analyzer_after_delete, App, AppState};
+        use super::{App, AppState};
+        use crate::analyzer_ops::restore_analyzer_after_delete;
         use mc_core::models::DirNode;
         use std::sync::Arc;
 
@@ -1984,7 +776,8 @@ mod tests {
     fn found_seeds_preselect_by_safety_and_flag() {
         // KTD3：Found 首次插入时按 selected(= safety != Risky && preselect) 播种 marked，
         // 合并累加不重复播种；Risky 与 preselect=false 不播种。
-        use super::{handle_progress, App, AppState};
+        use super::{App, AppState};
+        use crate::progress::handle_progress;
         use mc_core::models::SafetyLevel;
         use mc_core::progress::ProgressEvent;
 
@@ -2170,7 +963,8 @@ mod tests {
     fn live_delete_confirm_during_sorting_uses_analyzer_path() {
         // 审查条目 #1 竞态：确认框展示期间扫描自然完成进入 Sorting，此时确认删除
         // 仍应走 analyzer 暂存路径（由 SortDone 消费），不落入 Results 删除（→ Cleaning）。
-        use super::{confirm_accept, AppState};
+        use super::AppState;
+        use crate::delete::confirm_accept;
         let mut app = live_app(vec![DirNode::new_file(PathBuf::from("/r/big"), "big".into(), 100)]);
         app.marked.insert(PathBuf::from("/r/big"));
         press(&mut app, KeyCode::Char('x')); // 打开确认框（live x）
@@ -2188,7 +982,8 @@ mod tests {
     fn found_ignored_outside_scanning_state() {
         // 防污染守卫：非扫描态（如已返回 Menu）收到残留 Found 应被忽略，
         // 不得重建 scan_result 让下一个命令看到上一个命令的检测结果。
-        use super::{handle_progress, App};
+        use super::App;
+        use crate::progress::handle_progress;
         use mc_core::models::SafetyLevel;
         use mc_core::progress::ProgressEvent;
 
@@ -2224,7 +1019,7 @@ mod tests {
 
         let mut deleted = HashSet::new();
         deleted.insert(PathBuf::from("/r/big"));
-        super::prune_paths(&mut root, &deleted);
+        crate::analyzer_ops::prune_paths(&mut root, &deleted);
 
         assert_eq!(root.children.len(), 1);
         assert_eq!(root.children[0].name, "keep");
@@ -2244,7 +1039,7 @@ mod tests {
 
         let mut deleted = HashSet::new();
         deleted.insert(PathBuf::from("/r/a/b"));
-        super::prune_paths(&mut root, &deleted);
+        crate::analyzer_ops::prune_paths(&mut root, &deleted);
 
         assert_eq!(root.children[0].children.len(), 1);
         assert_eq!(root.children[0].size, 300);
@@ -2257,16 +1052,16 @@ mod tests {
         let mut root = DirNode::new_dir(PathBuf::from("/r"), "r".into());
         root.children.push(DirNode::new_dir(PathBuf::from("/r/a"), "a".into()));
         let nav_before = vec![0];
-        let targets = super::nav_path_target_paths(&root, &nav_before);
+        let targets = crate::analyzer_ops::nav_path_target_paths(&root, &nav_before);
 
         let mut deleted = HashSet::new();
         deleted.insert(PathBuf::from("/r/a"));
-        super::prune_paths(&mut root, &deleted);
+        crate::analyzer_ops::prune_paths(&mut root, &deleted);
 
         let mut nav = nav_before.clone();
         let mut cursor = 9;
         let mut stack = vec![0];
-        super::clamp_nav_after_prune(&root, &targets, &mut nav, &mut cursor, &mut stack);
+        crate::analyzer_ops::clamp_nav_after_prune(&root, &targets, &mut nav, &mut cursor, &mut stack);
         assert!(nav.is_empty());
         assert!(stack.is_empty());
         assert_eq!(cursor, 0);
@@ -2282,16 +1077,16 @@ mod tests {
                 .push(DirNode::new_dir(PathBuf::from(format!("/r/{name}")), name.into()));
         }
         let nav_before = vec![1]; // 指向 b
-        let targets = super::nav_path_target_paths(&root, &nav_before);
+        let targets = crate::analyzer_ops::nav_path_target_paths(&root, &nav_before);
 
         let mut deleted = HashSet::new();
         deleted.insert(PathBuf::from("/r/a"));
-        super::prune_paths(&mut root, &deleted);
+        crate::analyzer_ops::prune_paths(&mut root, &deleted);
 
         let mut nav = nav_before.clone();
         let mut cursor = 0;
         let mut stack = vec![1];
-        super::clamp_nav_after_prune(&root, &targets, &mut nav, &mut cursor, &mut stack);
+        crate::analyzer_ops::clamp_nav_after_prune(&root, &targets, &mut nav, &mut cursor, &mut stack);
         // 索引已从 1 重映射到 0，且解析出的目标仍是 b（而非 c）。
         assert_eq!(nav, vec![0]);
         assert_eq!(super::resolve_nav_node(&root, &nav).path, PathBuf::from("/r/b"));
@@ -2299,7 +1094,8 @@ mod tests {
 
     #[test]
     fn request_leave_to_menu_two_step_confirm_when_marked() {
-        use super::{request_leave_to_menu, App, AppState};
+        use super::{App, AppState};
+        use crate::progress::request_leave_to_menu;
         let mut app = App::new();
         app.state = AppState::Results;
         app.marked.insert(PathBuf::from("/r/x"));
@@ -2372,7 +1168,8 @@ mod tests {
 
     #[test]
     fn request_leave_to_menu_immediate_when_no_marks() {
-        use super::{request_leave_to_menu, App, AppState};
+        use super::{App, AppState};
+        use crate::progress::request_leave_to_menu;
         let mut app = App::new();
         app.state = AppState::Results;
         // 无标记：一次按 q 即返回菜单，不进入二次确认。
@@ -2398,7 +1195,7 @@ mod tests {
 
     #[test]
     fn hit_row_maps_visible_rows_and_rejects_borders() {
-        use super::hit_row;
+        use crate::mouse::hit_row;
         use ratatui::layout::Rect;
         // y=3, height=12 → 上下边框各 1 行，可见内容行 = 10（全局行 4..=13）
         let area = Rect::new(0, 3, 40, 12);
@@ -2417,7 +1214,7 @@ mod tests {
 
     #[test]
     fn hit_row_accounts_for_scroll_offset() {
-        use super::hit_row;
+        use crate::mouse::hit_row;
         use ratatui::layout::Rect;
         let area = Rect::new(0, 3, 40, 12); // 可见 10 行
         // cursor=50 → window_start = 41；点首个可见行 → idx 41
@@ -2428,7 +1225,7 @@ mod tests {
 
     #[test]
     fn hit_row_click_below_last_item_is_none() {
-        use super::hit_row;
+        use crate::mouse::hit_row;
         use ratatui::layout::Rect;
         let area = Rect::new(0, 3, 40, 12); // 可见 10 行
         // 仅 5 项，点第 8 个可见行（visible_row=7 → idx 7 ≥ total）→ None
@@ -2439,7 +1236,7 @@ mod tests {
 
     #[test]
     fn scroll_cursor_steps_and_clamps() {
-        use super::scroll_cursor;
+        use crate::mouse::scroll_cursor;
         // 向下步进 3，不越界
         let mut c = 0;
         assert!(scroll_cursor(&mut c, 100, true));
