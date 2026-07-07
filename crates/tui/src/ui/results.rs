@@ -101,7 +101,8 @@ fn level_rubric(level: SafetyLevel) -> &'static str {
 }
 
 /// 渲染详情面板：颜色 + 形状符号 + 文字标签三通道并存，保证 `NO_COLOR` 或色盲下仍可辨。
-fn render_detail(f: &mut Frame, area: Rect, detail: &DetailView) {
+/// `pub(crate)`：扫描态（`ui/scan.rs`）复用同一面板，让详情在扫描进行中即可见，而非等完成切 Results。
+pub(crate) fn render_detail(f: &mut Frame, area: Rect, detail: &DetailView) {
     let lines: Vec<Line> = match detail {
         DetailView::Empty => vec![Line::from("")],
         DetailView::Level(level) => {
