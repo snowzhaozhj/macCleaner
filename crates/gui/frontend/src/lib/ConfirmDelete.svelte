@@ -3,8 +3,16 @@
   import { CONFIRM_TOKEN, isConfirmed } from "./confirm";
   import { formatBytes } from "./format";
   import Safety from "./Safety.svelte";
+  import PathText from "./PathText.svelte";
+  import EvidenceCard from "./EvidenceCard.svelte";
 
-  export type ConfirmItem = { path: string; size: number; safety?: SafetyLevel };
+  export type ConfirmItem = {
+    path: string;
+    size: number;
+    safety?: SafetyLevel;
+    impact?: string;
+    recovery?: string;
+  };
 
   let {
     items,
@@ -49,7 +57,8 @@
           {#if item.safety}
             <Safety safety={item.safety} />
           {/if}
-          <span class="path" title={item.path}>{item.path}</span>
+          <PathText path={item.path} />
+          <EvidenceCard impact={item.impact ?? ""} recovery={item.recovery ?? ""} />
           <span class="size">{formatBytes(item.size)}</span>
         </li>
       {/each}
@@ -137,16 +146,6 @@
     gap: var(--sp-3);
     min-height: var(--row-height);
     border-bottom: 1px solid color-mix(in oklch, var(--border-subtle) 40%, transparent);
-  }
-  .path {
-    flex: 1 1 auto;
-    font-family: var(--font-mono);
-    font-size: 0.85em;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    direction: rtl;
-    text-align: left;
   }
   .size {
     font-family: var(--font-mono);

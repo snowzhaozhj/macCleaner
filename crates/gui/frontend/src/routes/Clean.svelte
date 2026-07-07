@@ -1,104 +1,134 @@
 <script lang="ts">
-  import { scanClean, clean, cancelScan, type SafetyLevel } from "../lib/ipc";
-  import { formatBytes } from "../lib/format";
-  import Safety from "../lib/Safety.svelte";
+  import { onMount } from "svelte";
+  import {
+    scanClean,
+    clean,
+    cancelScan,
+    openTrash,
+    type CleanReport,
+    type ScanResult,
+  } from "../lib/ipc";
+  import {
+    upsertFound,
+    aggregateByCategory,
+    computeSegments,
+    formatBytes,
+    type LiveItem,
+    type FoundData,
+  } from "../lib/format";
+  import { withViewTransition } from "../lib/transition";
+  import { nextToast, dismissToast, type ToastState } from "../lib/toast";
+  import Shell from "../lib/Shell.svelte";
+  import SummaryHeader from "../lib/SummaryHeader.svelte";
+  import StreamingList from "../lib/StreamingList.svelte";
+  import CleanReceipt from "../lib/CleanReceipt.svelte";
+  import UndoToast from "../lib/UndoToast.svelte";
   import ConfirmDelete from "../lib/ConfirmDelete.svelte";
   import type { ConfirmItem } from "../lib/ConfirmDelete.svelte";
 
-  type LiveItem = {
-    path: string;
-    size: number;
-    safety: SafetyLevel;
-    category: string;
-    impact: string;
-    recovery: string;
-    selected: boolean;
-  };
+  /**
+   * clean_rules 的已知分类（预印占位行的顺序，防跳变基座 R2/KTD2）。
+   * 与 `crates/core/src/clean_rules.toml` 的 category 保持一致——新增品类时同步此处。
+   */
+  const KNOWN_CATEGORIES = ["系统缓存", "浏览器缓存"] as const;
 
   type Phase = "idle" | "scanning" | "results" | "cleaning" | "done";
 
   let phase = $state<Phase>("idle");
   let items = $state<LiveItem[]>([]);
-  let currentPath = $state("");
   let error = $state<string | null>(null);
   let skipped = $state<string[]>([]);
   let showSkipped = $state(false);
+  let scanProg = $state<{ current: number; total: number } | null>(null);
 
   let confirmItems = $state<ConfirmItem[] | null>(null);
-
   let cleaningPath = $state("");
-  let freed = $state(0);
-  let cleanedCount = $state(0);
+  let lastReport = $state<CleanReport | null>(null);
+  let toast = $state<ToastState>(null);
 
-  // 派生：分类分组（发现顺序内累加），总大小/已选统计
-  const groups = $derived.by(() => {
-    const map = new Map<string, LiveItem[]>();
-    for (const it of items) {
-      const arr = map.get(it.category);
-      if (arr) arr.push(it);
-      else map.set(it.category, [it]);
-    }
-    return [...map.entries()].map(([name, list]) => ({
-      name,
-      items: list,
-      total: list.reduce((s, i) => s + i.size, 0),
-    }));
-  });
+  const scanning = $derived(phase === "scanning");
+  const cats = $derived(
+    aggregateByCategory(items, KNOWN_CATEGORIES, phase !== "scanning"),
+  );
   const selectedItems = $derived(items.filter((i) => i.selected));
-  const selectedSize = $derived(selectedItems.reduce((s, i) => s + i.size, 0));
-  const scannedSize = $derived(items.reduce((s, i) => s + i.size, 0));
+  const selectedSize = $derived(
+    items.reduce((s, i) => (i.selected ? s + i.size : s), 0),
+  );
+  // 分段横条按**已选**占比呈现，使横条总量与首屏主数字/主按钮量恒等（R10）。
+  const segments = $derived(
+    computeSegments(cats.map((c) => ({ ...c, size: c.selectedSize }))),
+  );
+
+  function setPhase(p: Phase) {
+    withViewTransition(() => {
+      phase = p;
+    });
+  }
+
+  // ---- 扫描：rAF 批处理流式 Found（KTD2）----
+  let rafId = 0;
+  let buffer: FoundData[] = [];
+  const index = new Map<string, number>();
+
+  function flush() {
+    rafId = 0;
+    for (const f of buffer) upsertFound(items, index, f);
+    buffer = [];
+  }
+  function scheduleFlush() {
+    if (rafId === 0) rafId = requestAnimationFrame(flush);
+  }
 
   async function startScan() {
-    phase = "scanning";
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = 0;
+    buffer = [];
+    index.clear();
     items = [];
     skipped = [];
     error = null;
-    currentPath = "";
-    // core 的 Found.size 是同一 (category, path) 的**增量 delta**（scanner.rs:736，
-    // 大目录会分多次 flush 重复上报同一基路径）；必须按 (category, path) 合并累加，
-    // 否则会产生重复行、Svelte 重复 key、选择碎片化（R-review，对齐 TUI 的合并语义）。
-    const indexByKey = new Map<string, number>();
+    scanProg = null;
+    setPhase("scanning");
+    let result: ScanResult | null = null;
     try {
-      await scanClean((e) => {
+      result = await scanClean((e) => {
         if (typeof e === "string") return; // "Complete"
-        if ("Scanning" in e) {
-          currentPath = e.Scanning.path;
-        } else if ("Found" in e) {
-          const f = e.Found;
-          const key = `${f.category}\u0000${f.path}`;
-          const idx = indexByKey.get(key);
-          if (idx !== undefined) {
-            // 已存在同一基路径：累加 delta（不改动已计算的预选/元数据）。
-            items[idx].size += f.size;
-          } else {
-            // 首次出现：建项。默认预选：非 Risky 且 preselect（Risky 永不预选）。
-            indexByKey.set(key, items.length);
-            items.push({
-              path: f.path,
-              size: f.size,
-              safety: f.safety,
-              category: f.category,
-              impact: f.impact,
-              recovery: f.recovery,
-              selected: f.safety !== "Risky" && f.preselect,
-            });
-          }
+        if ("Found" in e) {
+          buffer.push(e.Found);
+          scheduleFlush();
+        } else if ("RuleProgress" in e) {
+          scanProg = { current: e.RuleProgress.current, total: e.RuleProgress.total };
         } else if ("SkippedNoPermission" in e) {
           skipped.push(e.SkippedNoPermission.path);
         } else if ("Error" in e) {
           error = e.Error;
         }
       });
-      phase = "results";
     } catch (err) {
-      // 取消也走这里；有内容则停在结果，否则回 idle
-      if (items.length > 0) {
-        phase = "results";
-      } else {
-        phase = "idle";
-        if (error === null) error = String(err);
-      }
+      // 取消也走这里
+      if (error === null && items.length === 0) error = String(err);
     }
+    // 落尾帧 + 以 resolved ScanResult 为权威终值（KTD5：消除流式/终态漂移）。
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = 0;
+    }
+    if (result) {
+      items = result.categories.flatMap((g) =>
+        g.items.map((it) => ({
+          path: it.path,
+          size: it.size,
+          safety: it.safety,
+          category: it.category,
+          impact: it.impact,
+          recovery: it.recovery,
+          selected: it.selected,
+        })),
+      );
+    } else {
+      flush();
+    }
+    setPhase("results");
   }
 
   function cancel() {
@@ -109,326 +139,230 @@
     item.selected = !item.selected;
   }
 
-  function openConfirm() {
+  // ---- 删除：全 Safe 直删；含 Risky 才走 ConfirmDelete（v1 Clean 不触发，保留给未来）----
+  function primaryDelete() {
     if (selectedItems.length === 0) return;
-    confirmItems = selectedItems.map((i) => ({
-      path: i.path,
-      size: i.size,
-      safety: i.safety,
-    }));
+    if (selectedItems.some((i) => i.safety === "Risky")) {
+      confirmItems = selectedItems.map((i) => ({
+        path: i.path,
+        size: i.size,
+        safety: i.safety,
+      }));
+      return;
+    }
+    void doClean(
+      selectedItems.map((i) => i.path),
+      "",
+    );
   }
 
-  async function runClean(token: string) {
-    const paths = (confirmItems ?? []).map((i) => i.path);
+  async function doClean(paths: string[], token: string) {
     confirmItems = null;
     if (paths.length === 0) return;
-    phase = "cleaning";
-    error = null; // 清空上一轮扫描期可能残留的错误横幅（R-review）
-    freed = 0;
-    cleanedCount = 0;
+    error = null;
     cleaningPath = "";
+    setPhase("cleaning");
+    let report: CleanReport | null = null;
     try {
-      await clean(paths, token, (e) => {
+      report = await clean(paths, token, (e) => {
         if (typeof e === "string") return;
-        if ("CleaningFile" in e) {
-          cleaningPath = e.CleaningFile.path;
-        } else if ("CleaningDone" in e) {
-          freed = e.CleaningDone.freed;
-          cleanedCount = e.CleaningDone.count;
-        } else if ("Error" in e) {
-          error = e.Error;
-        }
+        if ("CleaningFile" in e) cleaningPath = e.CleaningFile.path;
+        else if ("Error" in e) error = e.Error;
       });
     } catch (err) {
       error = String(err);
     }
-    phase = "done";
+    if (report) {
+      lastReport = report;
+      // 单实例 toast：诚实「已移到废纸篓」（R11/R13）。
+      if (report.success_count > 0) {
+        toast = nextToast(toast, report.success_count, report.total_freed);
+      }
+    }
+    setPhase("done");
   }
 
-  function reset() {
-    phase = "idle";
-    items = [];
-    error = null;
+  function restoreInFinder() {
+    void openTrash();
   }
+
+  // toast 自动消失（6s）；新一次删除会重置计时（seq 变化触发 effect 重跑）。
+  $effect(() => {
+    const t = toast;
+    if (!t) return;
+    const seq = t.seq;
+    const timer = setTimeout(() => {
+      if (toast?.seq === seq) toast = dismissToast();
+    }, 6000);
+    return () => clearTimeout(timer);
+  });
+
+  onMount(() => {
+    // FDA 已授权后进入 Clean 即给「首屏答案」——自动开扫，稳定外壳内内容填充（F1）。
+    void startScan();
+    return () => {
+      if (rafId) cancelAnimationFrame(rafId);
+    };
+  });
 </script>
 
-<div class="clean">
-  {#if phase === "idle"}
-    <div class="hero">
-      <p>扫描系统与浏览器缓存，安全清理可自动补回的空间。</p>
-      <button class="primary" onclick={startScan}>开始扫描</button>
-    </div>
-  {/if}
-
-  {#if phase === "scanning"}
-    <div class="statusbar">
-      <span class="spinner" aria-hidden="true">⠋</span>
-      <span class="scanning-path" title={currentPath}>{currentPath || "扫描中…"}</span>
-      <span class="running-total">{formatBytes(scannedSize)} · {items.length} 项</span>
-      <button class="danger-ghost" onclick={cancel}>取消</button>
-    </div>
-  {/if}
-
-  {#if error && phase !== "cleaning"}
-    <p class="error" role="alert">扫描出错：{error}</p>
-  {/if}
-
-  {#if (phase === "scanning" || phase === "results") && groups.length > 0}
-    <div class="results">
-      {#each groups as g (g.name)}
-        <section class="group">
-          <header class="group-head">
-            <span class="group-name">{g.name}</span>
-            <span class="group-size">{formatBytes(g.total)}</span>
-          </header>
-          <ul class="rows">
-            {#each g.items as item (item.path)}
-              <li class="row" class:selected={item.selected}>
-                <label class="check">
-                  <input
-                    type="checkbox"
-                    checked={item.selected}
-                    onchange={() => toggle(item)}
-                    aria-label={item.path}
-                  />
-                </label>
-                <Safety safety={item.safety} />
-                <span class="path" title={item.path}>{item.path}</span>
-                <span class="size">{formatBytes(item.size)}</span>
-              </li>
-            {/each}
-          </ul>
-        </section>
-      {/each}
-    </div>
-  {/if}
-
-  {#if phase === "results" && groups.length === 0}
-    <p class="empty">未发现可清理项——系统很干净。</p>
-  {/if}
-
-  {#if phase === "results"}
-    {#if skipped.length > 0}
-      <div class="skipped">
-        <button class="link" onclick={() => (showSkipped = !showSkipped)}>
-          因权限跳过 {skipped.length} 项 {showSkipped ? "▼" : "▶"}
-        </button>
-        {#if showSkipped}
-          <ul class="skipped-list">
-            {#each skipped as p (p)}
-              <li title={p}>{p}</li>
-            {/each}
-          </ul>
-        {/if}
-      </div>
+<Shell>
+  {#snippet summary()}
+    {#if phase === "done" && lastReport}
+      <CleanReceipt report={lastReport} onRestore={restoreInFinder} />
+    {:else}
+      <SummaryHeader {selectedSize} {segments} {scanning} />
+      {#if error}<p class="error" role="alert">出错：{error}</p>{/if}
     {/if}
+  {/snippet}
 
-    <div class="actionbar">
-      <span class="summary">
-        已选 {selectedItems.length} 项 · {formatBytes(selectedSize)}
-      </span>
+  {#snippet list()}
+    {#if phase !== "done"}
+      <StreamingList
+        {items}
+        knownOrder={KNOWN_CATEGORIES}
+        {scanning}
+        onToggle={toggle}
+      />
+      {#if phase === "results" && items.length === 0}
+        <p class="empty">未发现可清理项——系统很干净。</p>
+      {/if}
+      {#if phase === "results" && skipped.length > 0}
+        <div class="skipped">
+          <button class="link" onclick={() => (showSkipped = !showSkipped)}>
+            因权限跳过 {skipped.length} 项 {showSkipped ? "收起" : "展开"}
+          </button>
+          {#if showSkipped}
+            <ul class="skipped-list">
+              {#each skipped as p (p)}
+                <li title={p}>{p}</li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
+      {/if}
+    {/if}
+  {/snippet}
+
+  {#snippet actions()}
+    {#if phase === "scanning"}
+      <div class="scan-actions">
+        <div class="prog" aria-live="polite">
+          {#if scanProg}
+            <span class="prog-text">扫描中 · {scanProg.current}/{scanProg.total}</span>
+            <span class="prog-track" aria-hidden="true">
+              <span
+                class="prog-fill"
+                style="transform: scaleX({scanProg.total > 0
+                  ? scanProg.current / scanProg.total
+                  : 0})"
+              ></span>
+            </span>
+          {:else}
+            <span class="prog-text">扫描中…</span>
+          {/if}
+        </div>
+        <button class="ghost-danger" onclick={cancel}>取消</button>
+      </div>
+    {:else if phase === "cleaning"}
+      <div class="scan-actions">
+        <span class="prog-text mono" title={cleaningPath}>
+          {cleaningPath || "移入废纸篓中…"}
+        </span>
+      </div>
+    {:else if phase === "done"}
+      <div class="btns">
+        <button class="primary" onclick={startScan}>再次扫描</button>
+      </div>
+    {:else}
+      <!-- results / idle -->
       <div class="btns">
         <button onclick={startScan}>重新扫描</button>
         <button
-          class="delete"
+          class="primary delete"
           disabled={selectedItems.length === 0}
-          onclick={openConfirm}
+          onclick={primaryDelete}
         >
-          删除选中
+          移入废纸篓 · 释放 {formatBytes(selectedSize)}
         </button>
       </div>
-    </div>
-  {/if}
+    {/if}
+  {/snippet}
+</Shell>
 
-  {#if phase === "cleaning"}
-    <div class="statusbar">
-      <span class="spinner" aria-hidden="true">⠋</span>
-      <span class="scanning-path" title={cleaningPath}>{cleaningPath || "清理中…"}</span>
-    </div>
-  {/if}
-
-  {#if phase === "done"}
-    <div class="hero">
-      <p class="freed">已释放 <strong>{formatBytes(freed)}</strong>（{cleanedCount} 项，已移入废纸篓）</p>
-      {#if error}<p class="error">{error}</p>{/if}
-      <button class="primary" onclick={reset}>完成</button>
-    </div>
-  {/if}
-</div>
+{#if toast}
+  {#key toast.seq}
+    <UndoToast
+      count={toast.count}
+      freed={toast.freed}
+      onRestore={restoreInFinder}
+      onDismiss={() => (toast = dismissToast())}
+    />
+  {/key}
+{/if}
 
 {#if confirmItems}
   <ConfirmDelete
     items={confirmItems}
-    onConfirm={runClean}
+    onConfirm={(token) => doClean(confirmItems?.map((i) => i.path) ?? [], token)}
     onCancel={() => (confirmItems = null)}
   />
 {/if}
 
 <style>
-  .clean {
-    display: flex;
-    flex-direction: column;
-    height: 100%;
-    min-height: 0;
-  }
-  .hero {
-    margin: auto;
-    text-align: center;
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-4);
-    align-items: center;
-    color: var(--ink-muted);
-  }
   .empty {
     padding: var(--sp-6) 0;
     text-align: center;
     color: var(--ink-muted);
   }
-  .freed {
-    font-size: 1.1rem;
-    color: var(--ink-primary);
-  }
-  .freed strong {
-    color: var(--state-success);
-    font-family: var(--font-mono);
-  }
-  .statusbar {
-    display: flex;
-    align-items: center;
-    gap: var(--sp-3);
-    padding: var(--sp-2) var(--sp-3);
-    background: var(--surface-raised);
-    border-radius: var(--radius);
-    margin-bottom: var(--sp-3);
-  }
-  .spinner {
-    color: var(--state-activity);
-    animation: spin 0.8s steps(10) infinite;
-  }
-  @keyframes spin {
-    to {
-      transform: rotate(360deg);
-    }
-  }
-  .scanning-path {
-    flex: 1 1 auto;
-    font-family: var(--font-mono);
-    font-size: 0.85em;
-    color: var(--ink-muted);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    direction: rtl;
-    text-align: left;
-  }
-  .running-total {
-    font-family: var(--font-mono);
-    color: var(--state-success);
-    flex: 0 0 auto;
-  }
-  .results {
-    flex: 1 1 auto;
-    overflow-y: auto;
-    min-height: 0;
-  }
-  .group {
-    margin-bottom: var(--sp-4);
-  }
-  .group-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    padding: var(--sp-2) var(--sp-1);
-    border-bottom: 1px solid var(--border-subtle);
-    position: sticky;
-    top: 0;
-    background: var(--surface-base);
-  }
-  .group-name {
-    color: var(--accent);
-    font-weight: 600;
-  }
-  .group-size {
-    font-family: var(--font-mono);
-    color: var(--ink-muted);
-  }
-  .rows {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-  }
-  .row {
-    display: flex;
-    align-items: center;
-    gap: var(--sp-3);
-    min-height: var(--row-height);
-    padding: 0 var(--sp-1);
-  }
-  .row:hover {
-    background: var(--surface-raised);
-  }
-  .row.selected {
-    background: color-mix(in oklch, var(--accent) 12%, transparent);
-  }
-  .check {
-    display: flex;
-    flex: 0 0 auto;
-  }
-  .check input {
-    accent-color: var(--accent);
-    width: 15px;
-    height: 15px;
-    cursor: pointer;
-  }
-  .path {
-    flex: 1 1 auto;
-    font-family: var(--font-mono);
-    font-size: 0.85em;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    direction: rtl;
-    text-align: left;
-  }
-  .size {
-    font-family: var(--font-mono);
-    color: var(--ink-muted);
-    flex: 0 0 auto;
-  }
-  .skipped {
-    padding: var(--sp-2) 0;
-    border-top: 1px solid var(--border-subtle);
-  }
-  .skipped-list {
-    list-style: none;
+  .error {
     margin: var(--sp-2) 0 0;
-    padding: 0;
-    max-height: 140px;
-    overflow-y: auto;
+    color: var(--state-danger);
+    font-size: 0.85em;
   }
-  .skipped-list li {
-    font-family: var(--font-mono);
-    font-size: 0.8em;
-    color: var(--ink-muted);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .actionbar {
+  .scan-actions {
     display: flex;
-    justify-content: space-between;
     align-items: center;
     gap: var(--sp-4);
-    padding: var(--sp-3) 0 0;
-    border-top: 1px solid var(--border-subtle);
   }
-  .summary {
+  .prog {
+    flex: 1 1 auto;
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    min-width: 0;
+  }
+  .prog-text {
+    color: var(--ink-muted);
+    font-size: 0.85em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .prog-text.mono {
+    flex: 1 1 auto;
     font-family: var(--font-mono);
-    color: var(--ink-primary);
+  }
+  /* 确定性进度条（RuleProgress 驱动）——取代 braille spinner（R6/R19） */
+  .prog-track {
+    flex: 1 1 auto;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--surface-raised);
+    overflow: hidden;
+  }
+  .prog-fill {
+    display: block;
+    width: 100%;
+    height: 100%;
+    background: var(--accent);
+    transform-origin: left;
+    /* 用 transform 而非 width 做进度过渡：避免布局回流（impeccable 布局物理学） */
+    transition: transform var(--dur-fast) var(--ease-out-quart);
   }
   .btns {
     display: flex;
+    justify-content: flex-end;
     gap: var(--sp-2);
   }
   button {
@@ -451,13 +385,14 @@
   .primary {
     border-color: var(--accent);
     color: var(--accent);
-  }
-  .delete {
-    border-color: var(--state-danger);
-    color: var(--state-danger);
     font-weight: 600;
   }
-  .danger-ghost {
+  /* Clean 全 Safe：主删除按钮不染红（R18：红只跟随 Risky）；用 accent 强调即可 */
+  .delete {
+    font-variant-numeric: tabular-nums;
+  }
+  .ghost-danger {
+    flex: 0 0 auto;
     border-color: var(--state-danger);
     color: var(--state-danger);
     padding: var(--sp-1) var(--sp-3);
@@ -468,12 +403,25 @@
     color: var(--accent);
     padding: 0;
     cursor: pointer;
-    font-family: var(--font-mono);
+    font-family: var(--font-ui);
     font-size: 0.85em;
   }
-  .error {
-    color: var(--state-danger);
+  .skipped {
+    padding: var(--sp-3) 0 0;
+  }
+  .skipped-list {
+    list-style: none;
+    margin: var(--sp-2) 0 0;
+    padding: 0;
+    max-height: 140px;
+    overflow-y: auto;
+  }
+  .skipped-list li {
     font-family: var(--font-mono);
-    font-size: 0.85em;
+    font-size: 0.8em;
+    color: var(--ink-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 </style>

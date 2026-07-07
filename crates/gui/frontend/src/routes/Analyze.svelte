@@ -209,7 +209,6 @@
 
   {#if phase === "analyzing"}
     <div class="statusbar">
-      <span class="spinner" aria-hidden="true">⠋</span>
       <span class="prog">分析中… {fileCount} 个文件 · {formatBytes(totalSize)}</span>
       <button class="danger-ghost" onclick={cancel}>取消</button>
     </div>
@@ -246,7 +245,11 @@
             disabled={!canEnter}
             onclick={() => enter(node)}
             aria-label="进入 {node.name}"
-          >▶</button>
+          >
+            <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true">
+              <path d="M3 2 L7 5 L3 8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
           <span
             class="name"
             class:dir={!node.is_file}
@@ -280,8 +283,7 @@
 
     {#if phase === "deleting"}
       <div class="statusbar deleting">
-        <span class="spinner" aria-hidden="true">⠋</span>
-        <span class="prog" title={deletingPath}>{deletingPath || "删除中…"}</span>
+        <span class="prog" title={deletingPath}>{deletingPath || "移入废纸篓中…"}</span>
       </div>
     {/if}
     {#if error}<p class="error">{error}</p>{/if}
@@ -323,15 +325,6 @@
   }
   .statusbar.deleting {
     margin: var(--sp-3) 0 0;
-  }
-  .spinner {
-    color: var(--state-activity);
-    animation: spin 0.8s steps(10) infinite;
-  }
-  @keyframes spin {
-    to {
-      transform: rotate(360deg);
-    }
   }
   .prog {
     flex: 1 1 auto;
@@ -404,13 +397,16 @@
   }
   .enter {
     flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     background: none;
     border: none;
     color: var(--accent-explore);
     cursor: pointer;
-    font-size: 0.75em;
     padding: 0;
-    width: 1em;
+    width: 16px;
+    height: 16px;
   }
   .enter.invisible {
     visibility: hidden;
