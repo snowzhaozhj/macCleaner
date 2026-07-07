@@ -21,15 +21,10 @@
     scanning?: boolean;
   } = $props();
 
-  // 低饱和分段色（按发现序索引取；刻意避开红系——安全内容不恐吓，R18）。
-  const PALETTE = [
-    "oklch(0.68 0.09 210)", // 冷蓝：系统缓存
-    "oklch(0.72 0.08 160)", // 低饱和绿：浏览器缓存
-    "oklch(0.7 0.07 260)", // 靛
-    "oklch(0.74 0.07 90)", // 暖黄（低饱和，非警示红）
-  ];
+  // 分段色取自 tokens 层（--seg-1..4，唯一色彩事实来源），按发现序索引循环取用。
+  const SEG_COUNT = 4;
   function colorAt(i: number): string {
-    return PALETTE[i % PALETTE.length];
+    return `var(--seg-${(i % SEG_COUNT) + 1})`;
   }
 </script>
 
