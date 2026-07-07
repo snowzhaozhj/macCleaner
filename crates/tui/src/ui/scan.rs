@@ -190,3 +190,58 @@ fn truncate_path(path: &str, max_len: usize) -> String {
     let suffix: String = path.chars().skip(char_count - keep).collect();
     format!("...{suffix}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{AppState, FlatRow};
+    use mc_core::models::{CategoryGroup, SafetyLevel, ScanItem, ScanResult};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::path::PathBuf;
+
+    /// 回归：扫描态应即渲染详情面板（路径/影响/恢复），不必等切 Results 才可见。
+    #[test]
+    fn scanning_renders_detail_panel_for_cursor_item() {
+        let items = vec![ScanItem::new(
+            PathBuf::from("/x/nm"),
+            20,
+            SafetyLevel::Moderate,
+            "c".into(),
+        )
+        .with_evidence("依赖被清空".into(), "npm install".into())];
+        let cat = CategoryGroup::new("c".into(), items);
+        let mut app = App::new();
+        app.scan_result = Some(ScanResult::from_categories(vec![cat]));
+        app.expanded = vec![true];
+        app.state = AppState::Scanning {
+            progress_text: String::new(),
+            rule_current: 0,
+            rule_total: 0,
+            rule_name: String::new(),
+        };
+        // 光标落到 Item 行
+        let rows = app.build_flat_rows();
+        app.result_cursor = rows
+            .iter()
+            .position(|r| matches!(r, FlatRow::Item { .. }))
+            .expect("应有 Item 行");
+
+        let backend = TestBackend::new(90, 44);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        // 去空格归一：TestBackend 用空格填充 CJK 次单元。
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>()
+            .replace(' ', "");
+
+        assert!(text.contains("详情"), "扫描态应渲染详情面板标题");
+        assert!(text.contains("依赖被清空"), "扫描态详情应含光标项 impact");
+        assert!(text.contains("npminstall"), "扫描态详情应含光标项 recovery");
+    }
+}

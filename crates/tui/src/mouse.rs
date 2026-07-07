@@ -149,12 +149,10 @@ fn mouse_click(app: &mut App, term_area: Rect, col: u16, row: u16) {
 
     // Results/Scanning：走 flat_rows + toggle_selection（需整体 &mut app，用 matches! 判分支）。
     if matches!(app.state, AppState::Results | AppState::Scanning { .. }) {
-        // Results 的 body 再分列表+详情；Scanning 用整块 body 作列表（无详情面板）。
-        let list_area = if matches!(app.state, AppState::Results) {
-            crate::ui::results::split_body(body).0
-        } else {
-            body
-        };
+        // Results 与 Scanning 现已同源渲染：body 均再分列表+详情，故命中测试必须用同一
+        // split_body 复算出的 list_area（与渲染同源）——否则详情面板占据的高度会让
+        // 可见行数/滚动窗口错配，点击行→索引映射错位（点详情区还会误标项）。
+        let list_area = crate::ui::results::split_body(body).0;
         let flat_rows = app.build_flat_rows();
         if let Some(idx) = hit_row(list_area, col, row, app.result_cursor, flat_rows.len()) {
             if let Some(fr) = flat_rows.get(idx) {
@@ -214,5 +212,77 @@ fn mouse_click(app: &mut App, term_area: Rect, col: u16, row: u16) {
     };
     if let Some(p) = clicked_path {
         toggle_marked(&mut app.marked, p);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{AppState, FlatRow};
+    use mc_core::models::{CategoryGroup, SafetyLevel, ScanItem, ScanResult};
+    use ratatui::layout::Rect;
+    use std::path::PathBuf;
+
+    const TERM: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 90,
+        height: 44,
+    };
+
+    /// 构造一个含 n 个 Item、单分类展开的 Scanning 态 App。项数取大，保证详情面板区域
+    /// 落在整块 body 内可映射到合法行——否则回归测试会因越界 no-op 而假通过。
+    fn scanning_app(n: usize) -> App {
+        let items = (0..n)
+            .map(|i| {
+                ScanItem::new(
+                    PathBuf::from(format!("/x/nm{i}")),
+                    10,
+                    SafetyLevel::Moderate,
+                    "c".into(),
+                )
+            })
+            .collect();
+        let cat = CategoryGroup::new("c".into(), items);
+        let mut app = App::new();
+        app.scan_result = Some(ScanResult::from_categories(vec![cat]));
+        app.expanded = vec![true];
+        app.state = AppState::Scanning {
+            progress_text: String::new(),
+            rule_current: 0,
+            rule_total: 0,
+            rule_name: String::new(),
+        };
+        app
+    }
+
+    /// 回归：扫描态渲染已切出详情面板，命中测试须与渲染同源（复用 `split_body`）。
+    /// 点击详情面板区域不得被当成列表点击而误标项——修复前用整块 body 会误命中。
+    #[test]
+    fn scanning_click_in_detail_panel_is_noop() {
+        let mut app = scanning_app(50);
+        let body = crate::ui::chrome::three_row_layout(TERM)[1];
+        let (list_area, detail_area) = crate::ui::results::split_body(body);
+        let detail = detail_area.expect("90x44 应切出详情面板");
+        mouse_click(&mut app, TERM, list_area.x + 1, detail.y + 1);
+        assert!(app.marked.is_empty(), "点击详情面板区不应标记任何项");
+        assert_eq!(app.result_cursor, 0, "点击详情面板区不应移动光标");
+    }
+
+    /// 对照：点击列表区的 Item 行仍正常移光标 + 切换标记。
+    #[test]
+    fn scanning_click_in_list_selects_item() {
+        let mut app = scanning_app(50);
+        let body = crate::ui::chrome::three_row_layout(TERM)[1];
+        let (list_area, _) = crate::ui::results::split_body(body);
+        let item_idx = app
+            .build_flat_rows()
+            .iter()
+            .position(|r| matches!(r, FlatRow::Item { .. }))
+            .expect("应有 Item 行");
+        // cursor=0 时 window_start=0；hit_row 排除顶部边框，故行坐标 = list_area.y + 1 + 行索引。
+        mouse_click(&mut app, TERM, list_area.x + 1, list_area.y + 1 + item_idx as u16);
+        assert_eq!(app.result_cursor, item_idx, "点击应把光标移到该 Item 行");
+        assert!(!app.marked.is_empty(), "点击 Item 应切换标记");
     }
 }
