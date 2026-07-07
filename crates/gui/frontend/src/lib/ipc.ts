@@ -122,14 +122,29 @@ export function analyze(
   return invoke<DirNode>("analyze", { root, onEvent: channel });
 }
 
-/** 删除 analyze 中标记的路径（恒移废纸篓）。 */
+/** 一条标记路径的安全分级（后端按规则 evidence_for_path 回查）。 */
+export type PathSafety = { path: string; safety: SafetyLevel };
+
+/**
+ * 为标记路径集回查安全分级（不删除）。前端据此在确认弹窗显示 Risky 三通道，
+ * 并对含 Risky 的删除要求 type-to-confirm（分析器项无规则元数据，须回查，R-review）。
+ */
+export function classifyMarked(paths: string[]): Promise<PathSafety[]> {
+  return invoke<PathSafety[]>("classify_marked", { paths });
+}
+
+/**
+ * 删除 analyze 中标记的路径（恒移废纸篓）。
+ * `confirmToken`：含 Risky 项时须传用户输入的确认口令，后端二次校验（防绕过 type-to-confirm）。
+ */
 export function deleteMarked(
   paths: string[],
+  confirmToken: string,
   onEvent: (e: ProgressEvent) => void,
 ): Promise<CleanReport> {
   const channel = new Channel<ProgressEvent>();
   channel.onmessage = onEvent;
-  return invoke<CleanReport>("delete_marked", { paths, onEvent: channel });
+  return invoke<CleanReport>("delete_marked", { paths, confirmToken, onEvent: channel });
 }
 
 /** 检查完全磁盘访问权限（FDA）。 */

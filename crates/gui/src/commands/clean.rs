@@ -10,16 +10,9 @@ use mc_core::progress::ProgressEvent;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 
+use crate::commands::is_confirmed;
 use crate::reporter::TauriReporter;
 use crate::AppState;
-
-/// type-to-confirm 口令（与前端 `confirm.ts` 的 `CONFIRM_TOKEN` 一致）。
-const CONFIRM_TOKEN: &str = "delete";
-
-/// 校验确认口令（trim + 大小写不敏感，对齐前端 `isConfirmed`）。
-fn is_confirmed(token: &str) -> bool {
-    token.trim().eq_ignore_ascii_case(CONFIRM_TOKEN)
-}
 
 /// 按路径集从扫描结果中挑出待删项（纯函数，便于单测）。
 /// 前端传来用户选中/标记的路径；Risky 项须经 type-to-confirm（U8）后才会出现在此集合中。

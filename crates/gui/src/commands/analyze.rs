@@ -8,10 +8,13 @@ use std::sync::atomic::Ordering;
 use mc_core::engine::Engine;
 use mc_core::models::{CleanReport, DeleteMode, DirNode, SafetyLevel, ScanItem};
 use mc_core::progress::{AnalyzeEvent, ProgressEvent};
+use mc_core::rules::evidence_for_path;
 use mc_core::{analyze_walk, IncrementalTreeBuilder};
+use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 
+use crate::commands::is_confirmed;
 use crate::reporter::TauriReporter;
 use crate::AppState;
 
@@ -38,8 +41,15 @@ fn collect_marked<H: std::hash::BuildHasher>(
     }
 }
 
-/// 从树 + 标记集构造待删 `ScanItem`（analyze 无规则来源，安全等级取 `Safe`、空分类——
-/// 与 TUI 一致；Risky 门槛在 UI 层的 type-to-confirm，删除去向恒为废纸篓）。纯函数便于单测。
+/// 分析器项来自 `DirNode`、无规则元数据：按路径回查规则证据（`evidence_for_path`）推断安全等级，
+/// 使 Risky 路径（Docker 卷/Xcode Archives/AVD 等）经分析器删除时也带 Risky、能触发 type-to-confirm；
+/// 未命中任何规则的普通路径默认 `Safe`（对齐 TUI `analyzer_ops` 的 KTD8 语义，R-review codex-P1）。
+fn safety_for(path: &Path) -> SafetyLevel {
+    evidence_for_path(path).map_or(SafetyLevel::Safe, |(safety, ..)| safety)
+}
+
+/// 从树 + 标记集构造待删 `ScanItem`。安全等级按路径回查规则（见 `safety_for`），删除去向恒废纸篓。
+/// 纯函数便于单测。
 pub fn marked_items<H: std::hash::BuildHasher>(
     tree: &DirNode,
     marked: &HashSet<PathBuf, H>,
@@ -48,7 +58,30 @@ pub fn marked_items<H: std::hash::BuildHasher>(
     collect_marked(tree, marked, &mut pairs);
     pairs
         .into_iter()
-        .map(|(path, size)| ScanItem::new(path, size, SafetyLevel::Safe, String::new()))
+        .map(|(path, size)| {
+            let safety = safety_for(&path);
+            ScanItem::new(path, size, safety, String::new())
+        })
+        .collect()
+}
+
+/// 一条标记路径的安全分级（供前端在打开确认弹窗前渲染三通道 + 决定是否要 type-to-confirm）。
+#[derive(Debug, Serialize)]
+pub struct PathSafety {
+    pub path: PathBuf,
+    pub safety: SafetyLevel,
+}
+
+/// 为前端标记的路径集回查安全等级（不触碰磁盘、无删除）。前端据此在 `ConfirmDelete`
+/// 显示 Risky 三通道并对含 Risky 的删除要求输入确认口令（R-review codex-P1）。
+#[tauri::command]
+pub async fn classify_marked(paths: Vec<PathBuf>) -> Vec<PathSafety> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let safety = safety_for(&path);
+            PathSafety { path, safety }
+        })
         .collect()
 }
 
@@ -103,10 +136,14 @@ pub async fn analyze(
 
 /// 移废纸篓删除被标记的目录/文件（恒用 `DeleteMode::Trash`，R7/AE3）。
 /// 待删项从上次分析树按标记路径收集，删除后前端据 `CleaningDone.deleted_paths` 原地剪树。
+///
+/// `confirm_token`：与 `clean` 同——若标记项含 Risky（经 `evidence_for_path` 回查，如 Docker 卷、
+/// Xcode Archives），须携带有效确认口令方可删，防分析器绕过 type-to-confirm（R-review codex-P1）。
 #[tauri::command]
 pub async fn delete_marked(
     app: AppHandle,
     paths: Vec<PathBuf>,
+    confirm_token: String,
     on_event: Channel<ProgressEvent>,
 ) -> Result<CleanReport, String> {
     let (cancelled, last_analyze) = {
@@ -122,6 +159,10 @@ pub async fn delete_marked(
             let tree = guard.as_ref().ok_or_else(|| "无分析结果可删除".to_string())?;
             marked_items(tree, &marked)
         };
+        // 后端闸：含 Risky 必须有有效确认口令（防分析器绕过前端 type-to-confirm）。
+        if items.iter().any(|i| i.safety == SafetyLevel::Risky) && !is_confirmed(&confirm_token) {
+            return Err("含危险项，需输入确认口令方可删除".to_string());
+        }
         let refs: Vec<&ScanItem> = items.iter().collect();
         let reporter = TauriReporter::new(on_event, cancelled);
         Engine::clean(&refs, DeleteMode::Trash, &reporter).map_err(|e| format!("删除失败: {e}"))
@@ -157,7 +198,22 @@ mod tests {
         assert_eq!(items.len(), 1, "标记目录整体收集，不下探其子");
         assert_eq!(items[0].path, PathBuf::from("/r/big"));
         assert_eq!(items[0].size, 500);
-        assert_eq!(items[0].safety, SafetyLevel::Safe, "analyze 项取 Safe");
+        // /r/big 不匹配任何规则 → evidence_for_path 返回 None → 默认 Safe。
+        assert_eq!(items[0].safety, SafetyLevel::Safe, "未命中规则的普通路径默认 Safe");
+    }
+
+    #[test]
+    fn marked_risky_path_classified_from_rules() {
+        // 命中 Risky 规则的路径（如 Xcode Archives）经 evidence_for_path 回查应为 Risky，
+        // 而非一律 Safe——这是分析器删除也能触发 type-to-confirm 的前提（R-review codex-P1）。
+        let archives =
+            mc_core::platform::get_home_dir().join("Library/Developer/Xcode/Archives");
+        let mut root = DirNode::new_dir(archives.clone(), "Archives".into());
+        root.size = 1000;
+        let marked: HashSet<PathBuf> = [archives.clone()].into_iter().collect();
+        let items = marked_items(&root, &marked);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].safety, SafetyLevel::Risky, "Xcode Archives 应回查为 Risky");
     }
 
     #[test]

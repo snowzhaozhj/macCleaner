@@ -1,6 +1,7 @@
 <script lang="ts">
   import {
     analyze,
+    classifyMarked,
     deleteMarked,
     cancelScan,
     userHome,
@@ -111,9 +112,25 @@
     marked = next;
   }
 
-  function openConfirm() {
+  async function openConfirm() {
     if (marked.size === 0) return;
-    confirmItems = markedItems.map((i) => ({ path: i.path, size: i.size }));
+    // 分析器项无规则元数据：打开确认弹窗前按路径回查安全分级，让 Risky 路径
+    // （Docker 卷/Xcode Archives 等）在弹窗显示危险三通道并触发 type-to-confirm（R-review codex-P1）。
+    const items = markedItems;
+    let safetyByPath = new Map<string, "Safe" | "Moderate" | "Risky">();
+    try {
+      const classified = await classifyMarked(items.map((i) => i.path));
+      safetyByPath = new Map(classified.map((c) => [c.path, c.safety]));
+    } catch (err) {
+      // 回查失败降级：保守地把全部项按 Risky 呈现（强制 type-to-confirm），不静默放行。
+      error = `安全分级查询失败：${String(err)}`;
+      for (const i of items) safetyByPath.set(i.path, "Risky");
+    }
+    confirmItems = items.map((i) => ({
+      path: i.path,
+      size: i.size,
+      safety: safetyByPath.get(i.path) ?? "Safe",
+    }));
   }
 
   // 原地剪树：移除 deleted 路径的节点并沿链回减各祖先 size（不重新 analyze）
@@ -135,7 +152,7 @@
     return removed;
   }
 
-  async function runDelete() {
+  async function runDelete(token: string) {
     const paths = (confirmItems ?? []).map((i) => i.path);
     confirmItems = null;
     if (paths.length === 0) return;
@@ -144,7 +161,7 @@
     deletingPath = "";
     let deleted: string[] = [];
     try {
-      await deleteMarked(paths, (e) => {
+      await deleteMarked(paths, token, (e) => {
         if (typeof e === "string") return;
         if ("CleaningFile" in e) {
           deletingPath = e.CleaningFile.path;

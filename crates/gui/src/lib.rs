@@ -64,6 +64,7 @@ pub fn run() {
             commands::clean::clean,
             commands::clean::cancel_scan,
             commands::analyze::analyze,
+            commands::analyze::classify_marked,
             commands::analyze::delete_marked,
             commands::permission::check_fda,
             commands::permission::open_fda_settings,
