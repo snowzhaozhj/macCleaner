@@ -47,6 +47,21 @@
 
   --row-height: 28px;
   --radius: 6px;
+
+  /*
+   * 动效轴（U3 / R19）——动效只传达状态：填充/展开/一次 FLIP settle/toast 进出。
+   * 时长锁在 150–250ms ease-out；无入场编排、无 count-up、无 spinner。
+   * reduced-motion 由本文件底部统一瞬切。
+   */
+  --dur-fast: 150ms;
+  --dur-base: 200ms;
+  --dur-settle: 250ms; /* 完成时体积降序一次 FLIP 上限 */
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+
+  /* 层级阴影（浮层/toast/卡片的物理深度，低调不喧宾） */
+  --elevation-1: 0 1px 2px rgb(0 0 0 / 0.25);
+  --elevation-2: 0 4px 12px rgb(0 0 0 / 0.35);
+  --elevation-3: 0 12px 40px rgb(0 0 0 / 0.5);
 }
 
 * {
