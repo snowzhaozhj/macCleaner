@@ -258,7 +258,7 @@ sequenceDiagram
 
 ## Verification Contract
 
-- **前端构建：** `crates/gui/frontend` 构建通过（`npm run build` 或项目脚本）。
+- **前端构建：** `crates/gui/frontend` 构建通过（`pnpm build` 或项目脚本）。
 - **单测（vitest）：** 现有 `confirm.test.ts`/`format.test.ts`/`safety.test.ts` 通过；新增覆盖 StreamingList 合并/批处理、format 分段与回执聚合、undo toast 单实例逻辑。
 - **后端（仅当 U5 加 `open_trash`）：** `cargo build -p mc-gui` + `cargo clippy` 通过（分支/worktree）。
 - **手动烟测（关键——防跳变本质是视觉）：** 录屏一次完整 Clean 扫描，逐帧核对无行增删/无位置跳变、相位切换无整体重排；默认态数字==按钮量；删除→诚实 toast→"在访达中恢复"能在废纸篓看到文件；每项证据文案默认可见；reduced-motion 下过渡瞬切、无 spinner。
