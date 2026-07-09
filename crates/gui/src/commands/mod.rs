@@ -3,6 +3,7 @@
 pub mod analyze;
 pub mod clean;
 pub mod permission;
+pub mod trash;
 
 /// type-to-confirm 口令（与前端 `confirm.ts` 的 `CONFIRM_TOKEN` 一致）。
 pub(crate) const CONFIRM_TOKEN: &str = "delete";

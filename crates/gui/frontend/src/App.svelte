@@ -53,7 +53,6 @@
   <main class="content">
     {#if boot === "checking"}
       <div class="checking">
-        <span class="spinner" aria-hidden="true">⠋</span>
         <span>检查磁盘访问权限…</span>
       </div>
     {:else if boot === "onboarding"}
@@ -148,15 +147,6 @@
     align-items: center;
     gap: var(--sp-3);
     color: var(--ink-muted);
-  }
-  .spinner {
-    color: var(--state-activity);
-    animation: spin 0.8s steps(10) infinite;
-  }
-  @keyframes spin {
-    to {
-      transform: rotate(360deg);
-    }
   }
   .statusbar {
     display: flex;

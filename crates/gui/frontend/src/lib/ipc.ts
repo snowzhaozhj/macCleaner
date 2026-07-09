@@ -157,6 +157,11 @@ export function openFdaSettings(): Promise<void> {
   return invoke("open_fda_settings");
 }
 
+/** 在 Finder 中打开系统废纸篓（U5「在访达中恢复」——用 Finder 原生「放回原处」恢复）。 */
+export function openTrash(): Promise<void> {
+  return invoke("open_trash");
+}
+
 /** 用户主目录（Analyze MVP 默认根）。 */
 export function userHome(): Promise<string> {
   return homeDir();

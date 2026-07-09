@@ -8,14 +8,19 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "e2e:install": "playwright install chromium",
+    "e2e": "playwright test",
+    "selftest": "pnpm check && pnpm build && pnpm test && pnpm e2e:install && pnpm e2e"
   },
   "dependencies": {
     "@tauri-apps/api": "^2"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@sveltejs/vite-plugin-svelte": "^5",
     "@tsconfig/svelte": "^5",
+    "@types/node": "^26.1.0",
     "svelte": "^5",
     "svelte-check": "^4",
     "typescript": "^5",
