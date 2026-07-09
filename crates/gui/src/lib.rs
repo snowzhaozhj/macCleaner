@@ -69,6 +69,7 @@ pub fn run() {
             commands::permission::check_fda,
             commands::permission::open_fda_settings,
             commands::trash::open_trash,
+            commands::reveal::reveal_in_finder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -163,6 +163,7 @@ export function defaultHandlers(): Handlers {
     cancel_scan: { result: null },
     open_trash: { result: null },
     open_fda_settings: { result: null },
+    reveal_in_finder: { result: null },
     "plugin:path|resolve_directory": { result: FAKE_HOME },
   };
 }
