@@ -218,7 +218,7 @@
     {#if phase === "done" && lastReport}
       <CleanReceipt report={lastReport} onRestore={restoreInFinder} />
     {:else}
-      <SummaryHeader {selectedSize} {segments} {scanning} />
+      <SummaryHeader amount={selectedSize} {segments} {scanning} />
       <!-- 扫描期不在摘要区显示错误横幅：其高度变化会推动列表位移（防跳变）；错误在完成后呈现 -->
       {#if error && !scanning}<p class="error" role="alert">出错：{error}</p>{/if}
     {/if}

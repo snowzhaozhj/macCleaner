@@ -1,10 +1,11 @@
 <script lang="ts">
   /**
-   * 首屏摘要（U4 / R7 R8 R10 / R17 R18）。
+   * 首屏摘要（U4 / R7 R8 R10 / R17 R18）。两个后端共用同一呈现语言：
+   *  - Clean：`lead`="可安全释放"，`amount`=当前已选总和（全 Safe＝全部），与主按钮量恒等（R10）。
+   *  - Analyze：`lead`="占用"，`amount`=当前导航层总占用，`segments`=该层 top 消费者（move 5）。
    *
-   * 一句话答案「可安全释放 X」——主数字来自当前已选总和（v1 Clean 全 Safe＝全部），
-   * 与操作区主按钮量恒等（R10）。扫描累加时数字随 $derived 增长；完成后 UI 不做 count-up
-   * 动画（R19：仅绑定值，不补间），故「定格无 count-up」天然成立。
+   * 扫描/累加时数字随 $derived 增长；完成后 UI 不做 count-up 动画（R19：仅绑定值，不补间），
+   * 故「定格无 count-up」天然成立。
    *
    * macOS 储存空间式静态分段横条：低饱和分类色 + 图例带精确值；Safe 段绝不用红系（R18）。
    * 数字用等宽 tabular-nums，强调靠 weight 而非 display 尺寸（R17 字阶 ≤3 级）。
@@ -12,12 +13,14 @@
   import { formatBytes, type Segment } from "./format";
 
   let {
-    selectedSize,
+    amount,
     segments,
+    lead = "可安全释放",
     scanning = false,
   }: {
-    selectedSize: number;
+    amount: number;
     segments: Segment[];
+    lead?: string;
     scanning?: boolean;
   } = $props();
 
@@ -30,8 +33,8 @@
 
 <header class="summary">
   <p class="headline">
-    <span class="lead">可安全释放</span>
-    <span class="amount">{formatBytes(selectedSize)}</span>
+    <span class="lead">{lead}</span>
+    <span class="amount">{formatBytes(amount)}</span>
     {#if scanning}<span class="scanning-tag">扫描中…</span>{/if}
   </p>
 
