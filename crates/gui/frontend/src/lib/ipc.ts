@@ -162,6 +162,14 @@ export function openTrash(): Promise<void> {
   return invoke("open_trash");
 }
 
+/**
+ * 在 Finder 中定位并选中某路径（move 6 审查面孔）。只读揭示，不删除/移动。
+ * 后端 `open -R`；路径不存在会 reject（前端据此优雅提示，不静默）。
+ */
+export function revealInFinder(path: string): Promise<void> {
+  return invoke("reveal_in_finder", { path });
+}
+
 /** 用户主目录（Analyze MVP 默认根）。 */
 export function userHome(): Promise<string> {
   return homeDir();

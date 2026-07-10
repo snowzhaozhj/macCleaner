@@ -160,3 +160,37 @@ test("每个删除都携带 onEvent 通道（流式回执前置）", async ({ pa
   expect(calls.length).toBe(1);
   expect(calls[0].args.onEvent).toBe("[Channel]");
 });
+
+test("move 6 展开审查面孔：完整路径 + 命令行等价 mc clean + 在 Finder 中显示触发 reveal_in_finder", async ({
+  page,
+}) => {
+  const target = "/Library/Caches/deep/nested/file.bin";
+  const items = [
+    scanItem(target, 5 * MB, { category: "系统缓存" }),
+    scanItem("/Library/Caches/b", 3 * MB, { category: "系统缓存" }),
+  ];
+  await installTauriMock(page, {
+    ...defaultHandlers(),
+    scan_clean: { events: scanStream(items), result: scanResult(items) },
+  });
+  await page.goto("/");
+
+  // 命令行等价出口：一次呈现、诚实标注（现存真实命令，不假造 --only）。
+  await expect(page.getByText("命令行等价")).toBeVisible();
+  await expect(page.getByText("mc clean", { exact: true })).toBeVisible();
+
+  // 折叠→展开：点分类头进入审查面孔。
+  await page.getByRole("button", { name: /系统缓存/ }).click();
+
+  // 审查面孔：完整路径可见（不截断）。
+  await expect(page.getByText(target, { exact: true })).toBeVisible();
+
+  // 「在 Finder 中显示」触发 reveal_in_finder，携带该项完整路径。
+  await page
+    .getByRole("button", { name: "在 Finder 中显示" })
+    .first()
+    .click();
+  const call = await lastCall(page, "reveal_in_finder");
+  expect(call?.args.path).toBe(target);
+});
+
