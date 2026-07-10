@@ -71,7 +71,7 @@ Decomposition skipped — surprise-me mode
 
 ### 6. Analyze 归因 + 大文件只读增强（重复文件视图最后做，永不预选） — [追平]
 **Description:** 复用增量树+置换底座+统一标记集管线：①归因（root_markers/规则反查大目录所有者；未识别大目录一键起草规则草稿喂 #2）②大文件只读视图 ③重复文件视图（**最后做**，内容哈希分组+字节级二次校验+**永不预选**+每副本独立身份键，不做独立 czkawka-clone）。**不喊"空间洞察平台"**（Codex：过度包装，且都是追平 Mole）。
-**Basis:** `direct:` AnalyzeEvent+IncrementalTreeBuilder 已抽象可复用(lib.rs:527/tree_builder.rs)；Analyzer 未命中规则路径当前默认 Safe(lib.rs:1329)——扩展到重复/大文件后未知用户文件**不能默认 Safe/选中** · `external:` Mole 已有 disk insights/large files/treemap（追平）；重复文件已被 czkawka/fclones 做透。
+**Basis:** `direct:` AnalyzeEvent+IncrementalTreeBuilder 已抽象可复用(lib.rs:527/tree_builder.rs)；Analyzer 未命中规则路径曾默认 Safe(lib.rs:1329)，该安全债已于 2026-07-10 修复为“仅信内置规则、未知路径 Risky + type-to-confirm”——扩展到重复/大文件时继续保持未知用户文件**不能默认 Safe/选中** · `external:` Mole 已有 disk insights/large files/treemap（追平）；重复文件已被 czkawka/fclones 做透。
 **Rationale:** 复用现有底座边际成本低；未识别大目录是 #2 规则库的天然线索来源。
 **Downsides:** 归因准确度依赖规则覆盖；重复文件是安全雷区（硬链接/APFS clone/Photos库/包内容/同步盘）。
 **Confidence:** 70% · **Complexity:** Med(归因/大文件)/High(重复文件) · **Status:** Unexplored

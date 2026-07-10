@@ -15,6 +15,7 @@ use mc_core::models::DirNode;
 use mc_core::progress::AnalyzeEvent;
 
 use crate::app::{self, App, AppState};
+use crate::delete::analyzer_confirm_items;
 use mc_core::IncrementalTreeBuilder;
 use crate::progress::cancel_analyze_to_menu;
 use crate::{resolve_nav_node, toggle_marked, PAGE_STEP};
@@ -222,29 +223,10 @@ pub(crate) fn handle_analyzer_key(app: &mut App, key: KeyCode, modifiers: KeyMod
                 let mut list = Vec::new();
                 collect_marked(tree_root, &app.marked, &mut list);
                 if !list.is_empty() {
-                    // 分析器项来自 DirNode，无规则元数据：按路径回查规则证据（evidence_for_path），
+                    // 分析器项来自 DirNode，无规则元数据：按路径回查规则证据，
                     // 使 Risky 路径（Docker 卷/Xcode Archives 等）经分析器删除时也触发 type-to-confirm；
-                    // 未命中任何规则的普通路径默认 Safe、空证据（KTD8）。
-                    let items = list
-                        .into_iter()
-                        .map(|(path, size)| {
-                            let (safety, impact, recovery) =
-                                mc_core::rules::evidence_for_path(&path).unwrap_or((
-                                    mc_core::models::SafetyLevel::Safe,
-                                    String::new(),
-                                    String::new(),
-                                ));
-                            crate::app::ConfirmItem {
-                                path,
-                                size,
-                                safety,
-                                category: String::new(),
-                                impact,
-                                recovery,
-                            }
-                        })
-                        .collect();
-                    app.confirm_delete = Some(items);
+                    // 未命中规则的路径可能是用户数据，同样按 Risky 进入强确认。
+                    app.confirm_delete = Some(analyzer_confirm_items(&list));
                     app.confirm_scroll = 0;
                 }
             }
@@ -356,30 +338,31 @@ pub(crate) fn handle_analyzer_live_key(
                 let mut list = Vec::new();
                 collect_marked(tree_root, &app.marked, &mut list);
                 if !list.is_empty() {
-                    let items = list
-                        .into_iter()
-                        .map(|(path, size)| {
-                            let (safety, impact, recovery) =
-                                mc_core::rules::evidence_for_path(&path).unwrap_or((
-                                    mc_core::models::SafetyLevel::Safe,
-                                    String::new(),
-                                    String::new(),
-                                ));
-                            crate::app::ConfirmItem {
-                                path,
-                                size,
-                                safety,
-                                category: String::new(),
-                                impact,
-                                recovery,
-                            }
-                        })
-                        .collect();
-                    app.confirm_delete = Some(items);
+                    app.confirm_delete = Some(analyzer_confirm_items(&list));
                     app.confirm_scroll = 0;
                 }
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::delete::analyzer_confirm_items;
+    use mc_core::models::SafetyLevel;
+    use std::path::PathBuf;
+
+    #[test]
+    fn unknown_analyzer_path_requires_risky_confirmation_with_evidence() {
+        let path = PathBuf::from("/unknown-user-data/notes.txt");
+        let items = analyzer_confirm_items(&[(path.clone(), 42)]);
+
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.path, path);
+        assert_eq!(item.safety, SafetyLevel::Risky);
+        assert!(!item.impact.trim().is_empty(), "未知路径必须说明删除影响");
+        assert!(!item.recovery.trim().is_empty(), "未知路径必须说明恢复方式");
     }
 }

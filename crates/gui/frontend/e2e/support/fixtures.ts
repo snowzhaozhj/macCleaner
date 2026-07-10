@@ -139,9 +139,26 @@ export function fdaUnauthorized(): FdaStatus {
   };
 }
 
-export function pathSafety(paths: string[], risky: string[] = []): PathSafety[] {
+export function pathSafety(
+  paths: string[],
+  risky: string[] = [],
+  evidenceByPath: Record<string, Pick<PathSafety, "impact" | "recovery">> = {},
+): PathSafety[] {
   const riskySet = new Set(risky);
-  return paths.map((path) => ({ path, safety: (riskySet.has(path) ? "Risky" : "Safe") as SafetyLevel }));
+  return paths.map((path) => {
+    const safety = (riskySet.has(path) ? "Risky" : "Safe") as SafetyLevel;
+    const fallback =
+      safety === "Risky"
+        ? {
+            impact: "归档含已发布 App 的 dSYM，删除后无法再符号化线上崩溃日志",
+            recovery: "不可恢复（除非保留了对应构建的 dSYM 备份）",
+          }
+        : {
+            impact: "应用缓存被清空，下次使用时自动重建",
+            recovery: "无需操作，应用会按需自动重新生成",
+          };
+    return { path, safety, ...(evidenceByPath[path] ?? fallback) };
+  });
 }
 
 const FAKE_HOME = "/Users/tester";

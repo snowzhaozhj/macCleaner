@@ -8,6 +8,7 @@
     openTrash,
     userHome,
     type DirNode,
+    type PathSafety,
   } from "../lib/ipc";
   import { formatBytes, dirSegments } from "../lib/format";
   import { withViewTransition } from "../lib/transition";
@@ -142,23 +143,35 @@
 
   async function openConfirm() {
     if (marked.size === 0) return;
-    // 分析器项无规则元数据：打开确认弹窗前按路径回查安全分级，让 Risky 路径
-    // （Docker 卷/Xcode Archives 等）在弹窗显示危险三通道并触发 type-to-confirm（R9）。
+    // 分析器项无规则元数据：打开确认弹窗前按路径回查安全分级与证据。未匹配规则的
+    // 用户文档也会保守归为 Risky，避免任意路径绕过 type-to-confirm。
     const items = markedItems;
-    let safetyByPath = new Map<string, "Safe" | "Moderate" | "Risky">();
+    const fallback: Omit<PathSafety, "path"> = {
+      safety: "Risky",
+      impact: "无法确认此路径是否可安全删除，可能包含不可再生的用户数据或应用状态",
+      recovery: "请先核对路径内容；若仍在废纸篓，可移回原处",
+    };
+    let evidenceByPath = new Map<string, Omit<PathSafety, "path">>();
     try {
       const classified = await classifyMarked(items.map((i) => i.path));
-      safetyByPath = new Map(classified.map((c) => [c.path, c.safety]));
+      evidenceByPath = new Map(
+        classified.map(({ path, ...evidence }) => [path, evidence]),
+      );
     } catch (err) {
       // 回查失败降级：保守地把全部项按 Risky 呈现（强制 type-to-confirm），不静默放行。
       error = `安全分级查询失败：${String(err)}`;
-      for (const i of items) safetyByPath.set(i.path, "Risky");
     }
-    confirmItems = items.map((i) => ({
-      path: i.path,
-      size: i.size,
-      safety: safetyByPath.get(i.path) ?? "Safe",
-    }));
+    confirmItems = items.map((i) => {
+      // 后端漏回某条路径时同样不能默认 Safe；用本地保守证据兜底。
+      const evidence = evidenceByPath.get(i.path) ?? fallback;
+      return {
+        path: i.path,
+        size: i.size,
+        safety: evidence.safety,
+        impact: evidence.impact,
+        recovery: evidence.recovery,
+      };
+    });
   }
 
   // 原地剪树：移除 deleted 路径的节点并沿链回减各祖先 size（不重新 analyze）
@@ -181,7 +194,11 @@
   }
 
   async function runDelete(token: string) {
-    const paths = (confirmItems ?? []).map((i) => i.path);
+    const confirmed = confirmItems ?? [];
+    const paths = confirmed.map((i) => i.path);
+    const confirmedRiskyPaths = confirmed
+      .filter((i) => i.safety === "Risky")
+      .map((i) => i.path);
     confirmItems = null;
     if (paths.length === 0) return;
     error = null; // 清空上一轮分析期可能残留的错误横幅
@@ -190,7 +207,7 @@
     let deleted: string[] = [];
     let freed = 0;
     try {
-      await deleteMarked(paths, token, (e) => {
+      await deleteMarked(paths, token, confirmedRiskyPaths, (e) => {
         if (typeof e === "string") return;
         if ("CleaningFile" in e) {
           deletingPath = e.CleaningFile.path;
