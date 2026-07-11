@@ -25,6 +25,9 @@ macCleaner 对外暴露四个顶层命令，互为对照——前三个按规则
 ### SafetyLevel（安全等级）
 对每个可删项按**两条判据串联**分级（非单轴）：先问"会不会丢不可再生数据/有价值状态"（会 → Risky，如 Docker 命名卷、Xcode Archives 的 dSYM、装好环境的 AVD）；不丢的再问"重建是否需用户主动发起且有明显耗时/打断"——需要 → Moderate（如 node_modules、target、DerivedData 冷编译），自动透明补回 → Safe（如共享/下载缓存、IDE 索引）。Safe 与 Moderate 都是零数据丢失，把它俩分开的正是这条**重建摩擦**轴；每项的具体代价再由证据文案（impact/recovery）细化。该等级驱动界面配色与形状标记（●/▲/✕）。**默认预选与等级解耦**：预选 = `safety != Risky && rule.preselect`——Safe/Moderate 默认勾选，Risky 默认不勾且删除时需 type-to-confirm；个别规则（如 `dist/build`）虽为 Moderate 但设 `preselect = false` 而不默认勾选。评级依据成文 rubric，见 `crates/core/src/models.rs` 的 `SafetyLevel` 文档注释与 `docs/brainstorms/2026-07-05-cleanup-safety-model-requirements.md`。
 
+### Analyze 未知路径（fail-closed）
+Analyze 不按清理规则筛选，用户可标记任意文件或目录；因此 `evidence_for_path(path) == None` 只表示“没有规则证据”，**不表示 Safe**。Analyze 发起删除时统一走 `deletion_evidence_for_path(s)`：仅信任随二进制审计、测试过的内置规则，用户叠加规则不能把任意路径降为 Safe/Moderate；未知路径保守归为 Risky、展示通用数据丢失与废纸篓恢复边界，并强制 type-to-confirm。多条规则同时命中时以最高风险优先、同级取最具体规则；`DirName` 还必须命中真实目录并满足 `root_markers`，不能仅凭文件名降低风险。GUI 与 TUI 必须消费这同一个核心分类入口，禁止各自设置本地 Safe fallback；真正启动删除前还要再次分类，且口令只授权确认框当时已展示为 Risky 的具体路径——任何后来升级的路径都必须先展示新证据并重新确认。
+
 ## 选择与删除 (Selection & Deletion)
 
 ### 统一标记集（Marked）

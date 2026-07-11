@@ -98,6 +98,28 @@ enum SelectResult {
     Timeout,
 }
 
+/// 消费后台 finalize 的稳定树，并在需要时继续执行 live Analyze 暂存的删除请求。
+/// 抽成单一转换点后，状态恢复与执行前风险复核可在不启动终端事件循环的情况下回归测试。
+fn finish_sorting(app: &mut App, sorted_tree: DirNode, events: &EventHandler) {
+    if let AppState::Sorting = std::mem::replace(&mut app.state, AppState::Menu) {
+        // finalize() 重排了 children，实时态的 discovery-order 索引已失效，故导航重置为根。
+        app.state = AppState::Analyzing {
+            tree_root: Arc::new(sorted_tree),
+            nav_path: Vec::new(),
+            cursor: 0,
+            cursor_stack: Vec::new(),
+        };
+        if let Some(pending) = app.pending_analyzer_delete.take() {
+            delete::start_cleaning_from_analyzer(
+                app,
+                pending.items,
+                &pending.confirmed_risky_paths,
+                events,
+            );
+        }
+    }
+}
+
 fn run_app(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<BufWriter<io::Stdout>>>,
 ) -> Result<()> {
@@ -218,25 +240,7 @@ fn run_app(
                 },
                 SelectResult::SortDone(result) => {
                     if let Ok(sorted_tree) = result {
-                        if let AppState::Sorting =
-                            std::mem::replace(&mut app.state, AppState::Menu)
-                        {
-                            // finalize() 重排了 children，实时态的 discovery-order 索引已失效，
-                            // 故 nav_path/cursor 重置为根；cursor_stack 同步清空以维持
-                            // cursor_stack.len()==nav_path.len() 不变式（审查 F-low）。
-                            app.state = AppState::Analyzing {
-                                tree_root: Arc::new(sorted_tree),
-                                nav_path: Vec::new(),
-                                cursor: 0,
-                                cursor_stack: Vec::new(),
-                            };
-                            // live 删除的收尾（KTD1）：本次 finalize 是为删除而来（暂存非空），
-                            // 树已稳定，此刻在稳定的 Analyzing 态上执行删除，走既有剪枝恢复路径。
-                            if !app.pending_analyzer_delete.is_empty() {
-                                let items = std::mem::take(&mut app.pending_analyzer_delete);
-                                delete::start_cleaning_from_analyzer(&mut app, items, &events);
-                            }
-                        }
+                        finish_sorting(&mut app, sorted_tree, &events);
                     } else {
                         // 排序线程 panic — 彻底清态回菜单（back_to_menu 一并清 marked/pending，
                         // 避免 live 标记漏到下个命令；树已丢失，无从安全剪枝）。
@@ -583,7 +587,7 @@ pub(crate) fn resolve_nav_node<'a>(root: &'a DirNode, nav_path: &[usize]) -> &'a
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_key, CONFIRM_TOKEN};
+    use super::{finish_sorting, handle_key, CONFIRM_TOKEN};
     use crate::analyzer_ops::collect_marked;
     use crate::app::{App, ConfirmItem};
     use crate::event::EventHandler;
@@ -937,6 +941,7 @@ mod tests {
         app.marked.insert(PathBuf::from("/r/big"));
         press(&mut app, KeyCode::Char('x'));
         assert!(app.confirm_delete.is_some(), "有标记按 x 应弹确认");
+        assert!(app.confirm_has_risky(), "未命中规则的任意路径必须按 Risky 强确认");
     }
 
     #[test]
@@ -947,16 +952,81 @@ mod tests {
     }
 
     #[test]
+    fn live_risky_token_authorization_survives_finalize() {
+        use super::AppState;
+        let path = PathBuf::from("/r/unknown-user-data");
+        let mut app = live_app(vec![DirNode::new_file(path.clone(), "unknown".into(), 100)]);
+        app.marked.insert(path.clone());
+        press(&mut app, KeyCode::Char('x'));
+        for c in CONFIRM_TOKEN.chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+
+        assert!(matches!(app.state, AppState::Sorting), "Risky 授权后应先进入 Sorting");
+        assert!(
+            app.pending_analyzer_delete
+                .as_ref()
+                .is_some_and(|pending| pending.confirmed_risky_paths.contains(&path)),
+            "type-to-confirm 授权必须按路径跨 finalize 保留"
+        );
+    }
+
+    #[test]
     fn live_delete_confirm_finalizes_before_deleting() {
         // U5/KTD1：live 删除确认 → 暂存待删清单 + 转 Sorting（先 finalize），
         // 不直接进 Cleaning；实际删除待 SortDone 在稳定树上执行。
         use super::AppState;
-        let mut app = live_app(vec![DirNode::new_file(PathBuf::from("/r/big"), "big".into(), 100)]);
-        app.marked.insert(PathBuf::from("/r/big"));
+        // 本测试聚焦非 Risky 的 Enter→finalize 流程，故使用内置规则明确覆盖的 Safe 缓存路径。
+        let safe_path = mc_core::platform::get_home_dir().join("Library/Caches/mc-test");
+        let mut app = live_app(vec![DirNode::new_file(safe_path.clone(), "mc-test".into(), 100)]);
+        app.marked.insert(safe_path);
         press(&mut app, KeyCode::Char('x')); // 弹确认（Safe，非 Risky）
         press(&mut app, KeyCode::Enter); // 确认 → confirm_accept(AnalyzingLive)
         assert!(matches!(app.state, AppState::Sorting), "应先 finalize 转 Sorting");
-        assert!(!app.pending_analyzer_delete.is_empty(), "待删清单应被暂存");
+        let pending = app.pending_analyzer_delete.as_ref().expect("待删清单应被暂存");
+        assert!(!pending.items.is_empty(), "待删清单应非空");
+        assert!(
+            pending.confirmed_risky_paths.is_empty(),
+            "Safe 流程不应伪造 Risky 授权"
+        );
+    }
+
+    #[test]
+    fn sort_done_rechecks_marker_change_before_deleting() {
+        use crate::app::{AppState, PendingAnalyzerDelete};
+
+        let temp = tempfile::tempdir().expect("应创建临时目录");
+        let node_modules = temp.path().join("node_modules");
+        let marker = temp.path().join("package.json");
+        std::fs::create_dir(&node_modules).expect("应创建 node_modules");
+        std::fs::write(&marker, "{}").expect("应创建项目 marker");
+        let initial = crate::delete::analyzer_confirm_items(&[(node_modules.clone(), 100)]);
+        assert_eq!(
+            initial[0].safety,
+            SafetyLevel::Moderate,
+            "marker 存在时应为 Moderate"
+        );
+
+        let mut app = App::new();
+        app.state = AppState::Sorting;
+        app.pending_analyzer_delete = Some(PendingAnalyzerDelete {
+            items: vec![(node_modules.clone(), 100)],
+            confirmed_risky_paths: HashSet::new(),
+        });
+        std::fs::remove_file(marker).expect("应模拟 finalize 期间 marker 消失");
+
+        let mut root = DirNode::new_dir(temp.path().to_path_buf(), "root".into());
+        root.children
+            .push(DirNode::new_dir(node_modules, "node_modules".into()));
+        finish_sorting(&mut app, root, &EventHandler::new());
+
+        assert!(
+            matches!(app.state, AppState::Analyzing { .. }),
+            "未授权升级不得进入 Cleaning"
+        );
+        assert!(app.confirm_has_risky(), "最终复核必须展示升级后的 Risky 证据");
+        assert!(app.analyzer_return.is_none(), "未授权时不得暂存删除返回上下文");
+        assert!(app.pending_analyzer_delete.is_none(), "SortDone 应原子消费暂存请求");
     }
 
     #[test]
@@ -965,8 +1035,9 @@ mod tests {
         // 仍应走 analyzer 暂存路径（由 SortDone 消费），不落入 Results 删除（→ Cleaning）。
         use super::AppState;
         use crate::delete::confirm_accept;
-        let mut app = live_app(vec![DirNode::new_file(PathBuf::from("/r/big"), "big".into(), 100)]);
-        app.marked.insert(PathBuf::from("/r/big"));
+        let safe_path = mc_core::platform::get_home_dir().join("Library/Caches/mc-test");
+        let mut app = live_app(vec![DirNode::new_file(safe_path.clone(), "mc-test".into(), 100)]);
+        app.marked.insert(safe_path);
         press(&mut app, KeyCode::Char('x')); // 打开确认框（live x）
         assert!(app.confirm_delete.is_some());
         // 模拟扫描自然完成、finalize 进行中：状态已切到 Sorting，confirm_delete 仍 Some。
@@ -974,7 +1045,7 @@ mod tests {
         let events = EventHandler::new();
         confirm_accept(&mut app, &events, &mut None, &mut None, &mut None);
         assert!(matches!(app.state, AppState::Sorting), "应仍在 Sorting 等 finalize，不转 Cleaning");
-        assert!(!app.pending_analyzer_delete.is_empty(), "应暂存待删走 analyzer 路径");
+        assert!(app.pending_analyzer_delete.is_some(), "应暂存待删走 analyzer 路径");
         assert!(app.confirm_delete.is_none(), "确认框应关闭");
     }
 

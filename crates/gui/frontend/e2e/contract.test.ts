@@ -140,13 +140,15 @@ describe("IPC 契约守卫（R4）", () => {
     expect(violations).toEqual([]);
   });
 
-  it("关键映射：clean/delete_marked 的 confirmToken/onEvent 映射到 confirm_token/on_event", () => {
+  it("关键映射：删除确认参数保持前后端一致", () => {
     for (const cmd of ["clean", "delete_marked"]) {
       expect(ipcCalls.get(cmd)).toContain("confirmToken");
       expect(ipcCalls.get(cmd)).toContain("onEvent");
       expect(rustArgs.get(cmd)).toContain("confirm_token");
       expect(rustArgs.get(cmd)).toContain("on_event");
     }
+    expect(ipcCalls.get("delete_marked")).toContain("confirmedRiskyPaths");
+    expect(rustArgs.get("delete_marked")).toContain("confirmed_risky_paths");
   });
 
   // 负向自证：守卫真的能红。若前端多调一个未注册命令，diffCommands 必须把它列为 extra。
@@ -157,6 +159,7 @@ describe("IPC 契约守卫（R4）", () => {
 
   it("负向自证：camel→snake 转换正确", () => {
     expect(camelToSnake("confirmToken")).toBe("confirm_token");
+    expect(camelToSnake("confirmedRiskyPaths")).toBe("confirmed_risky_paths");
     expect(camelToSnake("onEvent")).toBe("on_event");
     expect(camelToSnake("paths")).toBe("paths");
   });

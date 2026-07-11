@@ -110,10 +110,11 @@ pub struct App {
     /// 沉没成本二次确认：存在已标记项时，第一次按 q 返回菜单只置位并提示，
     /// 第二次按才真正放弃标记返回（对齐 dua 的 `pending_exit`，避免手滑丢标记）。
     pub pending_leave: bool,
-    /// `AnalyzingLive` 态提交删除的暂存清单（KTD1）：live 删除须先 finalize 部分树，
-    /// 故在 `confirm_accept` 暂存待删 (路径, 大小)，待 `SortDone` 进入稳定 `Analyzing` 态后
-    /// 再经 `start_cleaning_from_analyzer` 执行。非空即表示"本次 finalize 是为删除而非扫描完成"。
-    pub pending_analyzer_delete: Vec<(PathBuf, u64)>,
+    /// `AnalyzingLive` 态提交删除的暂存请求（KTD1）：live 删除须先 finalize 部分树，
+    /// 故在 `confirm_accept` 暂存清单及本轮逐路径 Risky 授权，待 `SortDone` 进入稳定
+    /// `Analyzing` 后再经 `start_cleaning_from_analyzer` 执行。`Some` 即表示本次 finalize
+    /// 是为删除而来。
+    pub pending_analyzer_delete: Option<PendingAnalyzerDelete>,
 }
 
 impl App {
@@ -142,7 +143,7 @@ impl App {
             analyzer_return: None,
             status_message: None,
             pending_leave: false,
-            pending_analyzer_delete: Vec::new(),
+            pending_analyzer_delete: None,
         }
     }
 
@@ -561,7 +562,7 @@ impl App {
         self.analyzer_return = None;
         self.status_message = None;
         self.pending_leave = false;
-        self.pending_analyzer_delete.clear();
+        self.pending_analyzer_delete = None;
     }
 
     /// KTD2 诚实披露：勾选父目录会连带其中**未勾选**的子项一并删除（size 归属已扣除、
@@ -608,6 +609,13 @@ pub struct AnalyzerReturn {
     pub cursor: usize,
     pub cursor_stack: Vec<usize>,
     pub deleted: Vec<PathBuf>,
+}
+
+/// live Analyze 跨后台 finalize 保存的原子删除请求。授权绑定到确认框中当时确为 Risky
+/// 的路径；若另一条路径在 finalize 期间升级为 Risky，最终复核必须重新展示证据。
+pub struct PendingAnalyzerDelete {
+    pub items: Vec<(PathBuf, u64)>,
+    pub confirmed_risky_paths: HashSet<PathBuf>,
 }
 
 /// 扁平化的行类型，用于结果列表渲染

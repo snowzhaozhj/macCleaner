@@ -36,7 +36,7 @@ execution: code
 - **等价 CLI 走路 B（纯前端 + 现存命令），不假造。** CLI 无 `--only`、规则无 slug，逐项精确命令无法诚实生成；本 PR 用**现存真实命令** `mc clean` 作为分类/整体层面的等价出口，**逐项不放不精确的命令**（诚实招牌不破）。精确 `--only`（需先建规则 slug + CLI 参数）诚实延后为独立 PR。
 - **"在 Finder 显示"用加性后端小命令 `reveal_in_finder`。** 与 `open_trash` 完全同款（复用 `open_path`），不碰引擎/扫描/删除逻辑；不引入前端 opener 包与 capabilities scope 扩张。
 - **命中规则名延后。** `Found` 无 rule name，改契约成本大、价值边际（category + 证据全文已表达"它是什么"）。
-- **本 PR 只做 Clean。** Analyze 的审查面孔（等价命令在此可精确到 `mc purge <path>`/`mc analyze <path>`，是真实存在命令 + 真实路径）价值更高，但 Analyze 是树导航、展开交互需单独设计——列为 move 6 第二段（下个 PR），避免混入。
+- **本 PR 只做 Clean。** Analyze 的审查面孔可诚实提供 `mc analyze <path>` 作为“从该路径继续分析”的 CLI 出口；`mc purge <path>` 会扫描后进入交互清理，`mc purge <path> --dry-run` 才是只读预览，二者都**不等价于删除任意 Analyze 项**，不得标成等价删除命令（如展示，只能分别标注“交互清理此处的开发产物”/“预览此处的开发产物”）。Analyze 是树导航、展开交互需单独设计——列为 move 6 第二段（下个 PR），避免混入。
 - **恰好两层，只改展开语义、不加模式开关。** 不做 Simple/Advanced 硬切换；复用现有 `expanded` 状态机。
 
 ### Actors
@@ -87,7 +87,7 @@ execution: code
 **Out of scope（诚实延后）**
 - 逐项精确等价命令 + CLI `--only` + 规则 slug 体系（独立 PR）。
 - 命中规则名/root_marker（需改 `Found` 契约）。
-- Analyze 审查面孔（move 6 第二段，含精确 `mc purge <path>`）。
+- Analyze 审查面孔（move 6 第二段；可提供精确 `mc analyze <path>`，无任意路径删除的等价 CLI）。
 - move 7 / 真 undo / 仪表盘 / 后端增量树流式。
 
 ### Outstanding Questions（已在实现中定夺）
@@ -109,4 +109,3 @@ execution: code
 
 - `pnpm check` 0 error；`pnpm build` 通过；`pnpm test` 43 passed；`pnpm e2e` 17 passed（新增 move 6 展开审查：完整路径 + `mc clean` + 在 Finder 中显示触发 `reveal_in_finder`）。
 - `cargo clippy --all-targets`(pedantic) 无警告；`cargo test` 全通过（core 102 / tui 68 等）。
-

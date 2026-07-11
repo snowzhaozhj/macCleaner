@@ -219,26 +219,115 @@ pub fn user_rules() -> Vec<CleanRule> {
 }
 
 /// 返回所有规则（系统缓存 + 开发产物 + 通过门禁的用户叠加规则）。
-/// 用户规则 append 在末尾：Clean 最长前缀归类、evidence 匹配均保持内置优先。
+/// 用户规则 append 在末尾：扫描保持内置规则的既有顺序；证据反查另按风险与具体度选取。
 pub fn all_rules() -> Vec<CleanRule> {
-    let mut rules = clean_rules();
-    rules.extend(purge_rules());
+    let mut rules = builtin_rules();
     rules.extend(user_rules());
     rules
 }
 
-/// 为任意路径（如磁盘分析器中用户手动选中的路径）推断安全信息：命中某条规则的模式时
-/// 返回其 `(safety, impact, recovery)`，否则 `None`（视为 Safe、无证据）。
+/// 内置规则全集（clean + purge），不含用户本地叠加规则。
+fn builtin_rules() -> Vec<CleanRule> {
+    let mut rules = clean_rules();
+    rules.extend(purge_rules());
+    rules
+}
+
+/// 为任意路径（如磁盘分析器中用户手动选中的路径）查找规则证据：命中某条规则的模式时
+/// 返回其 `(safety, impact, recovery)`，否则 `None`。`None` 只表示「无规则证据」，调用方
+/// 不应据此推断路径是 Safe；删除场景应使用 [`deletion_evidence_for_path`]。
 ///
-/// 用途：让分析器发起的删除也能对 Risky 路径（Docker 卷、Xcode Archives、AVD 等）触发
-/// type-to-confirm，而不是一律按 Safe 单键删除。
+/// 用途：供只读诊断解释某条路径命中了哪条规则；它包含用户叠加规则，不能据此授权删除。
+/// Analyze 等删除入口必须改用 [`deletion_evidence_for_path`]。
 pub fn evidence_for_path(path: &std::path::Path) -> Option<(SafetyLevel, String, String)> {
-    all_rules().into_iter().find_map(|rule| {
-        rule.patterns
-            .iter()
-            .any(|p| matches_pattern(p, path))
-            .then(|| (rule.safety, rule.impact.clone(), rule.recovery.clone()))
+    let rules = all_rules();
+    evidence_for_path_in_rules(path, &rules)
+}
+
+/// 为删除场景返回 fail-closed 的安全证据。已知路径原样沿用规则证据；未知路径无法证明可安全
+/// 重建，因此按 Risky 处理，并明确提示潜在的数据损失与恢复边界。Analyze 只信任随二进制
+/// 审计、测试过的内置规则：用户规则用于扩展扫描范围，不能作为任意路径降级为 Safe/Moderate
+/// 的依据。
+pub fn deletion_evidence_for_path(path: &std::path::Path) -> (SafetyLevel, String, String) {
+    let rules = builtin_rules();
+    deletion_evidence_for_path_in_rules(path, &rules)
+}
+
+/// 批量返回 Analyze 删除证据，保持输入顺序；内置规则只加载一次，避免每个标记路径重复解析。
+pub fn deletion_evidence_for_paths(paths: &[PathBuf]) -> Vec<(SafetyLevel, String, String)> {
+    let rules = builtin_rules();
+    paths
+        .iter()
+        .map(|path| deletion_evidence_for_path_in_rules(path, &rules))
+        .collect()
+}
+
+fn deletion_evidence_for_path_in_rules(
+    path: &std::path::Path,
+    rules: &[CleanRule],
+) -> (SafetyLevel, String, String) {
+    evidence_for_path_in_rules(path, rules).unwrap_or_else(|| {
+        (
+            SafetyLevel::Risky,
+            "此路径未匹配任何已知清理规则，删除可能造成不可再生的用户数据或应用状态丢失".into(),
+            "若仍在废纸篓可移回原处；清空废纸篓后，数据可能无法恢复".into(),
+        )
     })
+}
+
+fn evidence_for_path_in_rules(
+    path: &std::path::Path,
+    rules: &[CleanRule],
+) -> Option<(SafetyLevel, String, String)> {
+    rules
+        .iter()
+        .filter_map(|rule| rule_match_specificity(rule, path).map(|specificity| (rule, specificity)))
+        .reduce(|best, candidate| {
+            let best_priority = (safety_rank(best.0.safety), best.1);
+            let candidate_priority = (safety_rank(candidate.0.safety), candidate.1);
+            if candidate_priority > best_priority {
+                candidate
+            } else {
+                best
+            }
+        })
+        .map(|(rule, _)| {
+            (
+                rule.safety,
+                rule.impact.clone(),
+                rule.recovery.clone(),
+            )
+        })
+}
+
+const fn safety_rank(safety: SafetyLevel) -> u8 {
+    match safety {
+        SafetyLevel::Safe => 0,
+        SafetyLevel::Moderate => 1,
+        SafetyLevel::Risky => 2,
+    }
+}
+
+/// 返回规则对该路径最具体的命中程度。Exact 以基路径长度衡量；DirName 命中路径本身，
+/// 因而具体度等于目标路径长度。DirName 还必须是未跟随符号链接看到的真实目录，并满足守卫。
+fn rule_match_specificity(rule: &CleanRule, path: &std::path::Path) -> Option<usize> {
+    rule.patterns
+        .iter()
+        .filter_map(|pattern| {
+            if !matches_pattern(pattern, path) {
+                return None;
+            }
+            match pattern {
+                // Exact 保持「命中基路径或其后代」的原语义。
+                PathPattern::Exact(base) => Some(base.components().count()),
+                PathPattern::DirName(_) => std::fs::symlink_metadata(path)
+                    .ok()
+                    .filter(|metadata| metadata.file_type().is_dir())
+                    .filter(|_| matches_root_markers(&rule.root_markers, path))
+                    .map(|_| path.components().count()),
+            }
+        })
+        .max()
 }
 
 /// 判断给定路径是否匹配某个模式
@@ -256,16 +345,6 @@ pub fn matches_pattern(pattern: &PathPattern, path: &std::path::Path) -> bool {
 mod tests {
     use super::*;
     use crate::models::SafetyLevel;
-
-    /// 内置规则全集（clean + purge），**不含**用户叠加规则。内置契约测试验证的是
-    /// 「内置规则的不变量」，不能用 `all_rules()`——那会在测试机存在
-    /// `~/.config/mc/rules.toml` 时被用户规则污染（环境依赖、脆弱）。这不是放宽契约
-    /// （rubric 断言本身不变），只是把被遍历的集合收窄回内置。
-    fn builtin_rules() -> Vec<CleanRule> {
-        let mut r = clean_rules();
-        r.extend(purge_rules());
-        r
-    }
 
     #[test]
     fn clean_rules_all_safe() {
@@ -404,16 +483,210 @@ mod tests {
         assert_eq!(buildx.safety, SafetyLevel::Safe, "buildx 应为 Safe 缓存");
     }
 
+    fn evidence_rule(
+        name: &str,
+        patterns: Vec<PathPattern>,
+        safety: SafetyLevel,
+        impact: &str,
+        root_markers: Vec<RootMarker>,
+    ) -> CleanRule {
+        CleanRule {
+            name: name.into(),
+            description: "测试规则".into(),
+            patterns,
+            safety,
+            category: "测试".into(),
+            impact: impact.into(),
+            recovery: format!("恢复 {name}"),
+            root_markers,
+            preselect: true,
+        }
+    }
+
     #[test]
-    fn evidence_for_path_flags_risky_paths() {
+    fn evidence_for_path_preserves_known_rule_evidence() {
         // 分析器用它把 Risky 路径（如 Xcode Archives）识别出来以触发 type-to-confirm。
         let archives = home().join("Library/Developer/Xcode/Archives/old.xcarchive");
-        let (safety, impact, recovery) =
-            evidence_for_path(&archives).expect("Archives 路径应命中规则");
-        assert_eq!(safety, SafetyLevel::Risky);
+        let rules = builtin_rules();
+        let evidence =
+            evidence_for_path_in_rules(&archives, &rules).expect("Archives 路径应命中规则");
+        let (safety, impact, recovery) = &evidence;
+        assert_eq!(*safety, SafetyLevel::Risky);
         assert!(!impact.is_empty() && !recovery.is_empty());
-        // 未命中任何规则的普通路径返回 None（分析器据此按 Safe/空证据处理）。
-        assert!(evidence_for_path(&home().join("Documents/notes.txt")).is_none());
+        assert_eq!(deletion_evidence_for_path(&archives), evidence);
+    }
+
+    #[test]
+    fn deletion_evidence_for_unknown_path_is_risky_and_non_empty() {
+        let unknown = home().join("Documents/notes.txt");
+        let rules = Vec::new();
+        assert!(
+            evidence_for_path_in_rules(&unknown, &rules).is_none(),
+            "未知路径不应伪造规则证据"
+        );
+        // 公开删除入口只加载内置规则；即使测试机存在用户叠加规则，Documents 仍不得被降级。
+        let (safety, impact, recovery) = deletion_evidence_for_path(&unknown);
+        assert_eq!(safety, SafetyLevel::Risky);
+        assert!(!impact.trim().is_empty(), "未知路径必须解释删除影响");
+        assert!(!recovery.trim().is_empty(), "未知路径必须解释恢复边界");
+    }
+
+    #[test]
+    fn dirname_evidence_requires_root_marker() {
+        let temp = tempfile::tempdir().expect("应创建临时目录");
+        let matched_dir = temp.path().join("node_modules");
+        std::fs::create_dir(&matched_dir).expect("应创建待匹配目录");
+        let rule = CleanRule {
+            name: "node_modules".into(),
+            description: "d".into(),
+            patterns: vec![PathPattern::DirName("node_modules".into())],
+            safety: SafetyLevel::Moderate,
+            category: "Node.js".into(),
+            impact: "依赖被删除".into(),
+            recovery: "重新安装依赖".into(),
+            root_markers: vec![RootMarker::Sibling("package.json".into())],
+            preselect: true,
+        };
+
+        assert!(
+            evidence_for_path_in_rules(&matched_dir, std::slice::from_ref(&rule)).is_none(),
+            "仅目录名相同但缺少项目标记时不应返回规则证据"
+        );
+
+        std::fs::write(temp.path().join("package.json"), "{}").expect("应写入项目标记");
+        let (safety, impact, recovery) = evidence_for_path_in_rules(&matched_dir, &[rule])
+            .expect("目录名和项目标记同时命中时应返回规则证据");
+        assert_eq!(safety, SafetyLevel::Moderate);
+        assert_eq!(impact, "依赖被删除");
+        assert_eq!(recovery, "重新安装依赖");
+    }
+
+    #[test]
+    fn dirname_regular_files_are_not_rule_evidence() {
+        let temp = tempfile::tempdir().expect("应创建临时目录");
+        let pycache = temp.path().join("__pycache__");
+        let node_modules = temp.path().join("node_modules");
+        std::fs::write(&pycache, "不是目录").expect("应创建同名普通文件");
+        std::fs::write(temp.path().join("package.json"), "{}").expect("应写入项目标记");
+        std::fs::write(&node_modules, "也不是目录").expect("应创建同名普通文件");
+        let rules = purge_rules();
+
+        assert!(
+            evidence_for_path_in_rules(&pycache, &rules).is_none(),
+            "普通文件 __pycache__ 不得被降级为 Safe"
+        );
+        assert!(
+            evidence_for_path_in_rules(&node_modules, &rules).is_none(),
+            "即使 marker 存在，普通文件 node_modules 也不得被降级为 Moderate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dirname_symlinks_are_not_rule_evidence_even_with_marker() {
+        let temp = tempfile::tempdir().expect("应创建临时目录");
+        let real_modules = temp.path().join("real-modules");
+        let node_modules = temp.path().join("node_modules");
+        std::fs::create_dir(&real_modules).expect("应创建符号链接目标目录");
+        std::os::unix::fs::symlink(&real_modules, &node_modules)
+            .expect("应创建 node_modules 符号链接");
+        std::fs::write(temp.path().join("package.json"), "{}")
+            .expect("应写入有效项目标记");
+        let rules = purge_rules();
+
+        assert!(
+            evidence_for_path_in_rules(&node_modules, &rules).is_none(),
+            "即使 marker 有效，DirName 符号链接也不能被降级为已知清理目录"
+        );
+        assert_eq!(
+            deletion_evidence_for_path_in_rules(&node_modules, &rules).0,
+            SafetyLevel::Risky,
+            "符号链接必须走未知路径的 fail-closed 分级"
+        );
+    }
+
+    #[test]
+    fn higher_safety_wins_over_more_specific_rule_regardless_of_order() {
+        let temp = tempfile::tempdir().expect("应创建临时目录");
+        let project = temp.path().join("project");
+        let node_modules = project.join("node_modules");
+        std::fs::create_dir_all(&node_modules).expect("应创建依赖目录");
+        std::fs::write(project.join("package.json"), "{}").expect("应写入项目标记");
+        let mut rules = vec![
+            evidence_rule(
+                "宽泛 Risky",
+                vec![PathPattern::Exact(project)],
+                SafetyLevel::Risky,
+                "宽泛 Risky 证据",
+                vec![],
+            ),
+            evidence_rule(
+                "具体 Safe",
+                vec![PathPattern::DirName("node_modules".into())],
+                SafetyLevel::Safe,
+                "具体 Safe 证据",
+                vec![RootMarker::Sibling("package.json".into())],
+            ),
+        ];
+
+        for _ in 0..2 {
+            let (safety, impact, _) = evidence_for_path_in_rules(&node_modules, &rules)
+                .expect("宽泛 Exact 与具体 DirName 均应命中");
+            assert_eq!(
+                safety,
+                SafetyLevel::Risky,
+                "更高风险必须压过更具体的 Safe 规则"
+            );
+            assert_eq!(impact, "宽泛 Risky 证据");
+            rules.reverse();
+        }
+    }
+
+    #[test]
+    fn same_safety_prefers_longest_exact_prefix() {
+        let temp = tempfile::tempdir().expect("应创建临时目录");
+        let broad = temp.path().join("cache");
+        let specific = broad.join("app");
+        let target = specific.join("data.bin");
+        let mut rules = vec![
+            evidence_rule(
+                "宽泛 Exact",
+                vec![PathPattern::Exact(broad)],
+                SafetyLevel::Safe,
+                "宽泛证据",
+                vec![],
+            ),
+            evidence_rule(
+                "具体 Exact",
+                vec![PathPattern::Exact(specific)],
+                SafetyLevel::Safe,
+                "具体证据",
+                vec![],
+            ),
+        ];
+
+        for _ in 0..2 {
+            let (safety, impact, _) =
+                evidence_for_path_in_rules(&target, &rules).expect("两条 Exact 规则均应命中");
+            assert_eq!(safety, SafetyLevel::Safe);
+            assert_eq!(impact, "具体证据", "同风险时必须选最长前缀，不受规则顺序影响");
+            rules.reverse();
+        }
+    }
+
+    #[test]
+    fn batch_deletion_evidence_matches_single_path_helper() {
+        let paths = vec![
+            home().join("Library/Developer/Xcode/Archives/old.xcarchive"),
+            home().join("Documents/mc-batch-unknown.txt"),
+        ];
+        let batch = deletion_evidence_for_paths(&paths);
+        let singles: Vec<_> = paths
+            .iter()
+            .map(|path| deletion_evidence_for_path(path))
+            .collect();
+
+        assert_eq!(batch, singles, "批量分类应与逐路径分类一致且保持顺序");
     }
 
     // D2: dist/build 默认不勾选
