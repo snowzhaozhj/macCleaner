@@ -8,6 +8,13 @@
   type Boot = "checking" | "onboarding" | "ready";
   type Tab = "clean" | "purge" | "analyze";
 
+  /** statusbar 模式文案（新增 tab 只需补一行，不再叠三元链）。 */
+  const TAB_LABELS: Record<Tab, string> = {
+    clean: "清理模式",
+    purge: "开发清理模式",
+    analyze: "分析模式",
+  };
+
   let boot = $state<Boot>("checking");
   let probes = $state<ProbeResult[]>([]);
   let tab = $state<Tab>("clean");
@@ -72,15 +79,7 @@
 
   <footer class="statusbar">
     <span class="hint">macCleaner · 移废纸篓可恢复 · 零遥测</span>
-    <span class="mode">
-      {boot === "ready"
-        ? tab === "clean"
-          ? "清理模式"
-          : tab === "purge"
-            ? "开发清理模式"
-            : "分析模式"
-        : ""}
-    </span>
+    <span class="mode">{boot === "ready" ? TAB_LABELS[tab] : ""}</span>
   </footer>
 </div>
 
