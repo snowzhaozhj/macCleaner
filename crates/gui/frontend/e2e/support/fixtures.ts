@@ -174,6 +174,10 @@ export function defaultHandlers(): Handlers {
     check_fda: { result: fdaAuthorized() },
     scan_clean: { events: scanStream([]), result: scanResult([]) },
     clean: { events: [], result: cleanReport([], 0) },
+    scan_purge: { events: scanStream([]), result: scanResult([]) },
+    purge: { events: [], result: cleanReport([], 0) },
+    // 原生目录选择器默认「取消」（resolve null）——选择成功的用例自行覆盖为目录路径。
+    "plugin:dialog|open": { result: null },
     analyze: { events: analyzeStream(0, 0), result: dirNode(FAKE_HOME, "tester", 0) },
     classify_marked: { result: [] as PathSafety[] },
     delete_marked: { events: [], result: cleanReport([], 0) },

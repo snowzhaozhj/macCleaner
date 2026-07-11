@@ -160,7 +160,7 @@ test("Tab 切换 clean↔analyze 不串状态", async ({ page }) => {
   await expect(page.getByText("可安全释放")).toBeVisible();
   await page.getByRole("button", { name: "分析" }).click();
   await expect(page.getByRole("button", { name: "分析主目录" })).toBeVisible();
-  await page.getByRole("button", { name: "清理" }).click();
+  await page.getByRole("button", { name: "清理", exact: true }).click();
   await expect(page.getByText("可安全释放")).toBeVisible();
 });
 

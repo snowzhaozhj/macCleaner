@@ -28,12 +28,18 @@
     knownOrder = [],
     scanning,
     onToggle,
+    cliCommand = "mc clean",
+    cliNote = "清理全部可安全释放项",
   }: {
     items: LiveItem[];
     knownOrder?: readonly string[];
     scanning: boolean;
     /** 逐项勾选（仅 results 相位可用；扫描期列表不可交互）。 */
     onToggle?: (item: LiveItem) => void;
+    /** 命令行等价出口的命令文本（Clean 默认 `mc clean`；Purge 传 `mc purge <目录>`）。 */
+    cliCommand?: string;
+    /** 命令行等价出口的诚实标注文案。 */
+    cliNote?: string;
   } = $props();
 
   // 扫描期：保留 0 命中已知分类（骨架），顺序=knownOrder 锁死不重排（R2/R4）。
@@ -51,10 +57,8 @@
     return totalSize > 0 ? size / totalSize : 0;
   }
 
-  // 命令行等价出口（move 6 / 路 B）：v1 Clean 全 Safe，`mc clean` 即整体等价命令。
+  // 命令行等价出口（move 6 / 路 B）：命令文本由 props 注入（Clean=`mc clean`、Purge=`mc purge <目录>`）。
   // 逐项精确 `--only <slug>` 需 CLI 支持，未支持前不展示不精确/不存在的命令（诚实招牌）。
-  const CLEAN_CMD = "mc clean";
-
   // 展开态（results 第二层）：默认全折叠，用户点分类头展开审查逐项。
   let expanded = $state<Set<string>>(new Set());
   function toggleExpand(name: string) {
@@ -81,9 +85,9 @@
   <!-- 命令行等价出口：一次呈现，代表「用命令行清这一批」；诚实标注清理全部 -->
   <div class="cli-hint">
     <span class="cli-label">命令行等价</span>
-    <code class="cli-cmd">{CLEAN_CMD}</code>
-    <CopyButton text={CLEAN_CMD} />
-    <span class="cli-note">清理全部可安全释放项</span>
+    <code class="cli-cmd">{cliCommand}</code>
+    <CopyButton text={cliCommand} />
+    <span class="cli-note">{cliNote}</span>
   </div>
 {/if}
 
