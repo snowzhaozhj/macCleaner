@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/zhaohejie/workspace/projects/macCleaner/.codex/hooks/deny-edit-on-main.sh'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/zhaohejie/workspace/projects/macCleaner/.codex/hooks/clippy-after-rs-edit.sh'"
+          }
+        ]
+      }
+    ]
+  }
+}
