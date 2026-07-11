@@ -16,6 +16,7 @@ tauri-build = { workspace = true }
 mc-core = { path = "../core" }
 tauri = { workspace = true }
 tauri-plugin-opener = { workspace = true }
+tauri-plugin-dialog = { workspace = true }
 serde = { workspace = true }
 
 [lints]

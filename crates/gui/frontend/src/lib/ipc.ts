@@ -107,7 +107,36 @@ export function clean(
   return invoke<CleanReport>("clean", { paths, confirmToken, onEvent: channel });
 }
 
-/** 协作式取消（scan_clean / clean / analyze 通用）。 */
+/**
+ * 流式扫描 `path` 下的开发产物（node_modules/target/DerivedData…）。
+ * 事件与 scanClean 同形（Found/Complete/…），resolve 时返回最终 ScanResult；
+ * 结果存入后端独立的 last_purge 槽，与 clean 扫描互不串扰（KTD2）。
+ */
+export function scanPurge(
+  path: string,
+  onEvent: (e: ProgressEvent) => void,
+): Promise<ScanResult> {
+  const channel = new Channel<ProgressEvent>();
+  channel.onmessage = onEvent;
+  return invoke<ScanResult>("scan_purge", { path, onEvent: channel });
+}
+
+/**
+ * 删除 purge 扫描出的选中路径（恒移废纸篓）。
+ * `confirmToken`：含 Risky 项时须传用户输入的确认口令，后端二次校验（防绕过 type-to-confirm）。
+ * 纯非 Risky 删除传空串即可。
+ */
+export function purge(
+  paths: string[],
+  confirmToken: string,
+  onEvent: (e: ProgressEvent) => void,
+): Promise<CleanReport> {
+  const channel = new Channel<ProgressEvent>();
+  channel.onmessage = onEvent;
+  return invoke<CleanReport>("purge", { paths, confirmToken, onEvent: channel });
+}
+
+/** 协作式取消（scan_clean / scan_purge / clean / analyze 通用）。 */
 export function cancelScan(): Promise<void> {
   return invoke("cancel_scan");
 }
