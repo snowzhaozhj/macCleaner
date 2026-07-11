@@ -31,7 +31,9 @@
   let evidence = $state<Omit<PathSafety, "path"> | null>(null);
   let evidenceError = $state<string | null>(null);
   let finderError = $state<string | null>(null);
+  let finderLoading = $state(false);
   let requestToken = 0;
+  let finderRequestToken = 0;
 
   const isUnknown = $derived(
     evidence?.impact.includes("未匹配任何已知清理规则") ?? false,
@@ -63,11 +65,16 @@
   }
 
   async function reveal() {
+    const token = ++finderRequestToken;
+    finderLoading = true;
     finderError = null;
     try {
       await revealInFinder(path);
     } catch (err) {
+      if (token !== finderRequestToken) return;
       finderError = `在 Finder 中显示 ${path} 失败：${String(err)}`;
+    } finally {
+      if (token === finderRequestToken) finderLoading = false;
     }
   }
 
@@ -80,6 +87,7 @@
   $effect(() => {
     return () => {
       requestToken += 1;
+      finderRequestToken += 1;
     };
   });
 </script>
@@ -90,7 +98,12 @@
       <span class="path" title={path}>{path}</span>
       <div class="path-actions">
         <CopyButton text={path} label="复制路径" />
-        <button class="finder" onclick={reveal} aria-label="在 Finder 中显示 {path}">
+        <button
+          class="finder"
+          onclick={reveal}
+          disabled={finderLoading}
+          aria-label="在 Finder 中显示 {path}"
+        >
           在 Finder 中显示
         </button>
       </div>

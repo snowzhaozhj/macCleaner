@@ -304,6 +304,46 @@ test("审查失败 fail-closed，可重试且乱序只接受最后请求", async
   await expect(page.getByText("较旧重试证据")).toHaveCount(0);
 });
 
+test("空集、漏回与成功未知路径保持各自的 fail-closed 证据边界", async ({ page }) => {
+  const empty = "/Users/tester/Documents";
+  const missing = "/Users/tester/big.zip";
+  const unknown = "/Users/tester/Movies";
+  const impact = "此路径未匹配任何已知清理规则，删除可能造成用户数据丢失";
+  const recovery = "请先核对内容；若仍在废纸篓可移回原处";
+  await gotoAnalyzeReady(page, {
+    ...defaultHandlers(),
+    analyze: { events: analyzeStream(10, 800 * MB), result: sampleTree() },
+    classify_marked: {
+      sequence: [
+        { result: [] },
+        { result: pathSafety(["/Users/tester/other"]) },
+        {
+          result: pathSafety([unknown], [unknown], {
+            [unknown]: { impact, recovery },
+          }),
+        },
+      ],
+    },
+  });
+
+  for (const target of [empty, missing]) {
+    await page.getByRole("button", { name: `审查 ${target}` }).click();
+    const panel = page.getByRole("region", { name: `${target} 的删除审查` });
+    await expect(panel.getByTitle("安全等级：危险")).toBeVisible();
+    await expect(panel.getByRole("alert")).toContainText("分类结果未包含目标路径");
+    await expect(panel.getByRole("button", { name: `重新查询 ${target}` })).toBeVisible();
+    await expect(panel.getByText("未匹配内置清理规则", { exact: true })).toHaveCount(0);
+  }
+
+  await page.getByRole("button", { name: `审查 ${unknown}` }).click();
+  const unknownPanel = page.getByRole("region", { name: `${unknown} 的删除审查` });
+  await expect(unknownPanel.getByTitle("安全等级：危险")).toBeVisible();
+  await expect(unknownPanel.getByText(impact, { exact: true })).toBeVisible();
+  await expect(unknownPanel.getByText(recovery, { exact: true })).toBeVisible();
+  await expect(unknownPanel.getByText("未匹配内置清理规则", { exact: true })).toBeVisible();
+  await expect(unknownPanel.getByRole("alert")).toHaveCount(0);
+});
+
 test("CLI 随当前目录审查层显示；Finder 失败保留审查和标记", async ({ page }) => {
   const target = "/Users/tester/Movies";
   await gotoAnalyzeReady(page, {
@@ -336,6 +376,61 @@ test("CLI 随当前目录审查层显示；Finder 失败保留审查和标记", 
   await expect(page.getByText("在命令行继续分析此目录")).toHaveCount(0);
 });
 
+test("Finder 乱序响应只保留最后一次动作结果", async ({ page }) => {
+  const target = "/Users/tester/Movies";
+  await gotoAnalyzeReady(page, {
+    ...defaultHandlers(),
+    analyze: { events: analyzeStream(10, 800 * MB), result: sampleTree() },
+    classify_marked: { result: pathSafety([target]) },
+    reveal_in_finder: {
+      sequence: [
+        { deferred: "finder-old", error: "较旧 Finder 失败" },
+        { deferred: "finder-new", result: null },
+      ],
+    },
+  });
+
+  await page.getByRole("button", { name: `审查 ${target}` }).click();
+  const finder = page.getByRole("button", { name: `在 Finder 中显示 ${target}` });
+  await finder.click();
+  await expect(finder).toBeDisabled();
+  await finder.evaluate((button) => button.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+  await releaseDeferred(page, "finder-new");
+  await expect(finder).toBeEnabled();
+  await releaseDeferred(page, "finder-old");
+  await expect(page.getByRole("alert").filter({ hasText: target })).toHaveCount(0);
+  expect(await callsFor(page, "reveal_in_finder")).toHaveLength(2);
+});
+
+test("删除已展开节点后清理审查面孔与 CLI 提示", async ({ page }) => {
+  const target = "/Users/tester/Library/Caches";
+  await gotoAnalyzeReady(page, {
+    ...defaultHandlers(),
+    analyze: { events: analyzeStream(10, 800 * MB), result: sampleTree() },
+    classify_marked: {
+      sequence: [
+        { result: pathSafety([target]) },
+        { result: pathSafety([target]) },
+      ],
+    },
+    delete_marked: {
+      events: cleanStream([target], 100 * MB),
+      result: cleanReport([target], 100 * MB),
+    },
+  });
+
+  await page.getByRole("button", { name: `审查 ${target}` }).click();
+  await page.getByRole("checkbox", { name: target }).check();
+  await expect(page.getByRole("region", { name: `${target} 的删除审查` })).toBeVisible();
+  await expect(page.getByText("在命令行继续分析此目录")).toHaveCount(1);
+  await page.getByRole("button", { name: "删除标记" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "删除" }).click();
+
+  await expect(page.getByRole("checkbox", { name: target })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: `${target} 的删除审查` })).toHaveCount(0);
+  await expect(page.getByText("在命令行继续分析此目录")).toHaveCount(0);
+});
+
 test("审查证据不授权删除，确认前再次分类并采用升级后的 Risky", async ({ page }) => {
   const target = "/Users/tester/Library/Caches";
   await gotoAnalyzeReady(page, {
@@ -362,15 +457,25 @@ test("审查证据不授权删除，确认前再次分类并采用升级后的 R
 
 test("720×520 审查态无横向滚动且控件可见", async ({ page }) => {
   await page.setViewportSize({ width: 720, height: 520 });
-  const target = "/Users/tester/Library/Developer/Xcode/Archives";
+  const target = "/Users/tester/Movies";
   await gotoAnalyzeReady(page, {
     ...defaultHandlers(),
     analyze: { events: analyzeStream(10, 800 * MB), result: sampleTree() },
-    classify_marked: { result: pathSafety([target], [target]) },
+    classify_marked: { result: pathSafety([target]) },
   });
   await page.getByRole("button", { name: `审查 ${target}` }).click();
-  await expect(page.getByRole("checkbox", { name: target })).toBeVisible();
-  await expect(page.getByRole("button", { name: `审查 ${target}` })).toBeVisible();
+  const row = page.getByRole("listitem").filter({ has: page.getByRole("checkbox", { name: target }) });
+  const enter = row.getByRole("button", { name: "进入 Movies" });
+  const size = row.getByText("300 MiB", { exact: true });
+  await expect(enter).toBeVisible();
+  await expect(enter).toBeEnabled();
+  await expect(size).toBeVisible();
+  await expect(row.getByRole("button", { name: `审查 ${target}` })).toBeVisible();
   await expect(page.getByRole("button", { name: `在 Finder 中显示 ${target}` })).toBeVisible();
+  for (const control of [enter, size]) {
+    const box = await control.boundingBox();
+    expect(box).not.toBeNull();
+    expect(box!.x + box!.width).toBeLessThanOrEqual(720);
+  }
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
