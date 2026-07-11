@@ -1,5 +1,10 @@
 import { test, expect } from "@playwright/test";
-import { installTauriMock, lastCall } from "./support/tauri-mock";
+import {
+  callsFor,
+  installTauriMock,
+  lastCall,
+  releaseDeferred,
+} from "./support/tauri-mock";
 import {
   defaultHandlers,
   analyzeStream,
@@ -157,4 +162,214 @@ test("Tab 切换 clean↔analyze 不串状态", async ({ page }) => {
   await expect(page.getByRole("button", { name: "分析主目录" })).toBeVisible();
   await page.getByRole("button", { name: "清理" }).click();
   await expect(page.getByText("可安全释放")).toBeVisible();
+});
+
+test("审查多开、三手势独立，折叠重开复用单路径证据", async ({ page }) => {
+  const movies = "/Users/tester/Movies";
+  const archive = "/Users/tester/big.zip";
+  await gotoAnalyzeReady(page, {
+    ...defaultHandlers(),
+    analyze: { events: analyzeStream(10, 800 * MB), result: sampleTree() },
+    classify_marked: {
+      sequence: [
+        { result: pathSafety([movies]) },
+        { result: pathSafety([archive], [archive]) },
+      ],
+    },
+  });
+
+  const moviesReview = page.getByRole("button", { name: `审查 ${movies}` });
+  const archiveReview = page.getByRole("button", { name: `审查 ${archive}` });
+  await moviesReview.click();
+  await archiveReview.click();
+  await expect(moviesReview).toHaveAttribute("aria-expanded", "true");
+  await expect(archiveReview).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByText(movies, { exact: true })).toBeVisible();
+  await expect(page.getByText(archive, { exact: true })).toBeVisible();
+  expect((await callsFor(page, "classify_marked")).map((c) => c.args.paths)).toEqual([
+    [movies],
+    [archive],
+  ]);
+
+  // 审查不标记、不进入；checkbox 与进入仍是独立手势。
+  await expect(page.getByRole("checkbox", { name: movies })).not.toBeChecked();
+  await page.getByRole("checkbox", { name: movies }).check();
+  await expect(moviesReview).toHaveAttribute("aria-expanded", "true");
+  await moviesReview.click();
+  await moviesReview.click();
+  await expect(page.getByText("应用缓存被清空，下次使用时自动重建").first()).toBeVisible();
+  expect(await callsFor(page, "classify_marked")).toHaveLength(2);
+});
+
+test("加载中折叠后保留结果缓存，重开不重复请求", async ({ page }) => {
+  const target = "/Users/tester/big.zip";
+  await gotoAnalyzeReady(page, {
+    ...defaultHandlers(),
+    analyze: { events: analyzeStream(10, 800 * MB), result: sampleTree() },
+    classify_marked: {
+      deferred: "folded-review",
+      result: pathSafety([target], [target]),
+    },
+  });
+
+  const review = page.getByRole("button", { name: `审查 ${target}` });
+  await review.click();
+  await expect(page.getByRole("status", { name: `正在查询 ${target} 的删除安全证据` })).toBeVisible();
+  await review.click();
+  await releaseDeferred(page, "folded-review");
+  await review.click();
+  await expect(page.getByText("不可恢复（除非保留了对应构建的 dSYM 备份）")).toBeVisible();
+  expect(await callsFor(page, "classify_marked")).toHaveLength(1);
+});
+
+test("导航卸载旧同路径实例，旧返回不污染新实例", async ({ page }) => {
+  const repeated = "/Users/tester/Movies/repeated";
+  const tree = dirNode(FAKE_HOME, "tester", 800 * MB, {
+    children: [
+      dirNode("/Users/tester/Movies", "Movies", 400 * MB, {
+        children: [dirNode(repeated, "repeated", 200 * MB, { is_file: true })],
+      }),
+      dirNode(repeated, "repeated", 200 * MB, { is_file: true }),
+    ],
+  });
+  await gotoAnalyzeReady(page, {
+    ...defaultHandlers(),
+    analyze: { events: analyzeStream(10, 800 * MB), result: tree },
+    classify_marked: {
+      sequence: [
+        {
+          deferred: "old-instance",
+          result: pathSafety([repeated], [repeated], {
+            [repeated]: { impact: "旧实例证据", recovery: "旧实例恢复" },
+          }),
+        },
+        {
+          deferred: "new-instance",
+          result: pathSafety([repeated], [], {
+            [repeated]: { impact: "新实例证据", recovery: "新实例恢复" },
+          }),
+        },
+      ],
+    },
+  });
+
+  await page.getByRole("button", { name: `审查 ${repeated}` }).click();
+  await page.getByRole("button", { name: "进入 Movies" }).click();
+  await page.getByRole("button", { name: `审查 ${repeated}` }).click();
+  await releaseDeferred(page, "new-instance");
+  await expect(page.getByText("新实例证据")).toBeVisible();
+  await releaseDeferred(page, "old-instance");
+  await expect(page.getByText("新实例证据")).toBeVisible();
+  await expect(page.getByText("旧实例证据")).toHaveCount(0);
+});
+
+test("审查失败 fail-closed，可重试且乱序只接受最后请求", async ({ page }) => {
+  const target = "/Users/tester/Documents";
+  await gotoAnalyzeReady(page, {
+    ...defaultHandlers(),
+    analyze: { events: analyzeStream(10, 800 * MB), result: sampleTree() },
+    classify_marked: {
+      sequence: [
+        { error: "分类服务暂不可用" },
+        {
+          deferred: "retry-old",
+          result: pathSafety([target], [target], {
+            [target]: { impact: "较旧重试证据", recovery: "较旧恢复" },
+          }),
+        },
+        {
+          deferred: "retry-new",
+          result: pathSafety([target], [], {
+            [target]: { impact: "最后重试证据", recovery: "最后恢复" },
+          }),
+        },
+      ],
+    },
+  });
+
+  await page.getByRole("button", { name: `审查 ${target}` }).click();
+  const alert = page.getByRole("alert").filter({ hasText: target });
+  await expect(alert).toContainText("分类服务暂不可用");
+  await expect(page.getByText("未匹配内置清理规则", { exact: true })).toBeVisible();
+  const retry = page.getByRole("button", { name: `重新查询 ${target}` });
+  await retry.click();
+  await expect(retry).toBeDisabled();
+  // 用户态禁用可阻止重复提交；合成事件覆盖请求令牌的乱序防御。
+  await retry.evaluate((button) => button.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+  await releaseDeferred(page, "retry-new");
+  await expect(page.getByText("最后重试证据")).toBeVisible();
+  await releaseDeferred(page, "retry-old");
+  await expect(page.getByText("最后重试证据")).toBeVisible();
+  await expect(page.getByText("较旧重试证据")).toHaveCount(0);
+});
+
+test("CLI 随当前目录审查层显示；Finder 失败保留审查和标记", async ({ page }) => {
+  const target = "/Users/tester/Movies";
+  await gotoAnalyzeReady(page, {
+    ...defaultHandlers(),
+    analyze: { events: analyzeStream(10, 800 * MB), result: sampleTree() },
+    classify_marked: { result: pathSafety([target]) },
+    reveal_in_finder: { error: "路径不存在" },
+  });
+
+  await expect(page.getByText("在命令行继续分析此目录")).toHaveCount(0);
+  await page.getByRole("checkbox", { name: target }).check();
+  await page.getByRole("button", { name: `审查 ${target}` }).click();
+  await expect(page.getByText("在命令行继续分析此目录")).toHaveCount(1);
+  await expect(page.getByText("mc analyze '/Users/tester'", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: `在 Finder 中显示 ${target}` }).click();
+  await expect(page.getByRole("alert").filter({ hasText: target })).toContainText("路径不存在");
+  await expect(page.getByRole("checkbox", { name: target })).toBeChecked();
+  await expect(page.getByRole("button", { name: `审查 ${target}` })).toHaveAttribute("aria-expanded", "true");
+  expect((await lastCall(page, "reveal_in_finder"))?.args.path).toBe(target);
+
+  await page.getByRole("button", { name: "进入 Movies" }).click();
+  await expect(page.getByText("在命令行继续分析此目录")).toHaveCount(0);
+  await expect(page.getByRole("checkbox", { name: target, exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "tester", exact: true }).click();
+  await expect(page.getByRole("checkbox", { name: target, exact: true })).toBeChecked();
+  await page.getByRole("button", { name: `审查 ${target}` }).click();
+  await expect(page.getByText("在命令行继续分析此目录")).toHaveCount(1);
+  await page.getByRole("button", { name: "重新分析" }).click();
+  await expect(page.getByRole("checkbox", { name: target, exact: true })).not.toBeChecked();
+  await expect(page.getByText("在命令行继续分析此目录")).toHaveCount(0);
+});
+
+test("审查证据不授权删除，确认前再次分类并采用升级后的 Risky", async ({ page }) => {
+  const target = "/Users/tester/Library/Caches";
+  await gotoAnalyzeReady(page, {
+    ...defaultHandlers(),
+    analyze: { events: analyzeStream(10, 800 * MB), result: sampleTree() },
+    classify_marked: {
+      sequence: [
+        { result: pathSafety([target]) },
+        { result: pathSafety([target], [target]) },
+      ],
+    },
+  });
+
+  await page.getByRole("button", { name: `审查 ${target}` }).click();
+  await expect(page.getByTitle("安全等级：安全")).toBeVisible();
+  await page.getByRole("checkbox", { name: target }).check();
+  await page.getByRole("button", { name: "删除标记" }).click();
+  await expect(page.getByRole("dialog").getByRole("button", { name: "删除" })).toBeDisabled();
+  expect((await callsFor(page, "classify_marked")).map((c) => c.args.paths)).toEqual([
+    [target],
+    [target],
+  ]);
+});
+
+test("720×520 审查态无横向滚动且控件可见", async ({ page }) => {
+  await page.setViewportSize({ width: 720, height: 520 });
+  const target = "/Users/tester/Library/Developer/Xcode/Archives";
+  await gotoAnalyzeReady(page, {
+    ...defaultHandlers(),
+    analyze: { events: analyzeStream(10, 800 * MB), result: sampleTree() },
+    classify_marked: { result: pathSafety([target], [target]) },
+  });
+  await page.getByRole("button", { name: `审查 ${target}` }).click();
+  await expect(page.getByRole("checkbox", { name: target })).toBeVisible();
+  await expect(page.getByRole("button", { name: `审查 ${target}` })).toBeVisible();
+  await expect(page.getByRole("button", { name: `在 Finder 中显示 ${target}` })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });

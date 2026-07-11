@@ -10,13 +10,15 @@
     type DirNode,
     type PathSafety,
   } from "../lib/ipc";
-  import { formatBytes, dirSegments } from "../lib/format";
+  import { analyzeCommand, formatBytes, dirSegments } from "../lib/format";
   import { withViewTransition } from "../lib/transition";
   import { nextToast, dismissToast, type ToastState } from "../lib/toast";
   import Shell from "../lib/Shell.svelte";
   import SummaryHeader from "../lib/SummaryHeader.svelte";
   import UndoToast from "../lib/UndoToast.svelte";
   import ConfirmDelete from "../lib/ConfirmDelete.svelte";
+  import CopyButton from "../lib/CopyButton.svelte";
+  import AnalyzeReviewRow from "../lib/AnalyzeReviewRow.svelte";
   import type { ConfirmItem } from "../lib/ConfirmDelete.svelte";
 
   type Phase = "idle" | "analyzing" | "ready" | "deleting";
@@ -25,6 +27,8 @@
   let tree = $state<DirNode | null>(null);
   let navPaths = $state<string[]>([]); // 从根向下逐层的绝对路径（不含根）
   let marked = $state<Map<string, number>>(new Map()); // path → size（用于确认清单）
+  let expanded = $state<Set<string>>(new Set()); // 仅当前导航层；证据缓存由 keyed 行组件独占
+  let initializedReviews = $state<Set<string>>(new Set()); // 首次展开后才挂载，折叠时保留证据缓存
   let fileCount = $state(0);
   let totalSize = $state(0);
   let error = $state<string | null>(null);
@@ -96,6 +100,8 @@
     tree = null;
     navPaths = [];
     marked = new Map();
+    expanded = new Set();
+    initializedReviews = new Set();
     fileCount = 0;
     totalSize = 0;
     error = null;
@@ -127,11 +133,33 @@
 
   function enter(node: DirNode) {
     if (node.is_file || node.children.length === 0) return;
+    expanded = new Set();
+    initializedReviews = new Set();
     navPaths = [...navPaths, node.path];
   }
 
   function gotoTrail(paths: string[]) {
+    expanded = new Set();
+    initializedReviews = new Set();
     navPaths = paths;
+  }
+
+  function toggleReview(path: string) {
+    const next = new Set(expanded);
+    if (next.has(path)) next.delete(path);
+    else {
+      next.add(path);
+      initializedReviews = new Set(initializedReviews).add(path);
+    }
+    expanded = next;
+  }
+
+  function wasDeleted(path: string, deleted: string[]): boolean {
+    return deleted.some((deletedPath) => path === deletedPath || path.startsWith(`${deletedPath}/`));
+  }
+
+  function reviewPanelId(path: string): string {
+    return `analyze-review-${encodeURIComponent(path)}`;
   }
 
   function toggleMark(node: DirNode) {
@@ -229,11 +257,25 @@
       // 必须一并清出，否则残留陈旧标记（计数虚高、确认列表出现已不存在的路径）。
       const nextMarked = new Map(marked);
       for (const key of [...nextMarked.keys()]) {
-        if (deleted.some((d) => key === d || key.startsWith(`${d}/`))) {
+        if (wasDeleted(key, deleted)) {
           nextMarked.delete(key);
         }
       }
       marked = nextMarked;
+      const nextExpanded = new Set(expanded);
+      for (const key of [...nextExpanded]) {
+        if (wasDeleted(key, deleted)) {
+          nextExpanded.delete(key);
+        }
+      }
+      expanded = nextExpanded;
+      const nextInitializedReviews = new Set(initializedReviews);
+      for (const key of [...nextInitializedReviews]) {
+        if (wasDeleted(key, deleted)) {
+          nextInitializedReviews.delete(key);
+        }
+      }
+      initializedReviews = nextInitializedReviews;
       // 与 Clean 一致的诚实提示：已移废纸篓、可在访达恢复（R10，单实例）。
       toast = nextToast(toast, deleted.length, freed);
     }
@@ -307,44 +349,70 @@
           {/each}
         </ul>
       {:else}
+        {#if phase === "ready" && expanded.size > 0 && currentNode}
+          {@const cliCommand = analyzeCommand(currentNode.path)}
+          <div class="cli-hint">
+            <span class="cli-label">在命令行继续分析此目录</span>
+            <code>{cliCommand}</code>
+            <CopyButton text={cliCommand} label="复制分析命令" />
+            <span class="cli-note">只读分析当前目录，不代表删除</span>
+          </div>
+        {/if}
         <ul class="rows">
-          {#each sortedChildren as node (node.path)}
+          {#each sortedChildren as node (`${currentNode?.path}\0${node.path}`)}
             {@const isMarked = marked.has(node.path)}
             {@const isLarge = node.is_file && node.size > LARGE_FILE}
             {@const canEnter = !node.is_file && node.children.length > 0}
-            <li class="row" class:marked={isMarked} animate:flip={{ duration: 200 }}>
-              <label class="check">
-                <input
-                  type="checkbox"
-                  checked={isMarked}
-                  onchange={() => toggleMark(node)}
-                  aria-label={node.path}
-                />
-              </label>
-              <button
-                class="enter"
-                class:invisible={!canEnter}
-                disabled={!canEnter}
-                onclick={() => enter(node)}
-                aria-label="进入 {node.name}"
-              >
-                <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true">
-                  <path d="M3 2 L7 5 L3 8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-              </button>
-              <span
-                class="name"
-                class:dir={!node.is_file}
-                class:large={isLarge}
-                class:struck={isMarked}
-                title={node.path}
-              >
-                {#if isLarge}<span class="warn-glyph" aria-hidden="true">⚠</span>{/if}{node.name}
-              </span>
-              <span class="bar-wrap" aria-hidden="true">
-                <span class="bar" style="width: {barWidth(node.size)}%"></span>
-              </span>
-              <span class="size" class:struck={isMarked}>{formatBytes(node.size)}</span>
+            {@const isExpanded = expanded.has(node.path)}
+            {@const panelId = reviewPanelId(node.path)}
+            <li class="node" class:marked={isMarked} animate:flip={{ duration: 200 }}>
+              <div class="row">
+                <label class="check">
+                  <input
+                    type="checkbox"
+                    checked={isMarked}
+                    onchange={() => toggleMark(node)}
+                    aria-label={node.path}
+                  />
+                </label>
+                <button
+                  class="enter"
+                  class:invisible={!canEnter}
+                  disabled={!canEnter}
+                  onclick={() => enter(node)}
+                  aria-label="进入 {node.name}"
+                >
+                  <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true">
+                    <path d="M3 2 L7 5 L3 8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </button>
+                <span
+                  class="name"
+                  class:dir={!node.is_file}
+                  class:large={isLarge}
+                  class:struck={isMarked}
+                  title={node.path}
+                >
+                  {#if isLarge}<span class="warn-glyph" aria-hidden="true">⚠</span>{/if}{node.name}
+                </span>
+                <span class="bar-wrap" aria-hidden="true">
+                  <span class="bar" style="width: {barWidth(node.size)}%"></span>
+                </span>
+                <span class="size" class:struck={isMarked}>{formatBytes(node.size)}</span>
+                <button
+                  class="review-toggle"
+                  onclick={() => toggleReview(node.path)}
+                  aria-label="审查 {node.path}"
+                  aria-expanded={isExpanded}
+                  aria-controls={panelId}
+                >
+                  <span class="review-chevron" class:open={isExpanded} aria-hidden="true">›</span>
+                  审查
+                </button>
+              </div>
+              {#if initializedReviews.has(node.path)}
+                <AnalyzeReviewRow path={node.path} {panelId} expanded={isExpanded} />
+              {/if}
             </li>
           {/each}
         </ul>
@@ -458,19 +526,22 @@
     margin: 0;
     padding: 0;
   }
+  .node {
+    min-width: 0;
+    border-radius: var(--radius);
+  }
+  .node:hover {
+    background: var(--surface-raised);
+  }
+  .node.marked {
+    background: color-mix(in oklch, var(--state-danger) 14%, transparent);
+  }
   .row {
     display: flex;
     align-items: center;
     gap: var(--sp-3);
     min-height: var(--row-height);
     padding: 0 var(--sp-1);
-    border-radius: var(--radius);
-  }
-  .row:hover {
-    background: var(--surface-raised);
-  }
-  .row.marked {
-    background: color-mix(in oklch, var(--state-danger) 14%, transparent);
   }
   .check {
     display: flex;
@@ -549,6 +620,50 @@
     text-decoration: line-through;
     color: var(--state-danger);
   }
+  .review-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1);
+    flex: 0 0 auto;
+    padding: var(--sp-1) var(--sp-2);
+    color: var(--accent-explore);
+    font-size: 0.78em;
+  }
+  .review-chevron {
+    display: inline-block;
+    transition: transform var(--dur-fast) var(--ease-out-quart);
+  }
+  .review-chevron.open {
+    transform: rotate(90deg);
+  }
+  .cli-hint {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    flex-wrap: wrap;
+    min-width: 0;
+    padding: var(--sp-2) var(--sp-3);
+    margin-bottom: var(--sp-2);
+    border: 1px dashed var(--border-subtle);
+    border-radius: var(--radius);
+    background: var(--surface-raised);
+  }
+  .cli-label,
+  .cli-note {
+    color: var(--ink-muted);
+    font-size: 0.78em;
+  }
+  .cli-hint code {
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    font-family: var(--font-mono);
+    font-size: 0.8em;
+    color: var(--ink-primary);
+  }
+  .cli-note {
+    color: var(--ink-faint);
+  }
   /* 扫描期骨架行：与真实行同高，避免就绪时列表区高度突变（防跳变） */
   .skeleton-row {
     pointer-events: none;
@@ -588,6 +703,9 @@
   @media (prefers-reduced-motion: reduce) {
     .sk {
       animation: none;
+    }
+    .review-chevron {
+      transition: none;
     }
   }
   .scan-actions {
