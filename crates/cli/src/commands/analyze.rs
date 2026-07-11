@@ -111,7 +111,6 @@ fn build_dir_tree_recursive(path: &Path, depth: usize, max_depth: usize) -> Resu
 }
 
 fn dir_size_fast(path: &Path) -> u64 {
-    // 经 analyze_walk 求和：内部按 MC_WALK_ENGINE 选 jwalk/park 后端，两者逐字节一致。
     // 语义与旧 create_walker 求和相同（lstat 取大小、不跟随符号链接、含隐藏项）。
     let mut total = 0u64;
     mc_core::analyze_walk(

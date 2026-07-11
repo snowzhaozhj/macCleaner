@@ -49,22 +49,31 @@ fn walk_parallelism() -> jwalk::Parallelism {
 }
 
 /// 并行 walk 的后端选择（issue #20 / plan 010）。
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WalkEngine {
-    /// jwalk 0.8.1 自旋式并行（现状默认，零回退风险）。
+    /// jwalk 0.8.1 自旋式并行。
     Jwalk,
     /// 自写 park 式阻塞 work-queue（空闲挂起，0 CPU）。见 `crate::park_walk`。
     Park,
 }
 
-/// `MC_WALK_ENGINE` 路由：`park` → park 引擎；其余（含未设、非法值）→ jwalk（默认）。
+/// 全部并行遍历默认 park：保留并行 I/O，同时避免 jwalk 消费端自旋。
+const DEFAULT_WALK_ENGINE: WalkEngine = WalkEngine::Park;
+
+/// 解析遍历引擎配置：合法环境值显式覆盖，未设或非法值回到默认。
 ///
-/// 门控在此（plan 010 R7）：干净（无 EDR）机复测确认不退化前，默认保持 jwalk 现状行为。
-fn walk_engine() -> WalkEngine {
-    match std::env::var("MC_WALK_ENGINE").as_deref() {
-        Ok("park") => WalkEngine::Park,
-        _ => WalkEngine::Jwalk,
+/// 拆成纯函数便于测试，避免并行测试修改进程级环境变量导致串扰。
+fn select_walk_engine(value: Option<&str>) -> WalkEngine {
+    match value {
+        Some("park") => WalkEngine::Park,
+        Some("jwalk") => WalkEngine::Jwalk,
+        _ => DEFAULT_WALK_ENGINE,
     }
+}
+
+/// `MC_WALK_ENGINE=park|jwalk` 可显式覆盖；未设或非法值默认 park。
+fn walk_engine() -> WalkEngine {
+    select_walk_engine(std::env::var("MC_WALK_ENGINE").ok().as_deref())
 }
 
 /// park 引擎 worker 数：`MC_WALK_THREADS`（≥1）覆盖，缺省 3（对齐 macOS 下 jwalk 默认并行度）。
@@ -838,6 +847,17 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    #[test]
+    fn walk_engine_defaults_to_park_and_allows_explicit_override() {
+        assert_eq!(select_walk_engine(None), WalkEngine::Park);
+        assert_eq!(
+            select_walk_engine(Some("jwalk")),
+            WalkEngine::Jwalk
+        );
+        assert_eq!(select_walk_engine(Some("park")), WalkEngine::Park);
+        assert_eq!(select_walk_engine(Some("unknown")), WalkEngine::Park);
+    }
 
     /// 收集所有进度事件的测试用 reporter
     struct TestReporter {

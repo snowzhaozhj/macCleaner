@@ -101,14 +101,15 @@ dir_size_pool(4).install(|| dirs.par_iter().map(|d| dir_size(d)))
 | RayonNewPool(3)（macOS 旧默认） | ~129% | ~4.7s |
 | RayonNewPool(4) | ~138% | ~4.7s |
 | RayonNewPool(10) | ~134% | ~4.5s |
-| **Serial（新默认）** | **31%** | **5.05s** |
+| **Serial（当时实验配置）** | **31%** | **5.05s** |
 
 **2~10 线程 CPU 全是 ~130%，一点没差**——自旋**与池大小无关**，不是"线程太多"。真凶是 jwalk 并行迭代器的
 **消费端**：`for entry in walker` 拉取 in-order 结果时**忙等 ~1 核**，加再多 producer 也消不掉这份消费自旋。
 （此前误以为默认走 10 线程全局池——其实 macOS 旧默认是 `RayonNewPool(3)`；线程数根本不是变量。）
 
-**解法（修订）：自写 park 式阻塞 work-queue 遍历器**（`crates/core/src/park_walk.rs`，`MC_WALK_ENGINE=park` 门控，
-默认仍 jwalk）。空闲 worker **阻塞在 channel recv（park，0 CPU）而非自旋**，把那份消费自旋变成 0-CPU 挂起等待，
+**解法（修订）：自写 park 式阻塞 work-queue 遍历器**（`crates/core/src/park_walk.rs`）。Analyze/Clean/Purge
+全部默认走 park，`MC_WALK_ENGINE=park|jwalk` 可显式覆盖。结果批 channel 按 worker 数有界，慢消费时背压传回 worker，
+不把整棵树堆入内存；消费端每 entry 检查取消，不继续交付已缓存批次。空闲 worker **阻塞在 channel recv（park，0 CPU）而非自旋**，把那份消费自旋变成 0-CPU 挂起等待，
 同时保留并行度（不牺牲墙钟）。实测（issue #20）：
 - **冻结合成树 `purge` CPU 秒 1.24→0.61（−51%）**，user 态 0.38→0.06（自旋消除）；墙钟持平。
 - **`sample analyze ~/workspace` 顶栈自旋占比 40.1%→0.6%**——jwalk 的 `swtch_pri` 4452 样本槽在 park 里
@@ -117,7 +118,7 @@ dir_size_pool(4).install(|| dirs.par_iter().map(|d| dir_size(d)))
 
 **为什么 Serial 不行而 park 行**：Serial 用"取消并行"消自旋——全树遍历的 I/O 无法重叠，EDR close 税一串到底
 （analyze +76%）。park 用"空闲挂起"消自旋——**保留 N 线程 I/O 重叠**（快），空闲时不烧 CPU（省）。二者都消自旋，
-但 park 不付墙钟代价。`MC_WALK_ENGINE=park` 开、`MC_WALK_THREADS=N` 调 worker 数。
+但 park 不付墙钟代价。`MC_WALK_ENGINE` 切换后端，`MC_WALK_THREADS=N` 调 worker 数。
 
 **衡量自旋收益要看 profiler `swtch_pri` 占比或 CPU 秒，别看墙钟**——单次墙钟被 EDR 的 close 噪声淹没
 （本机 `purge ~` 默认 CPU 在 102%~225% 间跳，见 [[edr-syscall-tax-distorts-cpu-measurement]]）。

@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{bounded, unbounded};
 
 /// 交付给消费端的一个 entry（目录或文件）。
 pub struct WalkEntry {
@@ -73,11 +73,12 @@ enum Job {
 /// - `on_read_dir`：每读完一个目录的 children 后调用一次（在 worker 线程上），用于
 ///   `retain` 剪枝 + 可选 [`prefetch_sizes`]。**剪掉的目录不会被深入**。需 `Sync`
 ///   （多 worker 并发调用）。
-/// - `on_read_error`：某个目录 `read_dir` 失败时调用一次（在 worker 线程上，故需 `Sync`），
+/// - `on_read_error`：目录 `read_dir` / 迭代项 / `file_type` 读取失败时调用（在 worker
+///   线程上，故需 `Sync`），
 ///   传入 `(出错目录路径, io::Error)`。引擎本身不区分错误种类、失败目录一律跳过（不深入、
 ///   不产 entry，与 jwalk 一致）；是否把某类错误升为结构化事件（如权限跳过 #23）由调用方决定，
 ///   使本模块保持通用。传 `|_, _| {}` 即恢复"静默跳过读不到的目录"的原行为（如 analyze）。
-/// - `is_cancelled`：主线程每收到一批 entry 查一次；返回 true 即尽快中止遍历。
+/// - `is_cancelled`：主线程每交付一个 entry 前检查；返回 true 即尽快中止遍历。
 /// - `consume`：主线程按**完成序**逐个收到 [`WalkEntry`]（含根、所有子目录、所有文件）。
 ///   在单一线程上调用，故其捕获状态无需 `Send`。
 ///
@@ -97,7 +98,9 @@ pub fn park_walk<F, E, X, C>(
 {
     let threads = threads.max(1);
     let (job_tx, job_rx) = unbounded::<Job>();
-    let (res_tx, res_rx) = unbounded::<Vec<WalkEntry>>();
+    // 最多缓存每个 worker 一批：消费端（如 TUI 有界 channel）阻塞时，
+    // 背压会传回 worker，避免把整棵树的 entry 继续堆进无界内存。
+    let (res_tx, res_rx) = bounded::<Vec<WalkEntry>>(threads);
     let pending = AtomicUsize::new(1);
     let cancelled = AtomicBool::new(false);
 
@@ -122,8 +125,8 @@ pub fn park_walk<F, E, X, C>(
                         // **先发批、后入队子目录**：保证父目录（作为 entry 在本批内）先于其
                         // 任何子目录的批到达消费端。否则多 worker 下，子目录可能被另一 worker
                         // 抢先读完并发出其批，早于本批——analyze 键控插入会找不到父（issue #20
-                        // KTD3 的顺序假设在并发批交付下需此保证兜底）。消费端可能已因取消退出，
-                        // unbounded 发送不阻塞、失败忽略。
+                        // KTD3 的顺序假设在并发批交付下需此保证兜底）。有界发送会向 worker 施加背压；
+                        // 消费端因取消退出后发送失败，忽略即可。
                         let _ = res_tx.send(batch);
                         for subdir in subdirs {
                             // 先计数后入队：pending 不会在还有活时误降到 0。
@@ -146,12 +149,14 @@ pub fn park_walk<F, E, X, C>(
         drop(job_rx);
 
         // 消费端：阻塞 recv（挂起等待，不忙等），流式逐 entry 交付。
-        for batch in res_rx {
+        // 每个 entry 前都查取消，避免用户离开后继续消费已缓存的大批结果。
+        'results: for batch in res_rx {
             for entry in batch {
+                if is_cancelled() {
+                    cancelled.store(true, Ordering::Release);
+                    break 'results;
+                }
                 consume(entry);
-            }
-            if is_cancelled() {
-                cancelled.store(true, Ordering::Release);
             }
         }
     });
@@ -174,10 +179,24 @@ where
         }
     };
     let mut children: Vec<DirChild> = Vec::new();
-    for entry in read_dir.flatten() {
-        let Ok(file_type) = entry.file_type() else { continue };
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                on_read_error(dir, &err);
+                continue;
+            }
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                on_read_error(&path, &err);
+                continue;
+            }
+        };
         children.push(DirChild {
-            path: entry.path(),
+            path,
             is_dir: file_type.is_dir(),
             size: 0,
         });
@@ -381,11 +400,9 @@ mod tests {
         // 覆盖 R4：置取消后遍历及时停止，已发现项 < 全量、无 panic、无死锁。
         //
         // ## 为什么用 `threads=1` + `Barrier`（消除 CI 时序 flake）
-        // park_walk 的 worker→main entry 通道是 **unbounded**：main 每消费完一批才查
-        // `is_cancelled` 并置内部 `cancelled`，worker 每处理一个目录前才查一次 `cancelled`。
-        // 若树小 / CI 机快，worker 会在 main 置 `cancelled` **之前**就把全部 entry 灌进
-        // unbounded 通道 → main 全部消费 → `discovered == total`，`<` 断言失败（历史 flake：
-        // `discovered=883 应 < 全量 883`）。仅靠「把树造大」只是降低概率，并非确定性。
+        // 取消由消费端观察并传给 worker，worker 每处理一个目录前才查一次。
+        // 若树小 / CI 机快，没有可控交汇点时取消可能发生在 worker 已完成之后；
+        // 仅靠「把树造大」只是降低概率，并非确定性。
         //
         // 这里用 `threads=1` 让 on_read_dir 调用序确定为 root→t0→…，再用一个 `Barrier(2)`
         // 建立唯一交汇点：
@@ -436,6 +453,34 @@ mod tests {
             discovered < total,
             "取消应提前终止：discovered={discovered} 应 < 全量 {total}"
         );
+    }
+
+    #[test]
+    fn park_cancellation_stops_consuming_buffered_batch() {
+        // 根目录的文件会被 worker 组成同一批。消费第一个文件时触发取消后，
+        // 不应继续把该批已缓存的剩余 entry 交给调用方。
+        let tmp = tempdir().unwrap();
+        for i in 0..32 {
+            std::fs::write(tmp.path().join(format!("f{i}.bin")), b"x").unwrap();
+        }
+
+        let cancelled = AtomicBool::new(false);
+        let mut seen = 0usize;
+        park_walk(
+            tmp.path(),
+            1,
+            |children| prefetch_sizes(children),
+            |_p, _err| {},
+            || cancelled.load(Ordering::Relaxed),
+            |_e| {
+                seen += 1;
+                if seen == 2 {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+
+        assert_eq!(seen, 2, "取消后不应继续消费同批缓存 entry");
     }
 
     #[test]
