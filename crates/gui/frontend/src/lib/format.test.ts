@@ -1,5 +1,53 @@
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it, expect } from "vitest";
-import { formatBytes, dirSegments } from "./format";
+import { analyzeCommand, formatBytes, dirSegments } from "./format";
+
+function parseWithZsh(command: string, env: NodeJS.ProcessEnv = process.env): string[] {
+  const script = `mc() {
+    printf '%s\\0' "$#"
+    printf '%s\\0' "$@"
+  }
+  ${command}`;
+  const output = execFileSync("/bin/zsh", ["-c", script], { env });
+  return output.toString().split("\0").slice(0, -1);
+}
+
+describe("analyzeCommand", () => {
+  it.each([
+    ["普通绝对路径", "/Users/test/Library/Caches"],
+    ["空格", "/Users/test/Application Support/cache"],
+    ["单引号", "/Users/test/a'b"],
+    ["换行", "/Users/test/line\nbreak"],
+    ["反斜杠", String.raw`/Users/test/a\b`],
+    ["Unicode", "/Users/测试/缓存📦"],
+    ["分号", "/Users/test/cache;echo injected"],
+    ["命令替换", "/Users/test/$(echo injected)"],
+    ["反引号", "/Users/test/`echo injected`"],
+  ])("zsh 解析%s后，路径仍是原始的单一参数", (_label, path) => {
+    expect(parseWithZsh(analyzeCommand(path))).toEqual(["2", "analyze", path]);
+  });
+
+  it("不会执行路径中的命令替换或反引号", () => {
+    const dir = mkdtempSync(join(tmpdir(), "maccleaner-shell-quote-"));
+    const marker = join(dir, "executed");
+    const path = '/tmp/$(touch "$MC_SENTINEL")/`touch "$MC_SENTINEL"`';
+
+    try {
+      expect(
+        parseWithZsh(analyzeCommand(path), {
+          ...process.env,
+          MC_SENTINEL: marker,
+        }),
+      ).toEqual(["2", "analyze", path]);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("formatBytes", () => {
   it("小于 1024 字节按 B 原样显示（无小数）", () => {

@@ -8,7 +8,8 @@
  * 故该 handler 已就位）。真实后端/真实删除一概不走（本轮范围）。
  *
  * 设计要点：
- * - handler spec 是**纯数据**（events/result/error/pending），可经 addInitScript 序列化注入。
+ * - handler spec 是**纯数据**（events/result/error/pending/deferred/sequence），可经 addInitScript
+ *   序列化注入；deferred 由 releaseDeferred 精确释放，sequence 按调用次序消费。
  * - 每次 invoke 记入 `window.__TAURI_MOCK__.calls`（Channel 参数脱敏为 "[Channel]"），供测试
  *   断言「按钮触发了正确命令 + 正确参数」（R3）。
  * - **未注册命令 reject 并带诊断**（计划 U1 契约）：漏 mock 的调用暴露为清晰失败，而非静默 undefined。
@@ -27,12 +28,32 @@ export type HandlerSpec = {
   error?: string;
   /** 置位则 invoke 返回悬挂 Promise，直到 cancel_scan 到来才 reject（取消测试用）。 */
   pending?: boolean;
+  /**
+   * 置位则本次调用保持悬挂，直到测试用 `releaseDeferred` 精确释放该 id。
+   * 与 `pending` 的取消语义分开，专用于可重复的异步竞态回归。
+   */
+  deferred?: string;
+  /**
+   * 同一命令逐次调用的确定性行为；耗尽后明确 reject，避免意外调用复用最后结果。
+   * sequence 子项不能再嵌套 sequence。
+   */
+  sequence?: Omit<HandlerSpec, "sequence">[];
 };
 
 export type Handlers = Record<string, HandlerSpec>;
 
 /** 一条被记录的 invoke 调用（Channel 参数已脱敏）。 */
 export type RecordedCall = { cmd: string; args: Record<string, unknown> };
+
+type PendingSlot = { resolve: (value: unknown) => void; reject: (error: unknown) => void };
+type DeferredSlot = PendingSlot & { result: unknown; error?: string };
+type TauriMockState = {
+  handlers: Handlers;
+  calls: RecordedCall[];
+  pending: PendingSlot[];
+  invocationCounts: Record<string, number>;
+  deferred: Record<string, DeferredSlot>;
+};
 
 /**
  * 安装 mock。必须在 `page.goto` 之前调用（addInitScript 在页面脚本前运行）。
@@ -41,14 +62,16 @@ export type RecordedCall = { cmd: string; args: Record<string, unknown> };
 export async function installTauriMock(page: Page, handlers: Handlers): Promise<void> {
   await page.addInitScript((initial: Handlers) => {
     const w = window as unknown as {
-      __TAURI_MOCK__: {
-        handlers: Handlers;
-        calls: RecordedCall[];
-        pending: { resolve: (v: unknown) => void; reject: (e: unknown) => void }[];
-      };
+      __TAURI_MOCK__: TauriMockState;
       __TAURI_INTERNALS__: unknown;
     };
-    const mock = { handlers: initial || {}, calls: [] as RecordedCall[], pending: [] as { resolve: (v: unknown) => void; reject: (e: unknown) => void }[] };
+    const mock: TauriMockState = {
+      handlers: initial || {},
+      calls: [],
+      pending: [],
+      invocationCounts: {},
+      deferred: {},
+    };
     w.__TAURI_MOCK__ = mock;
 
     let cbId = 0;
@@ -68,8 +91,14 @@ export async function installTauriMock(page: Page, handlers: Handlers): Promise<
         }
         mock.calls.push({ cmd, args: recorded });
 
-        const spec = mock.handlers[cmd];
-        if (!spec) throw new Error(`Unmocked command: ${cmd}`);
+        const handler = mock.handlers[cmd];
+        if (!handler) throw new Error(`Unmocked command: ${cmd}`);
+        const invocation = mock.invocationCounts[cmd] ?? 0;
+        mock.invocationCounts[cmd] = invocation + 1;
+        const spec = handler.sequence
+          ? handler.sequence[invocation]
+          : handler;
+        if (!spec) throw new Error(`Mock sequence exhausted: ${cmd} invocation ${invocation + 1}`);
 
         if (spec.events) {
           const ch = a.onEvent as { onmessage?: (e: unknown) => void } | undefined;
@@ -84,6 +113,19 @@ export async function installTauriMock(page: Page, handlers: Handlers): Promise<
           for (const p of waiting) p.reject(new Error("cancelled"));
         }
 
+        if (spec.deferred) {
+          if (mock.deferred[spec.deferred]) {
+            throw new Error(`Duplicate deferred id: ${spec.deferred}`);
+          }
+          return await new Promise((resolve, reject) => {
+            mock.deferred[spec.deferred!] = {
+              resolve,
+              reject,
+              result: spec.result,
+              error: spec.error,
+            };
+          });
+        }
         if (spec.error) throw new Error(spec.error);
         if (spec.pending) {
           return await new Promise((resolve, reject) => mock.pending.push({ resolve, reject }));
@@ -92,6 +134,22 @@ export async function installTauriMock(page: Page, handlers: Handlers): Promise<
       },
     };
   }, handlers);
+}
+
+/**
+ * 释放一个已进入 invoke 的 deferred 行为。默认使用 spec 中预置的 result/error；
+ * id 不存在时明确失败，使测试不会靠时序侥幸通过。
+ */
+export async function releaseDeferred(page: Page, id: string): Promise<void> {
+  await page.evaluate((deferredId) => {
+    const w = window as unknown as { __TAURI_MOCK__?: TauriMockState };
+    const mock = w.__TAURI_MOCK__;
+    const slot = mock?.deferred[deferredId];
+    if (!slot) throw new Error(`Deferred mock is not waiting: ${deferredId}`);
+    delete mock.deferred[deferredId];
+    if (slot.error) slot.reject(new Error(slot.error));
+    else slot.resolve(slot.result);
+  }, id);
 }
 
 /** 读取迄今所有被记录的 invoke 调用。 */
