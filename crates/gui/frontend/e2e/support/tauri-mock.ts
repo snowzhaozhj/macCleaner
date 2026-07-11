@@ -8,7 +8,8 @@
  * 故该 handler 已就位）。真实后端/真实删除一概不走（本轮范围）。
  *
  * 设计要点：
- * - handler spec 是**纯数据**（events/result/error/pending），可经 addInitScript 序列化注入。
+ * - handler spec 是**纯数据**（events/result/error/pending/deferred/sequence），可经 addInitScript
+ *   序列化注入；deferred 由 releaseDeferred 精确释放，sequence 按调用次序消费。
  * - 每次 invoke 记入 `window.__TAURI_MOCK__.calls`（Channel 参数脱敏为 "[Channel]"），供测试
  *   断言「按钮触发了正确命令 + 正确参数」（R3）。
  * - **未注册命令 reject 并带诊断**（计划 U1 契约）：漏 mock 的调用暴露为清晰失败，而非静默 undefined。

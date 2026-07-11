@@ -290,7 +290,8 @@ test("审查失败 fail-closed，可重试且乱序只接受最后请求", async
   await page.getByRole("button", { name: `审查 ${target}` }).click();
   const alert = page.getByRole("alert").filter({ hasText: target });
   await expect(alert).toContainText("分类服务暂不可用");
-  await expect(page.getByText("未匹配内置清理规则", { exact: true })).toBeVisible();
+  await expect(page.getByText("分类服务不可用", { exact: false })).toBeVisible();
+  await expect(page.getByText("未匹配内置清理规则", { exact: true })).toHaveCount(0);
   const retry = page.getByRole("button", { name: `重新查询 ${target}` });
   await retry.click();
   await expect(retry).toBeDisabled();

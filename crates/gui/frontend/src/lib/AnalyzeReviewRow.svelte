@@ -22,7 +22,7 @@
 
   const fallback: Omit<PathSafety, "path"> = {
     safety: "Risky",
-    impact: "未匹配内置清理规则；无法确认此路径可安全删除，可能包含不可再生的用户数据或应用状态",
+    impact: "分类服务不可用；无法确认此路径是否匹配内置清理规则，也无法确认是否可安全删除，可能包含不可再生的用户数据或应用状态",
     recovery: "请先核对路径内容；若仍在废纸篓，可移回原处，清空后可能无法恢复",
   };
 
@@ -120,7 +120,7 @@
         <div class="safety-line">
           <span class="evidence-label">删除安全等级</span>
           <Safety safety={evidence.safety} />
-          {#if isUnknown || evidencePhase === "fallback"}
+          {#if isUnknown}
             <span class="boundary">未匹配内置清理规则</span>
           {/if}
         </div>
