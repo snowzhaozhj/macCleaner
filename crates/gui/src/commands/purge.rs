@@ -30,12 +30,18 @@ pub async fn scan_purge(
         (state.begin_operation(), state.last_purge.clone())
     };
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let reporter = TauriReporter::new(on_event, cancelled);
-        Engine::scan_purge(Path::new(&path), &reporter)
+        let reporter = TauriReporter::new(on_event, cancelled.clone());
+        let result = Engine::scan_purge(Path::new(&path), &reporter);
+        // 取消的扫描不得成为权威结果（评审 R2）：核心在取消时把未测完目录记 0 体积且仍
+        // Ok(partial)，TUI 丢弃返回值无此暴露；GUI 若照存 last_purge 会出现「取消后 0 B
+        // 预选项可删」与「慢速被取消的旧扫描覆盖新结果槽」两类污染——此处统一拒绝。
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("扫描已取消".to_string());
+        }
+        result.map_err(|e| format!("扫描失败: {e}"))
     })
     .await
-    .map_err(|e| format!("扫描线程异常: {e}"))?
-    .map_err(|e| format!("扫描失败: {e}"))?;
+    .map_err(|e| format!("扫描线程异常: {e}"))??;
     *last_purge.lock().map_err(|_| "状态锁毒化".to_string())? = Some(result.clone());
     Ok(result)
 }

@@ -21,6 +21,7 @@
     computeSegments,
     aggregateByCategory,
     formatBytes,
+    shellQuote,
     type LiveItem,
     type FoundData,
   } from "../lib/format";
@@ -68,12 +69,30 @@
     });
   }
 
+  // 清空扫描产物回 idle（换目标 / 扫描被取消或失败时的统一收敛点）。
+  function resetToIdle() {
+    items = [];
+    index.clear();
+    buffer = [];
+    skipped = [];
+    lastReport = null;
+    setPhase("idle");
+  }
+
   // ---- 目录选择（F1 / R4 / R5）----
   async function chooseDir() {
     try {
       const picked = await open({ directory: true, defaultPath: target || undefined });
       // 取消返回 null → 保留原目标；只接受字符串（目录路径）。
-      if (typeof picked === "string" && picked.length > 0) target = picked;
+      if (typeof picked === "string" && picked.length > 0 && picked !== target) {
+        target = picked;
+        // 换目标即作废旧结果（评审 R1）：results/done 的 items 属旧目录，若保留会出现
+        // 「目标标签是新目录、删除的却是旧目录项」的误导删除——立即清空回 idle。
+        if (phase === "results" || phase === "done") {
+          error = null;
+          resetToIdle();
+        }
+      }
     } catch (e) {
       // 选择器失败不进入错误态（R5）：目标保持原值，仅控制台留痕。
       console.warn("目录选择失败：", e);
@@ -125,8 +144,8 @@
         }
       });
     } catch (err) {
-      // 取消也走这里
-      if (error === null && items.length === 0) error = String(err);
+      // 取消也走这里；reject 后部分项会被清空回 idle，故无论已流入多少项都要留横幅说明原因。
+      if (error === null) error = String(err);
     }
     if (rafId) {
       cancelAnimationFrame(rafId);
@@ -147,10 +166,12 @@
       );
       index.clear();
       buffer = [];
+      setPhase("results");
     } else {
-      flush();
+      // 扫描被取消或命令失败（评审 R2）：后端此时不写 last_purge，若保留流式部分项
+      // 会形成「可见但删除必然落空」的假结果——清空回 idle，错误横幅仍呈现原因。
+      resetToIdle();
     }
-    setPhase("results");
   }
 
   function cancel() {
@@ -228,8 +249,9 @@
       .catch((e) => console.warn("获取主目录失败：", e));
     return () => {
       if (rafId) cancelAnimationFrame(rafId);
-      // 切走 tab 销毁本组件——协作取消在途扫描（AE6），幂等安全，同 Clean。
-      void cancelScan();
+      // 仅在确有在途操作时协作取消（AE6 / 评审 R3）：Purge 常驻 idle，无条件 cancel 会与
+      // 下一 tab（Clean）mount 自动扫描的 begin_operation 竞速，可能误杀刚起步的新扫描。
+      if (phase === "scanning" || phase === "cleaning") void cancelScan();
     };
   });
 </script>
@@ -269,7 +291,7 @@
           knownOrder={KNOWN_PURGE_CATEGORIES}
           {scanning}
           onToggle={toggle}
-          cliCommand={`mc purge ${target}`}
+          cliCommand={`mc purge ${shellQuote(target)}`}
           cliNote="清理该目录下全部可安全释放项"
         />
         {#if phase === "results" && items.length === 0 && !error}

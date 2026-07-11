@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect } from "vitest";
-import { analyzeCommand, formatBytes, dirSegments } from "./format";
+import { analyzeCommand, shellQuote, formatBytes, dirSegments } from "./format";
 
 function parseWithZsh(command: string, env: NodeJS.ProcessEnv = process.env): string[] {
   const script = `mc() {
@@ -46,6 +46,18 @@ describe("analyzeCommand", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// Purge 的「命令行等价」按此形态拼接（Purge.svelte 的 `mc purge ${shellQuote(target)}`）；
+// 含空格/元字符的目标目录必须仍作为单一参数到达 CLI（评审 R4：不给用户必然失败的命令）。
+describe("shellQuote（Purge 命令行等价拼接形态）", () => {
+  it.each([
+    ["空格", "/Users/test/My Project"],
+    ["单引号", "/Users/test/a'b"],
+    ["命令替换", "/Users/test/$(echo injected)"],
+  ])("zsh 解析%s路径后仍是原始的单一参数", (_label, path) => {
+    expect(parseWithZsh(`mc purge ${shellQuote(path)}`)).toEqual(["2", "purge", path]);
   });
 });
 
