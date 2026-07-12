@@ -6,6 +6,7 @@ pub mod permission;
 pub mod purge;
 pub mod reveal;
 pub mod trash;
+pub mod uninstall;
 
 use mc_core::models::{SafetyLevel, ScanItem};
 

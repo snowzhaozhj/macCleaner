@@ -73,6 +73,19 @@ export type CleanReport = {
   failure_count: number;
 };
 
+/**
+ * 已安装应用信息。字段用 snake_case——mc-core 的 AppInfo 无 #[serde(rename_all)]，
+ * Tauri 返回即 snake_case（与本文件其它返回体一致）。写成 bundleId 会运行时 undefined、
+ * 导致每个应用都落入「未能解析残留」分支，核心功能静默失效。
+ */
+export type AppInfo = {
+  name: string;
+  bundle_id: string | null;
+  path: string;
+  size: number;
+  version: string | null;
+};
+
 export type PathStatus =
   | { status: "readable" }
   | { status: "no_permission" }
@@ -136,7 +149,41 @@ export function purge(
   return invoke<CleanReport>("purge", { paths, confirmToken, onEvent: channel });
 }
 
-/** 协作式取消（scan_clean / scan_purge / clean / analyze 通用）。 */
+/**
+ * 阶段一：列出已安装应用（同步返回，含 bundle_id）。
+ * 无流式事件——后端对每个 .app 递归算体积，前端调用期呈加载态。
+ */
+export function scanUninstall(): Promise<AppInfo[]> {
+  return invoke<AppInfo[]>("scan_uninstall");
+}
+
+/**
+ * 阶段二：对选定应用解析残留，与 app bundle 合成一份 ScanResult 存入后端 last_uninstall 槽。
+ * 入参键用 camelCase（Tauri 映射到 Rust snake_case 形参）。bundleId 为 null 时只含 app bundle。
+ */
+export function resolveLeftovers(
+  appPath: string,
+  bundleId: string | null,
+  appSize: number,
+): Promise<ScanResult> {
+  return invoke<ScanResult>("resolve_leftovers", { appPath, bundleId, appSize });
+}
+
+/**
+ * 阶段三：删除卸载审查出的选中路径（恒移废纸篓）。
+ * `confirmToken`：含 Risky 项时须传确认口令，后端二次校验（防绕过 type-to-confirm）。
+ */
+export function uninstall(
+  paths: string[],
+  confirmToken: string,
+  onEvent: (e: ProgressEvent) => void,
+): Promise<CleanReport> {
+  const channel = new Channel<ProgressEvent>();
+  channel.onmessage = onEvent;
+  return invoke<CleanReport>("uninstall", { paths, confirmToken, onEvent: channel });
+}
+
+/** 协作式取消（scan_clean / scan_purge / clean / analyze / uninstall 通用）。 */
 export function cancelScan(): Promise<void> {
   return invoke("cancel_scan");
 }

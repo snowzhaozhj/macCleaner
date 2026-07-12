@@ -2,16 +2,18 @@
   import { checkFda, type ProbeResult } from "./lib/ipc";
   import Clean from "./routes/Clean.svelte";
   import Purge from "./routes/Purge.svelte";
+  import Uninstall from "./routes/Uninstall.svelte";
   import Analyze from "./routes/Analyze.svelte";
   import Onboarding from "./routes/Onboarding.svelte";
 
   type Boot = "checking" | "onboarding" | "ready";
-  type Tab = "clean" | "purge" | "analyze";
+  type Tab = "clean" | "purge" | "uninstall" | "analyze";
 
   /** statusbar 模式文案（新增 tab 只需补一行，不再叠三元链）。 */
   const TAB_LABELS: Record<Tab, string> = {
     clean: "清理模式",
     purge: "开发清理模式",
+    uninstall: "卸载模式",
     analyze: "分析模式",
   };
 
@@ -50,6 +52,9 @@
         <button class="tab" class:active={tab === "purge"} onclick={() => (tab = "purge")}>
           开发清理
         </button>
+        <button class="tab" class:active={tab === "uninstall"} onclick={() => (tab = "uninstall")}>
+          卸载
+        </button>
         <button
           class="tab explore"
           class:active={tab === "analyze"}
@@ -72,6 +77,8 @@
       <Clean />
     {:else if tab === "purge"}
       <Purge />
+    {:else if tab === "uninstall"}
+      <Uninstall />
     {:else}
       <Analyze />
     {/if}

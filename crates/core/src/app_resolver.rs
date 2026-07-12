@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use log::{debug, warn};
@@ -314,6 +314,20 @@ impl AppResolver {
             leftovers.len()
         );
         leftovers
+    }
+
+    /// 读取指定 `.app` 的 bundle ID（只解析 Info.plist，不计算体积）。
+    ///
+    /// 供 GUI 卸载**服务端派生** bundle ID，不信任前端回传：前端若传过宽前缀（如 `"com"`）
+    /// 会让 `find_leftovers` 前缀匹配到无关应用的 `~/Library` 残留。用真实 bundle ID 收敛匹配范围。
+    pub fn bundle_id_at(app_path: &Path) -> Option<String> {
+        let plist_path = app_path.join("Contents/Info.plist");
+        if !plist_path.exists() {
+            return None;
+        }
+        Self::parse_info_plist(&plist_path, "")
+            .ok()
+            .and_then(|(bundle_id, _, _)| bundle_id)
     }
 
     /// 在应用列表中按名称或 bundle ID 进行大小写不敏感搜索

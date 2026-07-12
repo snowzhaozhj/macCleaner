@@ -14,6 +14,7 @@ import type {
   FdaStatus,
   SafetyLevel,
   PathSafety,
+  AppInfo,
 } from "../../src/lib/ipc";
 import type { Handlers, HandlerSpec } from "./tauri-mock";
 
@@ -107,6 +108,24 @@ export function cleanReport(paths: string[], sizePer: number, opts: { fail?: str
   };
 }
 
+// ---- Uninstall 应用 ----
+
+/** 构造一条已安装应用信息（move 7 第二段 / plan 021）。 */
+export function appInfo(
+  name: string,
+  size: number,
+  opts: Partial<Pick<AppInfo, "bundle_id" | "path" | "version">> = {},
+): AppInfo {
+  return {
+    name,
+    // 用 in 判断而非 ??：显式传 bundle_id: null（无 Info.plist 应用）不应被默认值覆盖。
+    bundle_id: "bundle_id" in opts ? (opts.bundle_id ?? null) : `com.example.${name.toLowerCase()}`,
+    path: opts.path ?? `/Applications/${name}.app`,
+    size,
+    version: opts.version ?? "1.0.0",
+  };
+}
+
 // ---- Analyze 树 ----
 
 export function dirNode(
@@ -176,6 +195,10 @@ export function defaultHandlers(): Handlers {
     clean: { events: [], result: cleanReport([], 0) },
     scan_purge: { events: scanStream([]), result: scanResult([]) },
     purge: { events: [], result: cleanReport([], 0) },
+    // Uninstall（plan 021）：进入 tab 即调 scan_uninstall；resolve_leftovers 选应用时触发。
+    scan_uninstall: { result: [] as AppInfo[] },
+    resolve_leftovers: { result: scanResult([]) },
+    uninstall: { events: [], result: cleanReport([], 0) },
     // 原生目录选择器默认「取消」（resolve null）——选择成功的用例自行覆盖为目录路径。
     "plugin:dialog|open": { result: null },
     analyze: { events: analyzeStream(0, 0), result: dirNode(FAKE_HOME, "tester", 0) },
