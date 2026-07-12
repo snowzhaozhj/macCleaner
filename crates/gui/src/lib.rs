@@ -25,6 +25,9 @@ pub struct AppState {
     /// 最近一次 purge 扫描结果，独立于 `last_scan`（KTD2：clean/purge 隔离，
     /// 切 tab 或交替扫描时删除不会误取另一路径的项）。
     pub last_purge: Arc<Mutex<Option<ScanResult>>>,
+    /// 最近一次 uninstall 残留审查结果（app bundle + 残留），独立槽（KTD4：与 clean/purge
+    /// 隔离，切 tab 或交替操作时删除不会误取另一路径的项）。
+    pub last_uninstall: Arc<Mutex<Option<ScanResult>>>,
     /// 最近一次 analyze 树，供 `delete_marked` 按标记路径收集 (path, size)。
     pub last_analyze: Arc<Mutex<Option<DirNode>>>,
 }
@@ -35,6 +38,7 @@ impl Default for AppState {
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             last_scan: Arc::new(Mutex::new(None)),
             last_purge: Arc::new(Mutex::new(None)),
+            last_uninstall: Arc::new(Mutex::new(None)),
             last_analyze: Arc::new(Mutex::new(None)),
         }
     }
@@ -70,6 +74,9 @@ pub fn run() {
             commands::clean::cancel_scan,
             commands::purge::scan_purge,
             commands::purge::purge,
+            commands::uninstall::scan_uninstall,
+            commands::uninstall::resolve_leftovers,
+            commands::uninstall::uninstall,
             commands::analyze::analyze,
             commands::analyze::classify_marked,
             commands::analyze::delete_marked,
