@@ -46,12 +46,21 @@ pub async fn resolve_leftovers(
     let last_uninstall = app.state::<AppState>().last_uninstall.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let canonical = validate_app_path(&app_path)?;
+        // bundle_id 服务端派生优先（R11 信任边界）：从校验过的 canonical 路径读真实 bundle ID，
+        // 不信任前端回传——前端若传过宽前缀（如 "com"）会让 find_leftovers 前缀匹配到无关应用的
+        // 残留、一并移废纸篓。派生不到（无 Info.plist）才回退前端值：那类应用本就无 bundle ID、
+        // 解析不出残留（R7 优雅降级）。
+        let resolved_bid = Engine::bundle_id_at(&canonical).or(bundle_id);
         // app bundle 本体作为 Safe 项在前（对齐 CLI uninstall.rs 的合成顺序）。
         let app_item = ScanItem::new(canonical, app_size, SafetyLevel::Safe, "应用".to_string());
         let mut categories = vec![CategoryGroup::new("应用".to_string(), vec![app_item])];
-        // bundle_id 存在才解析残留；缺失时只删 app bundle（R7 优雅降级）。
-        if let Some(bid) = bundle_id.as_deref().filter(|s| !s.is_empty()) {
-            categories.extend(group_by_category(Engine::find_leftovers(bid)));
+        // 残留作为单个 CategoryGroup 收纳——前端按各项自身的 category（如「应用残留 (Caches)」）
+        // 重新分组渲染，故后端分组结构不影响展示、总量与按路径取项，无需在此按子目录再拆组。
+        if let Some(bid) = resolved_bid.as_deref().filter(|s| !s.is_empty()) {
+            let leftovers = Engine::find_leftovers(bid);
+            if !leftovers.is_empty() {
+                categories.push(CategoryGroup::new("应用残留".to_string(), leftovers));
+            }
         }
         Ok::<ScanResult, String>(ScanResult::from_categories(categories))
     })
@@ -105,10 +114,12 @@ fn validate_app_path(app_path: &str) -> Result<PathBuf, String> {
     if !canonical.is_dir() {
         return Err("应用路径不是目录".to_string());
     }
-    let mut allowed = vec![PathBuf::from("/Applications")];
-    if let Some(home) = std::env::var_os("HOME") {
-        allowed.push(PathBuf::from(home).join("Applications"));
-    }
+    // 与应用发现口径一致：list_apps 用 platform::get_home_dir() 构造 ~/Applications
+    // （dirs::home_dir 带 passwd 兜底）；用同一 helper 避免 HOME 未设时校验漏掉这些应用。
+    let allowed = [
+        PathBuf::from("/Applications"),
+        mc_core::platform::get_home_dir().join("Applications"),
+    ];
     let ok = allowed.iter().any(|base| {
         base.canonicalize()
             .is_ok_and(|b| canonical.starts_with(&b))
@@ -117,23 +128,6 @@ fn validate_app_path(app_path: &str) -> Result<PathBuf, String> {
         return Err("应用路径不在 /Applications 或 ~/Applications 下".to_string());
     }
     Ok(canonical)
-}
-
-/// 按 `category` 分组残留项（保首次出现顺序），使前端按子目录类目静态渲染。
-fn group_by_category(items: Vec<ScanItem>) -> Vec<CategoryGroup> {
-    let mut order: Vec<String> = Vec::new();
-    let mut buckets: std::collections::HashMap<String, Vec<ScanItem>> = std::collections::HashMap::new();
-    for item in items {
-        let key = item.category.clone();
-        if !buckets.contains_key(&key) {
-            order.push(key.clone());
-        }
-        buckets.entry(key).or_default().push(item);
-    }
-    order
-        .into_iter()
-        .filter_map(|k| buckets.remove(&k).map(|items| CategoryGroup::new(k, items)))
-        .collect()
 }
 
 #[cfg(test)]
@@ -187,19 +181,4 @@ mod tests {
         );
     }
 
-    /// 按类目分组保首次出现顺序，空输入得空。
-    #[test]
-    fn group_by_category_preserves_first_seen_order() {
-        let items = vec![
-            item("/a", SafetyLevel::Safe),
-            ScanItem::new(PathBuf::from("/b"), 1, SafetyLevel::Moderate, "残留".into()),
-            item("/c", SafetyLevel::Safe),
-        ];
-        let groups = group_by_category(items);
-        assert_eq!(groups.len(), 2, "两个不同类目");
-        assert_eq!(groups[0].name, "应用");
-        assert_eq!(groups[0].items.len(), 2);
-        assert_eq!(groups[1].name, "残留");
-        assert!(group_by_category(vec![]).is_empty());
-    }
 }

@@ -52,16 +52,17 @@
   let toast = $state<ToastState>(null);
 
   // ---- 阶段一：应用列表派生（搜索过滤 + 体积降序，R3/R4）----
+  // 体积降序只依赖 apps，与搜索无关——单独派生，避免每次按键都重排整表
+  // （filter 保序 + sort 稳定，输出与「先过滤再排序」逐字一致）。
+  const sortedApps = $derived([...apps].sort((x, y) => y.size - x.size));
   const filteredApps = $derived.by(() => {
     const q = search.trim().toLowerCase();
-    const matched = q
-      ? apps.filter(
-          (a) =>
-            a.name.toLowerCase().includes(q) ||
-            (a.bundle_id?.toLowerCase().includes(q) ?? false),
-        )
-      : apps;
-    return [...matched].sort((x, y) => y.size - x.size);
+    if (!q) return sortedApps;
+    return sortedApps.filter(
+      (a) =>
+        a.name.toLowerCase().includes(q) ||
+        (a.bundle_id?.toLowerCase().includes(q) ?? false),
+    );
   });
   // 零命中：有应用但搜索无匹配（区别于 listEmpty 真空扫描，AE2）。
   const zeroMatch = $derived(
@@ -81,8 +82,10 @@
     computeSegments(reviewCats.map((c) => ({ ...c, size: c.selectedSize }))),
   );
   // 残留说明（AE4/AE10）：无 bundle_id vs 有 bundle_id 但零残留，两措辞须不同。
+  // app 本体始终是 reviewItems[0]（resolve_leftovers 契约：本体在前），故残留数 = 总数 - 1。
+  // 用结构不变量而非匹配「应用」类目串——避免与后端类目文案的跨语言隐式耦合。
   const hasBundleId = $derived(!!selectedApp?.bundle_id);
-  const leftoverCount = $derived(reviewItems.filter((i) => i.category !== "应用").length);
+  const leftoverCount = $derived(Math.max(0, reviewItems.length - 1));
   const noBundleNote = $derived(phase === "reviewReady" && !hasBundleId);
   const noLeftoverNote = $derived(phase === "reviewReady" && hasBundleId && leftoverCount === 0);
 
@@ -168,7 +171,11 @@
     if (paths.length === 0) return;
     error = null;
     cleaningPath = "";
-    const uninstalledPath = selectedApp?.path;
+    // 清旧回执：否则上次成功删除的 report 会在本次删除 reject（report 为 null）时残留，
+    // done 相位把它误当本次成功回执展示、且错误被吞（reliability：destructive op 后须诚实报错）。
+    lastReport = null;
+    const uninstalledPath = selectedApp?.path; // 原始 AppInfo 路径，用于从 apps 列表剔除
+    const bundlePath = reviewItems[0]?.path ?? null; // app 本体 canonical 路径（resolve 契约：首项）
     setPhase("deleting");
     let report: CleanReport | null = null;
     try {
@@ -184,9 +191,15 @@
       lastReport = report;
       if (report.success_count > 0) {
         toast = nextToast(toast, report.success_count, report.total_freed);
-        // 删成功后从缓存剔除已卸载应用（R18/AE9，照 Analyze 删后剪树）：
-        // 重选已删应用会对不存在的 bundle 空转，故列表须反映删除。
-        if (uninstalledPath) apps = apps.filter((a) => a.path !== uninstalledPath);
+        // 仅当 app 本体确被删除才从缓存剔除该应用（R18/AE9，照 Analyze 删后剪树）：
+        // 用户可能取消勾选本体只删残留、或本体删除失败（占用/权限）——那时应用仍在装、
+        // 列表须保留，否则会误藏一个未卸载的应用（correctness/adversarial/reliability 共识）。
+        // bundlePath 与 report.cleaned 同为 canonical 路径；apps 按原始路径剔除。
+        const bundleDeleted =
+          !!bundlePath && report.cleaned.some((c) => c.success && c.path === bundlePath);
+        if (bundleDeleted && uninstalledPath) {
+          apps = apps.filter((a) => a.path !== uninstalledPath);
+        }
       }
     }
     setPhase("done");
@@ -219,8 +232,12 @@
 
 <Shell>
   {#snippet summary()}
-    {#if phase === "done" && lastReport}
-      <CleanReceipt report={lastReport} onRestore={restoreInFinder} />
+    {#if phase === "done"}
+      {#if lastReport}
+        <CleanReceipt report={lastReport} onRestore={restoreInFinder} />
+      {:else}
+        <p class="error" role="alert">卸载失败：{error ?? "未知错误"}</p>
+      {/if}
     {:else if reviewing}
       <SummaryHeader amount={selectedSize} {segments} scanning={false} />
       {#if selectedApp}

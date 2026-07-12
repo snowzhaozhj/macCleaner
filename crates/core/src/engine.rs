@@ -41,6 +41,14 @@ impl Engine {
         AppResolver::find_leftovers(bundle_id)
     }
 
+    /// 读取 `.app` 的真实 bundle ID（只解析 Info.plist）。facade 平价：委托 `AppResolver`。
+    ///
+    /// GUI 卸载用它服务端派生 bundle ID，不信任前端回传的过宽前缀（防误匹配他应用残留）。
+    #[must_use]
+    pub fn bundle_id_at(app_path: &Path) -> Option<String> {
+        AppResolver::bundle_id_at(app_path)
+    }
+
     /// 执行清理操作（实际删除文件）
     pub fn clean(
         items: &[&ScanItem],
@@ -80,5 +88,12 @@ mod tests {
             leftovers.is_empty(),
             "未知 bundle_id 应无残留（委托 AppResolver::find_leftovers）"
         );
+    }
+
+    /// facade 平价：`Engine::bundle_id_at` 对不存在的 .app 返回 None，委托生效且不 panic。
+    #[test]
+    fn bundle_id_at_delegates_and_handles_missing_app() {
+        let bid = Engine::bundle_id_at(std::path::Path::new("/does/not/exist.app"));
+        assert!(bid.is_none(), "不存在的 .app 应返回 None（委托 AppResolver::bundle_id_at）");
     }
 }

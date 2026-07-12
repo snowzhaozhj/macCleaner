@@ -210,6 +210,48 @@ test("AE6 隔离（前端面）：uninstall 只带残留审查结果的路径，
   expect(await callsFor(page, "purge")).toEqual([]);
 });
 
+test("删除 reject：done 相位诚实报错、不残留上次成功回执，应用不被剔除", async ({ page }) => {
+  const items = leftoversFor(SAFARI, { safeLeftover: 50 * MB });
+  await installTauriMock(page, {
+    ...uninstallHandlers([SAFARI, NOTES]),
+    resolve_leftovers: { result: scanResult(items) },
+    uninstall: { error: "删除失败：目标被占用" },
+  });
+  await gotoUninstall(page);
+  await page.getByRole("button", { name: /Safari/ }).click();
+  await page.getByRole("button", { name: /移入废纸篓/ }).click();
+
+  // done 相位显示失败横幅，不显示「已释放」成功回执。
+  await expect(page.getByRole("alert")).toContainText("卸载失败");
+  await expect(page.getByText(/已释放/)).toHaveCount(0);
+
+  // 返回列表：Safari 未被剔除（删除失败，仍在装）。
+  await page.getByRole("button", { name: "返回应用列表" }).click();
+  await expect(page.getByRole("button", { name: /Safari/ })).toBeVisible();
+});
+
+test("部分失败：本体删除失败但残留成功时应用不被剔除（prune 只认本体删除）", async ({ page }) => {
+  const items = leftoversFor(SAFARI, { safeLeftover: 50 * MB });
+  const cachePath = `~/Library/Caches/${SAFARI.bundle_id}`;
+  const paths = [SAFARI.path, cachePath];
+  await installTauriMock(page, {
+    ...uninstallHandlers([SAFARI, NOTES]),
+    resolve_leftovers: { result: scanResult(items) },
+    // 本体 .app 删除失败，仅缓存成功：success_count>0 但本体仍在。
+    uninstall: {
+      events: cleanStream([cachePath], 50 * MB, [cachePath]),
+      result: cleanReport(paths, 50 * MB, { fail: [SAFARI.path] }),
+    },
+  });
+  await gotoUninstall(page);
+  await page.getByRole("button", { name: /Safari/ }).click();
+  await page.getByRole("button", { name: /移入废纸篓/ }).click();
+  await page.getByRole("button", { name: "返回应用列表" }).click();
+
+  // 本体未删成功 → Safari 仍在列表（不能因删了缓存就误藏未卸载的应用）。
+  await expect(page.getByRole("button", { name: /Safari/ })).toBeVisible();
+});
+
 test("四 tab 导航：卸载 tab 可切换，进入应用列表态，不串扰其它 tab", async ({ page }) => {
   await installTauriMock(page, uninstallHandlers([SAFARI]));
   await page.goto("/");
