@@ -1,11 +1,19 @@
 <script lang="ts">
   import { checkFda, type ProbeResult } from "./lib/ipc";
   import Clean from "./routes/Clean.svelte";
+  import Purge from "./routes/Purge.svelte";
   import Analyze from "./routes/Analyze.svelte";
   import Onboarding from "./routes/Onboarding.svelte";
 
   type Boot = "checking" | "onboarding" | "ready";
-  type Tab = "clean" | "analyze";
+  type Tab = "clean" | "purge" | "analyze";
+
+  /** statusbar 模式文案（新增 tab 只需补一行，不再叠三元链）。 */
+  const TAB_LABELS: Record<Tab, string> = {
+    clean: "清理模式",
+    purge: "开发清理模式",
+    analyze: "分析模式",
+  };
 
   let boot = $state<Boot>("checking");
   let probes = $state<ProbeResult[]>([]);
@@ -39,6 +47,9 @@
         <button class="tab" class:active={tab === "clean"} onclick={() => (tab = "clean")}>
           清理
         </button>
+        <button class="tab" class:active={tab === "purge"} onclick={() => (tab = "purge")}>
+          开发清理
+        </button>
         <button
           class="tab explore"
           class:active={tab === "analyze"}
@@ -59,6 +70,8 @@
       <Onboarding {probes} onRecheck={() => (boot = "ready")} />
     {:else if tab === "clean"}
       <Clean />
+    {:else if tab === "purge"}
+      <Purge />
     {:else}
       <Analyze />
     {/if}
@@ -66,7 +79,7 @@
 
   <footer class="statusbar">
     <span class="hint">macCleaner · 移废纸篓可恢复 · 零遥测</span>
-    <span class="mode">{boot === "ready" ? (tab === "clean" ? "清理模式" : "分析模式") : ""}</span>
+    <span class="mode">{boot === "ready" ? TAB_LABELS[tab] : ""}</span>
   </footer>
 </div>
 

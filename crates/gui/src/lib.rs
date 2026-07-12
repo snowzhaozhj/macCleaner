@@ -22,6 +22,9 @@ pub struct AppState {
     pub cancel: Mutex<Arc<AtomicBool>>,
     /// 最近一次 clean 扫描结果，供 `clean` 按路径精确取项（避免前端回传完整 `ScanItem`）。
     pub last_scan: Arc<Mutex<Option<ScanResult>>>,
+    /// 最近一次 purge 扫描结果，独立于 `last_scan`（KTD2：clean/purge 隔离，
+    /// 切 tab 或交替扫描时删除不会误取另一路径的项）。
+    pub last_purge: Arc<Mutex<Option<ScanResult>>>,
     /// 最近一次 analyze 树，供 `delete_marked` 按标记路径收集 (path, size)。
     pub last_analyze: Arc<Mutex<Option<DirNode>>>,
 }
@@ -31,6 +34,7 @@ impl Default for AppState {
         Self {
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             last_scan: Arc::new(Mutex::new(None)),
+            last_purge: Arc::new(Mutex::new(None)),
             last_analyze: Arc::new(Mutex::new(None)),
         }
     }
@@ -58,11 +62,14 @@ impl AppState {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             commands::clean::scan_clean,
             commands::clean::clean,
             commands::clean::cancel_scan,
+            commands::purge::scan_purge,
+            commands::purge::purge,
             commands::analyze::analyze,
             commands::analyze::classify_marked,
             commands::analyze::delete_marked,

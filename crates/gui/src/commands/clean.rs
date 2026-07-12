@@ -5,12 +5,12 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use mc_core::engine::Engine;
-use mc_core::models::{CleanReport, DeleteMode, SafetyLevel, ScanItem, ScanResult};
+use mc_core::models::{CleanReport, DeleteMode, ScanItem, ScanResult};
 use mc_core::progress::ProgressEvent;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 
-use crate::commands::is_confirmed;
+use crate::commands::authorize_deletion;
 use crate::reporter::TauriReporter;
 use crate::AppState;
 
@@ -78,10 +78,8 @@ pub async fn clean(
             let scan = guard.as_ref().ok_or_else(|| "无扫描结果可清理".to_string())?;
             select_by_paths(scan, &selected).into_iter().cloned().collect()
         };
-        // 后端闸：含 Risky 必须有有效确认口令，否则拒删（防绕过前端 type-to-confirm）。
-        if items.iter().any(|i| i.safety == SafetyLevel::Risky) && !is_confirmed(&confirm_token) {
-            return Err("含危险项，需输入确认口令方可删除".to_string());
-        }
+        // 后端闸：含 Risky 必须有有效确认口令，否则拒删（与 purge 共用 authorize_deletion）。
+        authorize_deletion(&items, &confirm_token)?;
         let refs: Vec<&ScanItem> = items.iter().collect();
         let reporter = TauriReporter::new(on_event, cancelled);
         Engine::clean(&refs, DeleteMode::Trash, &reporter).map_err(|e| format!("清理失败: {e}"))
@@ -100,6 +98,7 @@ pub async fn cancel_scan(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::is_confirmed;
     use mc_core::models::{CategoryGroup, SafetyLevel};
 
     fn item(path: &str, safety: SafetyLevel) -> ScanItem {
