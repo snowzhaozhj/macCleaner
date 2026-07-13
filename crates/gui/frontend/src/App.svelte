@@ -44,7 +44,12 @@
   }
   function closePalette() {
     paletteOpen = false;
-    paletteTrigger?.focus(); // R4：焦点还原
+    // R4 焦点还原：若触发元素已随导航命令卸载（focus() 对脱离 DOM 的节点静默失败，
+    // 焦点会落到 body），回退聚焦当前激活 tab——审查发现，correctness+julik+adversarial 三家一致。
+    const target = paletteTrigger?.isConnected
+      ? paletteTrigger
+      : document.querySelector<HTMLElement>(".tab.active");
+    target?.focus();
     paletteTrigger = null;
   }
 
@@ -52,6 +57,7 @@
     // Cmd+K（macOS 主路径）/ Ctrl+K；仅主界面（ready）唤起，onboarding/checking 不响应（R1）。
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       if (boot !== "ready") return;
+      if (e.repeat) return; // 长按 K 自动重复不应反复 toggle（审查：adversarial）
       e.preventDefault(); // 拦截 webview 默认（部分 Ctrl+K 聚焦地址栏）
       if (paletteOpen) closePalette();
       else openPalette();

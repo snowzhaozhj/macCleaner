@@ -102,6 +102,38 @@ test("执行「打开废纸篓」命令调用 open_trash", async ({ page }) => {
   expect(await lastCall(page, "open_trash")).not.toBeNull();
 });
 
+test("R5 焦点陷阱：Tab / Shift+Tab 不逃出面板，焦点恒留输入框", async ({ page }) => {
+  await installTauriMock(page, defaultHandlers());
+  await page.goto("/");
+
+  await page.keyboard.press("ControlOrMeta+k");
+  const input = page.getByPlaceholder("搜索命令…");
+  await expect(input).toBeFocused();
+
+  // Tab 被 preventDefault 拦截——焦点不移出 input（护栏不变量，误删 preventDefault 即回归）。
+  await page.keyboard.press("Tab");
+  await expect(input).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  await expect(input).toBeFocused();
+});
+
+test("R4 焦点还原：关闭后焦点回到唤起前的触发元素", async ({ page }) => {
+  await installTauriMock(page, defaultHandlers());
+  await page.goto("/");
+
+  // 让某 tab 按钮成为触发元素（不点击以免切 tab）。
+  const trigger = page.getByRole("button", { name: "分析", exact: true });
+  await trigger.focus();
+  await expect(trigger).toBeFocused();
+
+  await page.keyboard.press("ControlOrMeta+k");
+  await expect(page.getByPlaceholder("搜索命令…")).toBeFocused();
+
+  // Esc 关闭 → 焦点还原到触发按钮（nav 常驻，触发元素未卸载）。
+  await page.keyboard.press("Escape");
+  await expect(trigger).toBeFocused();
+});
+
 test("R7 回归：四 tab 可见导航仍在、可点（面板是加速器非替代）", async ({ page }) => {
   await installTauriMock(page, defaultHandlers());
   await page.goto("/");

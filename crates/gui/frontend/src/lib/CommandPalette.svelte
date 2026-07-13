@@ -23,10 +23,17 @@
   let query = $state("");
   let selectedIndex = $state(0);
   let listEl = $state<HTMLUListElement | null>(null);
+  let inputEl = $state<HTMLInputElement | null>(null);
 
   const filtered = $derived(fuzzyFilter(commands, query));
 
-  // query 变化后结果集重排：高亮回到首项，并夹逼进合法区间（防越界）。
+  // 挂载即显式聚焦输入框——不依赖 autofocus 属性：当唤起前已有元素持焦（如某 tab 按钮），
+  // autofocus 不保证抢焦，会使焦点陷阱落空（审查 julik/testing 发现，R4 e2e 实测捕获）。
+  $effect(() => {
+    inputEl?.focus();
+  });
+
+  // query 变化 → 结果集重排，高亮回到首项（重置为 0 也天然避免了越界）。
   $effect(() => {
     void query;
     selectedIndex = 0;
@@ -83,16 +90,15 @@
   <!-- 键盘在容器层统一处理；焦点由内部 input 持有 -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="palette" role="dialog" aria-modal="true" aria-label="命令面板" tabindex="-1" onkeydown={handleKeys}>
-    <!-- svelte-ignore a11y_autofocus -->
     <input
       type="text"
+      bind:this={inputEl}
       bind:value={query}
       placeholder="搜索命令…"
       spellcheck="false"
       autocapitalize="off"
       autocomplete="off"
       aria-label="搜索命令"
-      autofocus
     />
 
     {#if filtered.length}
@@ -104,7 +110,9 @@
             aria-selected={i === selectedIndex}
             class:active={i === selectedIndex}
             onclick={() => run(cmd)}
-            onmousemove={() => (selectedIndex = i)}
+            onmousemove={() => {
+              if (selectedIndex !== i) selectedIndex = i; // mousemove 连发：仅变化时写
+            }}
           >
             {cmd.title}
           </li>
