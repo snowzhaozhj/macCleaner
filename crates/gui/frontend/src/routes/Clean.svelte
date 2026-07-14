@@ -26,6 +26,8 @@
   import UndoToast from "../lib/UndoToast.svelte";
   import ConfirmDelete from "../lib/ConfirmDelete.svelte";
   import type { ConfirmItem } from "../lib/ConfirmDelete.svelte";
+  import type { Command } from "../lib/palette";
+  import { registerRouteCommands } from "../lib/palette-registry.svelte";
 
   type Phase = "idle" | "scanning" | "results" | "cleaning" | "done";
 
@@ -200,6 +202,23 @@
     }, 6000);
     return () => clearTimeout(timer);
   });
+
+  // ---- Cmd+K 命令面板路由动作命令（U2）。**严格镜像按钮的相位可用性**（KTD2 / 评审 correctness+adversarial）：
+  // 只在按钮可见的相位暴露对应命令——cleaning 相位不出扫描/删除命令、done 只出「再次扫描」。
+  // 否则清理进行中经面板再触发 startScan/primaryDelete 会与在途操作并发（本仓反复防范，见下方 onMount 注释）。
+  // run 引既有函数保留删除分流（KTD3）：primaryDelete 全 Safe 直删、含 Risky 走 ConfirmDelete，命令层不绕过。----
+  const paletteCommands = $derived<Command[]>([
+    ...(phase === "scanning"
+      ? [{ id: "clean.cancel", title: "取消扫描", keywords: ["cancel", "quxiao"], run: cancel }]
+      : []),
+    ...(phase === "results" || phase === "done"
+      ? [{ id: "clean.scan", title: phase === "done" ? "再次扫描" : "重新扫描", keywords: ["scan", "rescan", "chongxin"], run: startScan }]
+      : []),
+    ...(phase === "results" && selectedItems.length > 0
+      ? [{ id: "clean.trash", title: "移入废纸篓", keywords: ["trash", "delete", "feizhilou"], run: primaryDelete }]
+      : []),
+  ]);
+  registerRouteCommands(() => paletteCommands);
 
   onMount(() => {
     // FDA 已授权后进入 Clean 即给「首屏答案」——自动开扫，稳定外壳内内容填充（F1）。

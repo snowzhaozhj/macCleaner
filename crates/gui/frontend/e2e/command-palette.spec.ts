@@ -67,12 +67,10 @@ test("↑ 从首项环绕到末项；点击某项执行（R3）", async ({ page 
     "true",
   );
 
-  // ↑ 环绕到末项「打开磁盘访问权限设置」。
+  // ↑ 环绕到末项。末项不再硬编码为静态 act.fda——着陆的 Clean 路由会在其后追加动作命令
+  // （U5：路由内动作命令特性），故按「最后一个 option」断言，保留环绕契约而不耦合命令集长度。
   await page.keyboard.press("ArrowUp");
-  await expect(page.getByRole("option", { name: "打开磁盘访问权限设置" })).toHaveAttribute(
-    "aria-selected",
-    "true",
-  );
+  await expect(page.getByRole("option").last()).toHaveAttribute("aria-selected", "true");
 
   // 鼠标点击「分析」直接执行 → 切到分析 tab。
   await page.getByRole("option", { name: "分析" }).click();

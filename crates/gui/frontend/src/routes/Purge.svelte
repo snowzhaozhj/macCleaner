@@ -35,6 +35,8 @@
   import UndoToast from "../lib/UndoToast.svelte";
   import ConfirmDelete from "../lib/ConfirmDelete.svelte";
   import type { ConfirmItem } from "../lib/ConfirmDelete.svelte";
+  import type { Command } from "../lib/palette";
+  import { registerRouteCommands } from "../lib/palette-registry.svelte";
 
   type Phase = "idle" | "scanning" | "results" | "cleaning" | "done";
 
@@ -62,6 +64,25 @@
   const segments = $derived(
     computeSegments(cats.map((c) => ({ ...c, size: c.selectedSize }))),
   );
+
+  // ---- Cmd+K 命令面板路由动作命令（U2）。**严格镜像按钮的相位可用性**（KTD2 / 评审 correctness+adversarial）；
+  // run 引既有函数保留删除分流（KTD3）。选目录在扫描/清理中省略（对应按钮此时 disabled）；未选目标不出扫描命令；
+  // 移入废纸篓仅 results 相位（对应按钮仅此相位渲染）——否则扫描期 Safe 预选会让删除命令在途扫描时并发触发。----
+  const paletteCommands = $derived<Command[]>([
+    ...(phase !== "scanning" && phase !== "cleaning"
+      ? [{ id: "purge.chooseDir", title: "选择目录", keywords: ["dir", "choose", "mulu", "xuanze"], run: chooseDir }]
+      : []),
+    ...(phase === "scanning"
+      ? [{ id: "purge.cancel", title: "取消扫描", keywords: ["cancel", "quxiao"], run: cancel }]
+      : []),
+    ...(phase !== "scanning" && phase !== "cleaning" && target
+      ? [{ id: "purge.scan", title: phase === "idle" ? "开始扫描" : "重新扫描", keywords: ["scan", "saomiao"], run: startScan }]
+      : []),
+    ...(phase === "results" && selectedItems.length > 0
+      ? [{ id: "purge.trash", title: "移入废纸篓", keywords: ["trash", "delete", "feizhilou"], run: primaryDelete }]
+      : []),
+  ]);
+  registerRouteCommands(() => paletteCommands);
 
   function setPhase(p: Phase) {
     withViewTransition(() => {

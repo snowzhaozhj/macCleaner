@@ -32,6 +32,8 @@
   import UndoToast from "../lib/UndoToast.svelte";
   import ConfirmDelete from "../lib/ConfirmDelete.svelte";
   import type { ConfirmItem } from "../lib/ConfirmDelete.svelte";
+  import type { Command } from "../lib/palette";
+  import { registerRouteCommands } from "../lib/palette-registry.svelte";
 
   // 显式相位机（KTD6）：list→review→delete 无法照搬 Clean/Purge 的 idle/scanning/results。
   type Phase =
@@ -88,6 +90,21 @@
   const leftoverCount = $derived(Math.max(0, reviewItems.length - 1));
   const noBundleNote = $derived(phase === "reviewReady" && !hasBundleId);
   const noLeftoverNote = $derived(phase === "reviewReady" && hasBundleId && leftoverCount === 0);
+
+  // ---- Cmd+K 命令面板路由动作命令（U3）。两阶段九态：list 阶段可重扫，review 阶段可返回/删除。
+  // selectApp 需入参（选哪个 App）→ 出范围（KTD5）。删除经 primaryDelete 保留分流（KTD3）。----
+  const paletteCommands = $derived<Command[]>([
+    ...(phase === "listReady" || phase === "listEmpty" || phase === "listError"
+      ? [{ id: "uninstall.rescan", title: "重新扫描应用", keywords: ["rescan", "scan", "saomiao", "yingyong"], run: startListScan }]
+      : []),
+    ...(phase === "reviewReady" || phase === "reviewError" || phase === "done"
+      ? [{ id: "uninstall.back", title: "返回应用列表", keywords: ["back", "list", "fanhui", "liebiao"], run: backToList }]
+      : []),
+    ...(phase === "reviewReady" && selectedItems.length > 0
+      ? [{ id: "uninstall.trash", title: "移入废纸篓", keywords: ["trash", "delete", "feizhilou"], run: primaryDelete }]
+      : []),
+  ]);
+  registerRouteCommands(() => paletteCommands);
 
   function setPhase(p: Phase) {
     withViewTransition(() => {

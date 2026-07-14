@@ -7,6 +7,7 @@
   import Onboarding from "./routes/Onboarding.svelte";
   import CommandPalette from "./lib/CommandPalette.svelte";
   import type { Command } from "./lib/palette";
+  import { routeCommands } from "./lib/palette-registry.svelte";
 
   type Boot = "checking" | "onboarding" | "ready";
   type Tab = "clean" | "purge" | "uninstall" | "analyze";
@@ -28,8 +29,8 @@
   // 打开前触发面板的元素；关闭时焦点还原到它，不留焦点陷阱残留（R4）。
   let paletteTrigger: HTMLElement | null = null;
 
-  /** 命令集：4 导航 + 2 全局动作（KTD1/KTD3）。路由内动作命令后续扩展。 */
-  const commands: Command[] = [
+  /** 静态命令：4 导航 + 2 全局动作（KTD1/KTD3），不依赖路由内部状态。 */
+  const staticCommands: Command[] = [
     { id: "nav.clean", title: "清理", keywords: ["clean", "qingli"], run: () => (tab = "clean") },
     { id: "nav.purge", title: "开发清理", keywords: ["purge", "dev", "kaifa"], run: () => (tab = "purge") },
     { id: "nav.uninstall", title: "卸载", keywords: ["uninstall", "xiezai"], run: () => (tab = "uninstall") },
@@ -37,6 +38,9 @@
     { id: "act.trash", title: "打开废纸篓", keywords: ["trash", "feizhilou"], run: () => void openTrash() },
     { id: "act.fda", title: "打开磁盘访问权限设置", keywords: ["fda", "permission", "quanxian"], run: () => void openFdaSettings() },
   ];
+
+  // 面板命令 = 静态 + 当前路由动态注册（KTD1）。路由命令随其相位/选择态反应式增删（KTD2）。
+  const commands = $derived<Command[]>([...staticCommands, ...routeCommands()]);
 
   function openPalette() {
     paletteTrigger = document.activeElement as HTMLElement | null;

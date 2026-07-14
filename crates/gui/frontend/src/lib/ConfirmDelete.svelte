@@ -30,7 +30,15 @@
   const totalSize = $derived(items.reduce((s, i) => s + i.size, 0));
 
   let input = $state("");
+  let inputEl = $state<HTMLInputElement | null>(null);
   const canDelete = $derived(!requiresToken || isConfirmed(input));
+
+  // 挂载即显式聚焦口令框，不依赖 autofocus 属性：命令面板触发删除时 closePalette 会先把焦点
+  // 还原到 .tab.active（App.svelte R4），此时 autofocus 不保证抢焦（CommandPalette 亦记载此坑，
+  // 评审 julik-frontend-races）。显式 focus() 保证 type-to-confirm 口令框对纯键盘用户可达。
+  $effect(() => {
+    inputEl?.focus();
+  });
 
   function handleDelete() {
     // 不绑定 Enter：必须点已启用按钮（DESIGN.md §6 / U8）。
@@ -72,6 +80,7 @@
         <!-- svelte-ignore a11y_autofocus -->
         <input
           type="text"
+          bind:this={inputEl}
           bind:value={input}
           placeholder={CONFIRM_TOKEN}
           spellcheck="false"
