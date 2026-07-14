@@ -1,10 +1,12 @@
 <script lang="ts">
-  import { checkFda, type ProbeResult } from "./lib/ipc";
+  import { checkFda, openTrash, openFdaSettings, type ProbeResult } from "./lib/ipc";
   import Clean from "./routes/Clean.svelte";
   import Purge from "./routes/Purge.svelte";
   import Uninstall from "./routes/Uninstall.svelte";
   import Analyze from "./routes/Analyze.svelte";
   import Onboarding from "./routes/Onboarding.svelte";
+  import CommandPalette from "./lib/CommandPalette.svelte";
+  import type { Command } from "./lib/palette";
 
   type Boot = "checking" | "onboarding" | "ready";
   type Tab = "clean" | "purge" | "uninstall" | "analyze";
@@ -20,6 +22,52 @@
   let boot = $state<Boot>("checking");
   let probes = $state<ProbeResult[]>([]);
   let tab = $state<Tab>("clean");
+
+  // ---- Cmd+K 命令面板（move7 收尾）：加速器而非唯一入口，四 tab 可见导航保留（R7）----
+  let paletteOpen = $state(false);
+  // 打开前触发面板的元素；关闭时焦点还原到它，不留焦点陷阱残留（R4）。
+  let paletteTrigger: HTMLElement | null = null;
+
+  /** 命令集：4 导航 + 2 全局动作（KTD1/KTD3）。路由内动作命令后续扩展。 */
+  const commands: Command[] = [
+    { id: "nav.clean", title: "清理", keywords: ["clean", "qingli"], run: () => (tab = "clean") },
+    { id: "nav.purge", title: "开发清理", keywords: ["purge", "dev", "kaifa"], run: () => (tab = "purge") },
+    { id: "nav.uninstall", title: "卸载", keywords: ["uninstall", "xiezai"], run: () => (tab = "uninstall") },
+    { id: "nav.analyze", title: "分析", keywords: ["analyze", "fenxi"], run: () => (tab = "analyze") },
+    { id: "act.trash", title: "打开废纸篓", keywords: ["trash", "feizhilou"], run: () => void openTrash() },
+    { id: "act.fda", title: "打开磁盘访问权限设置", keywords: ["fda", "permission", "quanxian"], run: () => void openFdaSettings() },
+  ];
+
+  function openPalette() {
+    paletteTrigger = document.activeElement as HTMLElement | null;
+    paletteOpen = true;
+  }
+  function closePalette() {
+    paletteOpen = false;
+    // R4 焦点还原：若触发元素已随导航命令卸载（focus() 对脱离 DOM 的节点静默失败，
+    // 焦点会落到 body），回退聚焦当前激活 tab——审查发现，correctness+julik+adversarial 三家一致。
+    const target = paletteTrigger?.isConnected
+      ? paletteTrigger
+      : document.querySelector<HTMLElement>(".tab.active");
+    target?.focus();
+    paletteTrigger = null;
+  }
+
+  function onGlobalKey(e: KeyboardEvent) {
+    // Cmd+K（macOS 主路径）/ Ctrl+K；仅主界面（ready）唤起，onboarding/checking 不响应（R1）。
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      if (boot !== "ready") return;
+      if (e.repeat) return; // 长按 K 自动重复不应反复 toggle（审查：adversarial）
+      e.preventDefault(); // 拦截 webview 默认（部分 Ctrl+K 聚焦地址栏）
+      if (paletteOpen) closePalette();
+      else openPalette();
+    }
+  }
+
+  $effect(() => {
+    window.addEventListener("keydown", onGlobalKey);
+    return () => window.removeEventListener("keydown", onGlobalKey);
+  });
 
   async function runFdaCheck() {
     boot = "checking";
@@ -88,6 +136,10 @@
     <span class="hint">macCleaner · 移废纸篓可恢复 · 零遥测</span>
     <span class="mode">{boot === "ready" ? TAB_LABELS[tab] : ""}</span>
   </footer>
+
+  {#if paletteOpen}
+    <CommandPalette {commands} onClose={closePalette} />
+  {/if}
 </div>
 
 <style>
