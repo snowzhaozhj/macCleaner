@@ -20,6 +20,8 @@
   import CopyButton from "../lib/CopyButton.svelte";
   import AnalyzeReviewRow from "../lib/AnalyzeReviewRow.svelte";
   import type { ConfirmItem } from "../lib/ConfirmDelete.svelte";
+  import type { Command } from "../lib/palette";
+  import { registerRouteCommands } from "../lib/palette-registry.svelte";
 
   type Phase = "idle" | "analyzing" | "ready" | "deleting";
 
@@ -37,6 +39,23 @@
   let toast = $state<ToastState>(null);
 
   const analyzing = $derived(phase === "analyzing");
+
+  // ---- Cmd+K 命令面板路由动作命令（U4）。Analyze 是「浏览+逐项标记」模型：删除命令用
+  // 「删除标记」而非「移入废纸篓」（R6 词汇一致）。openConfirm 先 classifyMarked 回查安全分级、
+  // 失败保守归 Risky（fail-closed）——命令层引它即继承该保护，绝不绕过 ConfirmDelete（KTD3）。
+  // enter/gotoTrail 需入参（哪个节点/哪层）→ 出范围（KTD5）。----
+  const paletteCommands = $derived<Command[]>([
+    ...(phase === "idle" || phase === "ready"
+      ? [{ id: "analyze.start", title: phase === "idle" ? "分析主目录" : "重新分析", keywords: ["analyze", "scan", "fenxi", "saomiao"], run: startAnalyze }]
+      : []),
+    ...(phase === "analyzing"
+      ? [{ id: "analyze.cancel", title: "取消", keywords: ["cancel", "quxiao"], run: cancel }]
+      : []),
+    ...(phase === "ready" && marked.size > 0
+      ? [{ id: "analyze.deleteMarked", title: "删除标记", keywords: ["delete", "marked", "shanchu", "biaoji"], run: openConfirm }]
+      : []),
+  ]);
+  registerRouteCommands(() => paletteCommands);
 
   // 当前所在节点：按 navPaths 从 tree 走下去（存储序，健壮于剪树后的引用变化）
   const currentNode = $derived.by(() => {
