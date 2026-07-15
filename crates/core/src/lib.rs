@@ -7,6 +7,7 @@ pub mod models;
 pub mod park_walk;
 pub mod platform;
 pub mod progress;
+pub mod restore;
 pub mod rules;
 pub mod scanner;
 pub mod tree_builder;
