@@ -260,4 +260,34 @@ mod tests {
         assert!(ok.original.exists());
         assert_eq!(fs::read_to_string(&occupied.original).unwrap(), "USER");
     }
+
+    /// 端到端真实回路：`Cleaner`（真移废纸篓）→ `HistoryEntry::from_report`（建映射）→
+    /// `restore`（放回）。用真实 `~/.Trash`，但恢复会把文件移回原址，故无废纸篓污染。
+    #[test]
+    fn end_to_end_clean_capture_record_restore_roundtrip() {
+        use crate::cleaner::Cleaner;
+        use crate::history::{HistoryCommand, HistoryEntry};
+        use crate::models::{DeleteMode, SafetyLevel, ScanItem};
+        use crate::progress::NoopReporter;
+
+        let dir = tempdir().unwrap();
+        let unique = format!("mc_undo_e2e_{}.txt", std::process::id());
+        let file = dir.path().join(&unique);
+        fs::write(&file, "precious").unwrap();
+
+        // 1) 清理：移入废纸篓，捕获落点。
+        let item = ScanItem::new(file.clone(), 8, SafetyLevel::Safe, "test".into());
+        let report = Cleaner::execute(&[&item], DeleteMode::Trash, &NoopReporter).unwrap();
+        assert!(!file.exists(), "清理后原址应消失");
+
+        // 2) 记账：从报告构建 restorable 映射。
+        let entry = HistoryEntry::from_report(HistoryCommand::Clean, &[&item], &report);
+        assert_eq!(entry.restorable.len(), 1, "应记录一条可恢复映射");
+
+        // 3) 撤销：放回原址。
+        let restore_report = restore(&entry.restorable, false);
+        assert_eq!(restore_report.restored_count(), 1);
+        assert!(file.exists(), "撤销后文件应回到原址");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "precious", "内容应完好");
+    }
 }
