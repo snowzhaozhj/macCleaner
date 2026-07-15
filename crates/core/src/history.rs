@@ -45,6 +45,16 @@ pub struct CategoryStat {
     pub count: usize,
 }
 
+/// 一条可确定性恢复的映射：原始路径 → 移入废纸篓后的落点。
+///
+/// 只有 Trash 删除且落点捕获成功的成功项才产生此映射（见 `cleaner::Cleaner::move_to_trash`）。
+/// `mc undo` 据此把 `trashed_to` 放回 `original`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreEntry {
+    pub original: PathBuf,
+    pub trashed_to: PathBuf,
+}
+
 /// 一次清理的账本条目（JSONL 中的一行）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEntry {
@@ -60,6 +70,11 @@ pub struct HistoryEntry {
     pub categories: Vec<CategoryStat>,
     /// 成功删除的路径列表（只含成功项，与剪树安全数据源同源）。
     pub deleted_paths: Vec<PathBuf>,
+    /// 可确定性恢复的映射（原始路径 → 废纸篓落点）。只含 Trash 删除且捕获到落点的成功项，
+    /// 故通常是 `deleted_paths` 的子集。`#[serde(default)]` 保证 #24 已写入的旧账本行
+    /// （无此字段）仍能加载——旧行 `restorable` 为空，`mc undo` 对其降级到 Finder 放回。
+    #[serde(default)]
+    pub restorable: Vec<RestoreEntry>,
 }
 
 impl HistoryEntry {
@@ -96,6 +111,19 @@ impl HistoryEntry {
             .map(|(name, (size, count))| CategoryStat { name, size, count })
             .collect();
 
+        // 可恢复映射：成功且捕获到废纸篓落点的项（Trash 删除专属；永久删除/捕获失败无落点）。
+        let restorable: Vec<RestoreEntry> = report
+            .cleaned
+            .iter()
+            .filter(|c| c.success)
+            .filter_map(|c| {
+                c.trashed_to.clone().map(|trashed_to| RestoreEntry {
+                    original: c.path.clone(),
+                    trashed_to,
+                })
+            })
+            .collect();
+
         Self {
             run_id: gen_run_id(),
             timestamp: now_unix_secs(),
@@ -104,6 +132,7 @@ impl HistoryEntry {
             count: report.success_count,
             categories,
             deleted_paths,
+            restorable,
         }
     }
 }
@@ -198,6 +227,10 @@ mod tests {
             count: 2,
             categories: vec![CategoryStat { name: "node_modules".into(), size: 1234, count: 2 }],
             deleted_paths: vec![PathBuf::from("/a"), PathBuf::from("/b")],
+            restorable: vec![RestoreEntry {
+                original: PathBuf::from("/a"),
+                trashed_to: PathBuf::from("/Users/x/.Trash/a"),
+            }],
         };
         let line = serde_json::to_string(&entry).unwrap();
         // 命令类型序列化为小写字符串，便于外部消费。
@@ -220,6 +253,7 @@ mod tests {
             count: 1,
             categories: vec![],
             deleted_paths: vec![PathBuf::from("/x")],
+            restorable: vec![],
         };
         let mut e2 = e1.clone();
         e2.run_id = "r2".into();
@@ -246,6 +280,7 @@ mod tests {
             count: 1,
             categories: vec![],
             deleted_paths: vec![],
+            restorable: vec![],
         })
         .unwrap();
         // 中间夹一行坏 JSON + 一行空行，均应被跳过而非丢整本账本。
@@ -301,5 +336,62 @@ mod tests {
             p.ends_with(".local/state/mc/history.jsonl"),
             "默认路径应落在 ~/.local/state/mc/history.jsonl，实际: {p:?}"
         );
+    }
+
+    #[test]
+    fn from_report_builds_restorable_only_from_successful_captured_items() {
+        // 三项：a 成功且有落点、b 成功但无落点（捕获失败/永久删除）、c 失败。
+        // restorable 只应含 a。
+        let a = item("/cache/a", 100, "系统缓存");
+        let b = item("/cache/b", 50, "系统缓存");
+        let c = item("/logs/c", 999, "日志");
+        let items: Vec<&ScanItem> = vec![&a, &b, &c];
+
+        let mut report = CleanReport::default();
+        report.add(CleanedItem {
+            path: a.path.clone(),
+            size: 100,
+            success: true,
+            error: None,
+            trashed_to: Some(PathBuf::from("/Users/x/.Trash/a")),
+        });
+        report.add(CleanedItem {
+            path: b.path.clone(),
+            size: 50,
+            success: true,
+            error: None,
+            trashed_to: None,
+        });
+        report.add(CleanedItem {
+            path: c.path.clone(),
+            size: 999,
+            success: false,
+            error: Some("权限不足".into()),
+            trashed_to: Some(PathBuf::from("/Users/x/.Trash/c")), // 失败项即便有落点也不应计入
+        });
+
+        let entry = HistoryEntry::from_report(HistoryCommand::Clean, &items, &report);
+
+        assert_eq!(entry.restorable.len(), 1, "只含成功且有落点的项");
+        assert_eq!(entry.restorable[0].original, a.path);
+        assert_eq!(entry.restorable[0].trashed_to, PathBuf::from("/Users/x/.Trash/a"));
+        // deleted_paths 仍按原语义含全部成功项（a、b），与 restorable 解耦。
+        assert_eq!(entry.deleted_paths.len(), 2);
+    }
+
+    #[test]
+    fn load_old_entry_without_restorable_field_defaults_empty() {
+        // 保护 #24 已写入的历史账本：不含 restorable 字段的旧行必须能加载，restorable 为空。
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let old_line = r#"{"run_id":"old-1","timestamp":100,"command":"clean","freed":42,"count":1,"categories":[],"deleted_paths":["/old/x"]}"#;
+        std::fs::write(&path, format!("{old_line}\n")).unwrap();
+
+        let loaded = load(&path);
+        assert_eq!(loaded.len(), 1, "旧行应正常加载");
+        assert_eq!(loaded[0].run_id, "old-1");
+        assert_eq!(loaded[0].freed, 42);
+        assert!(loaded[0].restorable.is_empty(), "缺失 restorable 字段应默认空 Vec");
+        assert_eq!(loaded[0].deleted_paths, vec![PathBuf::from("/old/x")]);
     }
 }
