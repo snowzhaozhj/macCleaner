@@ -270,13 +270,14 @@ mod tests {
         let items: Vec<&ScanItem> = vec![&a, &b, &c];
 
         let mut report = CleanReport::default();
-        report.add(CleanedItem { path: a.path.clone(), size: 100, success: true, error: None });
-        report.add(CleanedItem { path: b.path.clone(), size: 50, success: true, error: None });
+        report.add(CleanedItem { path: a.path.clone(), size: 100, success: true, error: None, trashed_to: None });
+        report.add(CleanedItem { path: b.path.clone(), size: 50, success: true, error: None, trashed_to: None });
         report.add(CleanedItem {
             path: c.path.clone(),
             size: 999,
             success: false,
             error: Some("权限不足".into()),
+            trashed_to: None,
         });
 
         let entry = HistoryEntry::from_report(HistoryCommand::Clean, &items, &report);

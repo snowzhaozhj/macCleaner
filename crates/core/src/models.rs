@@ -127,6 +127,11 @@ pub struct CleanedItem {
     pub size: u64,
     pub success: bool,
     pub error: Option<String>,
+    /// 移入废纸篓后的实际落点（`~/.Trash/<name>`）。仅 `DeleteMode::Trash` 且捕获成功时为 `Some`；
+    /// 永久删除、捕获失败（读不到 `~/.Trash`、差集歧义、非 home 卷）恒 `None`。
+    /// 这是 `mc undo` 确定性放回的数据源。`#[serde(default)]` 保证旧 `CleanReport` JSON 向后兼容。
+    #[serde(default)]
+    pub trashed_to: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
