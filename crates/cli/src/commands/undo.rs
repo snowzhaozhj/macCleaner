@@ -34,7 +34,7 @@ pub fn run(cli: &Cli, run_id: Option<&str>) -> Result<()> {
     let Some(entry) = select_entry(&entries, run_id) else {
         // 找不到目标条目：给定的 run-id 不存在，或账本里根本没有可恢复的记录。
         if cli.json {
-            println!("{}", serde_json::to_string_pretty(&restore::RestoreReport::default())?);
+            print_empty_json(cli.dry_run)?;
         } else if run_id.is_some() {
             println!("未找到该次清理记录（run-id 不存在）。");
         } else {
@@ -47,7 +47,7 @@ pub fn run(cli: &Cli, run_id: Option<&str>) -> Result<()> {
     if entry.restorable.is_empty() {
         // 命中了条目但它无落点映射（旧记录/未捕获）→ 降级到 Finder 放回。
         if cli.json {
-            println!("{}", serde_json::to_string_pretty(&restore::RestoreReport::default())?);
+            print_empty_json(cli.dry_run)?;
         } else {
             println!("该次清理（{}）无确定性落点记录，无法自动放回。", entry.command.label());
             print_finder_hint();
@@ -63,6 +63,13 @@ pub fn run(cli: &Cli, run_id: Option<&str>) -> Result<()> {
     }
 
     render(&report, entry);
+    Ok(())
+}
+
+/// 打印一份空的恢复报告（JSON）。无可恢复项的各降级分支共用，`dry_run` 如实反映本次调用。
+fn print_empty_json(dry_run: bool) -> Result<()> {
+    let report = restore::RestoreReport { dry_run, ..Default::default() };
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
@@ -128,6 +135,7 @@ mod tests {
                 .map(|p| RestoreEntry {
                     original: PathBuf::from(p),
                     trashed_to: PathBuf::from(format!("/T/{p}")),
+                    trashed_ino: 1,
                 })
                 .collect(),
         }

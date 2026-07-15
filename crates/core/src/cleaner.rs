@@ -2,6 +2,7 @@ use crate::models::{CleanReport, CleanedItem, DeleteMode, ScanItem};
 use crate::progress::{ProgressEvent, ProgressReporter};
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// 清理执行器，支持移到废纸篓和永久删除两种模式
@@ -28,13 +29,19 @@ impl Cleaner {
             };
 
             match result {
-                Ok(trashed_to) => {
+                Ok(captured) => {
+                    // 落点路径与 inode 成对存在，缺一即视为未捕获。
+                    let (trashed_to, trashed_ino) = match captured {
+                        Some((p, ino)) => (Some(p), Some(ino)),
+                        None => (None, None),
+                    };
                     report.add(CleanedItem {
                         path: item.path.clone(),
                         size: item.size,
                         success: true,
                         error: None,
                         trashed_to,
+                        trashed_ino,
                     });
                 }
                 Err(e) => {
@@ -46,6 +53,7 @@ impl Cleaner {
                         success: false,
                         error: Some(e.to_string()),
                         trashed_to: None,
+                        trashed_ino: None,
                     });
                 }
             }
@@ -76,25 +84,30 @@ impl Cleaner {
                 success: true,
                 error: None,
                 trashed_to: None,
+                trashed_ino: None,
             });
         }
         report
     }
 
-    /// 移入废纸篓，并尽力捕获落点路径（`~/.Trash/<name>`）。
+    /// 移入废纸篓，并尽力捕获落点路径与其 inode（`~/.Trash/<name>` + inode）。
     ///
     /// 捕获策略：删除前后各读一次 `~/.Trash` 顶层名集合，取差集中 basename 词干匹配原文件名的
-    /// **唯一**新条目。差集为空/多义/读目录失败 → 返回 `Ok(None)`（诚实降级，绝不猜）。
+    /// **唯一**新条目，再 stat 该落点取 inode。差集为空/多义/读目录失败/stat 失败 → 返回 `Ok(None)`
+    /// （诚实降级，绝不猜）。路径与 inode 必须成对捕获：inode 供恢复时校验身份，防废纸篓名字复用导致误恢复。
     /// 捕获失败不影响删除成功——删除本身若失败才返回 `Err`。
-    fn move_to_trash(path: &Path) -> anyhow::Result<Option<PathBuf>> {
+    fn move_to_trash(path: &Path) -> anyhow::Result<Option<(PathBuf, u64)>> {
         let trash = crate::platform::trash_dir();
         let before = read_trash_names(&trash);
         trash::delete(path)?;
         // 删除成功后再快照，差集即本次新增。before 为 None（读不到废纸篓）时不尝试捕获。
         let dest = before.and_then(|before| {
             let after = read_trash_names(&trash)?;
-            path.file_name()
-                .and_then(|name| pick_new_trash_entry(&trash, &before, &after, name))
+            let name = path.file_name()?;
+            let p = pick_new_trash_entry(&trash, &before, &after, name)?;
+            // stat 落点取 inode；stat 失败则整体放弃捕获（路径与 inode 必须成对）。
+            let ino = std::fs::symlink_metadata(&p).ok()?.ino();
+            Some((p, ino))
         });
         Ok(dest)
     }
@@ -144,8 +157,9 @@ fn pick_new_trash_entry(
     let mut matches = after
         .difference(before)
         .filter(|name| {
-            let n = name.to_string_lossy();
-            *n == *original || n.starts_with(&collision_prefix)
+            // 精确名直接比 OsStr（避免 lossy 往返把两个不同的非 UTF8 名折叠成同一个）；
+            // 碰撞重命名 "stem N.ext" 才需字符串前缀判断。
+            name.as_os_str() == original_name || name.to_string_lossy().starts_with(&collision_prefix)
         });
     let first = matches.next()?;
     // 存在第二个匹配 → 歧义，放弃。

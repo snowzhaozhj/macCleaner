@@ -45,14 +45,16 @@ pub struct CategoryStat {
     pub count: usize,
 }
 
-/// 一条可确定性恢复的映射：原始路径 → 移入废纸篓后的落点。
+/// 一条可确定性恢复的映射：原始路径 → 移入废纸篓后的落点（含 inode 身份）。
 ///
-/// 只有 Trash 删除且落点捕获成功的成功项才产生此映射（见 `cleaner::Cleaner::move_to_trash`）。
-/// `mc undo` 据此把 `trashed_to` 放回 `original`。
+/// 只有 Trash 删除且落点+inode 捕获成功的成功项才产生此映射（见 `cleaner::Cleaner::move_to_trash`）。
+/// `mc undo` 据此把 `trashed_to` 放回 `original`，并用 `trashed_ino` 校验废纸篓里的名字仍是当初那个文件
+/// （macOS 清空后复用名字，仅凭路径会误恢复无关同名文件）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreEntry {
     pub original: PathBuf,
     pub trashed_to: PathBuf,
+    pub trashed_ino: u64,
 }
 
 /// 一次清理的账本条目（JSONL 中的一行）。
@@ -111,16 +113,21 @@ impl HistoryEntry {
             .map(|(name, (size, count))| CategoryStat { name, size, count })
             .collect();
 
-        // 可恢复映射：成功且捕获到废纸篓落点的项（Trash 删除专属；永久删除/捕获失败无落点）。
+        // 可恢复映射：成功且捕获到废纸篓落点+inode 的项（Trash 删除专属；永久删除/捕获失败无落点）。
         let restorable: Vec<RestoreEntry> = report
             .cleaned
             .iter()
             .filter(|c| c.success)
             .filter_map(|c| {
-                c.trashed_to.clone().map(|trashed_to| RestoreEntry {
-                    original: c.path.clone(),
-                    trashed_to,
-                })
+                // 路径与 inode 必须成对；缺一即视为未捕获，不产生可恢复映射。
+                match (c.trashed_to.clone(), c.trashed_ino) {
+                    (Some(trashed_to), Some(trashed_ino)) => Some(RestoreEntry {
+                        original: c.path.clone(),
+                        trashed_to,
+                        trashed_ino,
+                    }),
+                    _ => None,
+                }
             })
             .collect();
 
@@ -230,6 +237,7 @@ mod tests {
             restorable: vec![RestoreEntry {
                 original: PathBuf::from("/a"),
                 trashed_to: PathBuf::from("/Users/x/.Trash/a"),
+                trashed_ino: 4242,
             }],
         };
         let line = serde_json::to_string(&entry).unwrap();
@@ -305,14 +313,15 @@ mod tests {
         let items: Vec<&ScanItem> = vec![&a, &b, &c];
 
         let mut report = CleanReport::default();
-        report.add(CleanedItem { path: a.path.clone(), size: 100, success: true, error: None, trashed_to: None });
-        report.add(CleanedItem { path: b.path.clone(), size: 50, success: true, error: None, trashed_to: None });
+        report.add(CleanedItem { path: a.path.clone(), size: 100, success: true, error: None, trashed_to: None, trashed_ino: None });
+        report.add(CleanedItem { path: b.path.clone(), size: 50, success: true, error: None, trashed_to: None, trashed_ino: None });
         report.add(CleanedItem {
             path: c.path.clone(),
             size: 999,
             success: false,
             error: Some("权限不足".into()),
             trashed_to: None,
+            trashed_ino: None,
         });
 
         let entry = HistoryEntry::from_report(HistoryCommand::Clean, &items, &report);
@@ -340,12 +349,13 @@ mod tests {
 
     #[test]
     fn from_report_builds_restorable_only_from_successful_captured_items() {
-        // 三项：a 成功且有落点、b 成功但无落点（捕获失败/永久删除）、c 失败。
-        // restorable 只应含 a。
+        // 四项：a 成功且路径+inode 齐全、b 成功但无落点、d 成功但有路径无 inode（不成对）、c 失败。
+        // restorable 只应含 a（路径与 inode 必须成对）。
         let a = item("/cache/a", 100, "系统缓存");
         let b = item("/cache/b", 50, "系统缓存");
+        let d = item("/cache/d", 20, "系统缓存");
         let c = item("/logs/c", 999, "日志");
-        let items: Vec<&ScanItem> = vec![&a, &b, &c];
+        let items: Vec<&ScanItem> = vec![&a, &b, &d, &c];
 
         let mut report = CleanReport::default();
         report.add(CleanedItem {
@@ -354,6 +364,7 @@ mod tests {
             success: true,
             error: None,
             trashed_to: Some(PathBuf::from("/Users/x/.Trash/a")),
+            trashed_ino: Some(4242),
         });
         report.add(CleanedItem {
             path: b.path.clone(),
@@ -361,22 +372,33 @@ mod tests {
             success: true,
             error: None,
             trashed_to: None,
+            trashed_ino: None,
+        });
+        report.add(CleanedItem {
+            path: d.path.clone(),
+            size: 20,
+            success: true,
+            error: None,
+            trashed_to: Some(PathBuf::from("/Users/x/.Trash/d")),
+            trashed_ino: None, // 路径有但 inode 缺 → 不成对，不计入
         });
         report.add(CleanedItem {
             path: c.path.clone(),
             size: 999,
             success: false,
             error: Some("权限不足".into()),
-            trashed_to: Some(PathBuf::from("/Users/x/.Trash/c")), // 失败项即便有落点也不应计入
+            trashed_to: Some(PathBuf::from("/Users/x/.Trash/c")),
+            trashed_ino: Some(9), // 失败项即便有落点也不应计入
         });
 
         let entry = HistoryEntry::from_report(HistoryCommand::Clean, &items, &report);
 
-        assert_eq!(entry.restorable.len(), 1, "只含成功且有落点的项");
+        assert_eq!(entry.restorable.len(), 1, "只含成功且路径+inode 成对的项");
         assert_eq!(entry.restorable[0].original, a.path);
         assert_eq!(entry.restorable[0].trashed_to, PathBuf::from("/Users/x/.Trash/a"));
-        // deleted_paths 仍按原语义含全部成功项（a、b），与 restorable 解耦。
-        assert_eq!(entry.deleted_paths.len(), 2);
+        assert_eq!(entry.restorable[0].trashed_ino, 4242);
+        // deleted_paths 仍按原语义含全部成功项（a、b、d），与 restorable 解耦。
+        assert_eq!(entry.deleted_paths.len(), 3);
     }
 
     #[test]
