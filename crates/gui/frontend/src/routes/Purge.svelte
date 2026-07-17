@@ -245,6 +245,7 @@
     if (report) {
       lastReport = report;
       lastRunId = runId;
+      undoResult = null; // 新一次清理：清掉上次撤销缓存（评审 #1）。
       if (report.success_count > 0) {
         toast = nextToast(toast, report.success_count, report.total_freed);
       }
@@ -257,8 +258,31 @@
   }
 
   // 真一键撤销：仅当本次清理写出账本条目（run_id 非空）时可用，按 run_id 精确命中（KTD1）。
+  //
+  // **撤销至多发一次 IPC**（评审 #1，同 Clean.svelte）：回执与吐司共享 undoAction，各自组件内的
+  // in-flight 守卫互不可见——先点吐司再点回执会二次 restore 得到全跳过的误导报告。故上提撤销生命周期
+  // 到父组件：`undoPromise` 合并并发调用，`undoResult` 缓存有实际放回的结果供后续入口重放、不再发
+  // IPC；空报告不缓存，允许各入口走 Finder 降级重试（R4）。
+  let undoResult: RestoreReport | null = null;
+  let undoPromise: Promise<RestoreReport> | null = null;
+
+  function runUndo(): Promise<RestoreReport> {
+    const id = lastRunId;
+    if (!id) return Promise.resolve({ outcomes: [], dry_run: false });
+    if (undoResult) return Promise.resolve(undoResult);
+    undoPromise ??= undo(id)
+      .then((r) => {
+        if (r.outcomes.length > 0) undoResult = r;
+        return r;
+      })
+      .finally(() => {
+        undoPromise = null;
+      });
+    return undoPromise;
+  }
+
   const undoAction = $derived<(() => Promise<RestoreReport>) | null>(
-    lastRunId ? () => undo(lastRunId as string) : null,
+    lastRunId ? runUndo : null,
   );
 
   function onUndone() {
