@@ -6,13 +6,13 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use mc_core::engine::Engine;
-use mc_core::history::HistoryCommand;
+use mc_core::history::{self, HistoryCommand};
 use mc_core::models::{DeleteMode, ScanItem, ScanResult};
 use mc_core::progress::ProgressEvent;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 
-use crate::commands::{authorize_deletion, clean::select_by_paths, record_history, CleanResponse};
+use crate::commands::{authorize_deletion, clean::select_by_paths, CleanResponse};
 use crate::reporter::TauriReporter;
 use crate::AppState;
 
@@ -76,7 +76,7 @@ pub async fn purge(
         let report =
             Engine::clean(&refs, DeleteMode::Trash, &reporter).map_err(|e| format!("清理失败: {e}"))?;
         // 旁路写账本 + 回传 run_id（HistoryCommand::Purge），供回执一键撤销。
-        let run_id = record_history(HistoryCommand::Purge, &refs, &report);
+        let run_id = history::record_run(HistoryCommand::Purge, &refs, &report);
         Ok(CleanResponse { report, run_id })
     })
     .await

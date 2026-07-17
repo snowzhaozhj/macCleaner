@@ -11,7 +11,7 @@
    * - uninstall 不传 `onUndo` → 只呈现既有「在访达中恢复」（开 Finder），行为不变。
    */
   import { formatBytes, summarizeReport } from "./format";
-  import { countRestore, type CleanReport, type RestoreReport } from "./ipc";
+  import { countRestore, type CleanReport, type RestoreReport, type RestoreStatus } from "./ipc";
   import PathText from "./PathText.svelte";
 
   let {
@@ -66,7 +66,7 @@
     }
   }
 
-  function skipLabel(status: string): string {
+  function skipLabel(status: RestoreStatus): string {
     return status === "skipped_target_occupied"
       ? "原位置已被占用（原文件未受影响）"
       : "废纸篓中已无此项";
@@ -173,13 +173,8 @@
     font-size: 1.05rem;
     color: var(--ink-primary);
   }
-  /* 释放量用中性成功色的等宽数字，非填色 hero；不喧宾（R18） */
-  .freed {
-    font-family: var(--font-mono);
-    font-variant-numeric: tabular-nums;
-    font-weight: 700;
-    color: var(--state-success);
-  }
+  /* 释放量/已放回数用中性成功色的等宽数字，非填色 hero；不喧宾（R18） */
+  .freed,
   .restored {
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
@@ -220,11 +215,13 @@
     cursor: not-allowed;
   }
   /* 跳过：中性提示，与失败的 danger 语义分列（R3）——跳过表示原文件未受影响。 */
-  .skips {
+  .skips,
+  .failures {
     padding-top: var(--sp-3);
     border-top: 1px solid var(--border-subtle);
   }
-  .sec-head {
+  .sec-head,
+  .fail-head {
     margin: 0 0 var(--sp-2);
     color: var(--ink-muted);
     font-size: 0.9em;
@@ -251,15 +248,6 @@
     flex: 0 0 auto;
     font-size: 0.8em;
     color: var(--ink-muted);
-  }
-  .failures {
-    padding-top: var(--sp-3);
-    border-top: 1px solid var(--border-subtle);
-  }
-  .fail-head {
-    margin: 0 0 var(--sp-2);
-    color: var(--ink-muted);
-    font-size: 0.9em;
   }
   .fail-reason {
     flex: 0 0 auto;

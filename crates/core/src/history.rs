@@ -190,6 +190,34 @@ pub fn record(entry: &HistoryEntry, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 成功清理后写账本（CLI `mc clean/purge` 与 GUI 共享的旁路写入真源）。
+///
+/// **旁路观测语义**：账本是清理的旁路记录，不是清理的一部分。
+/// - 无成功项 → 不写、返回 `None`（避免空记录污染账本）。
+/// - 写失败 → 只 `log::warn!`、返回 `None`，**绝不** panic、绝不让清理主流程失败。
+///
+/// 成功写入才返回 `Some(run_id)`——只有此时才存在可确定性撤销/恢复的账本条目。
+/// CLI 忽略返回值（`let _ = …`）；GUI 用它作回执一键撤销的精确命中锚点（见 `select_entry`）。
+#[must_use]
+pub fn record_run(
+    command: HistoryCommand,
+    items: &[&ScanItem],
+    report: &CleanReport,
+) -> Option<String> {
+    if report.success_count == 0 {
+        return None;
+    }
+    let entry = HistoryEntry::from_report(command, items, report);
+    let path = default_path();
+    match record(&entry, &path) {
+        Ok(()) => Some(entry.run_id),
+        Err(e) => {
+            log::warn!("写入清理账本失败（已忽略，不影响清理结果）: {e:?}");
+            None
+        }
+    }
+}
+
 /// 读回全部账本记录（按文件顺序，即时间先后）。
 ///
 /// 单行解析失败**跳过并 warn**，不因一条坏行丢掉整本账本（前向兼容/半写入容错）。

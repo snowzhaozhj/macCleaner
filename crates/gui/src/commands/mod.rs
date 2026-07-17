@@ -9,7 +9,6 @@ pub mod trash;
 pub mod undo;
 pub mod uninstall;
 
-use mc_core::history::{self, HistoryCommand};
 use mc_core::models::{CleanReport, SafetyLevel, ScanItem};
 use serde::Serialize;
 
@@ -39,30 +38,4 @@ pub(crate) fn authorize_deletion(items: &[ScanItem], confirm_token: &str) -> Res
 pub struct CleanResponse {
     pub report: CleanReport,
     pub run_id: Option<String>,
-}
-
-/// clean/purge 成功后写清理账本，返回本次条目的 `run_id`（供回执撤销）。
-///
-/// **旁路观测语义**（与 CLI `commands/history.rs::record` 一致）：
-/// - 无成功项 → 不写账本、返回 `None`（避免空记录污染账本）。
-/// - 写失败 → 只 `log::warn!`、返回 `None`，**绝不**改变清理结果或让命令失败。
-///
-/// 成功写入才返回 `Some(run_id)`——只有此时才存在可确定性撤销的账本条目。
-pub(crate) fn record_history(
-    command: HistoryCommand,
-    items: &[&ScanItem],
-    report: &CleanReport,
-) -> Option<String> {
-    if report.success_count == 0 {
-        return None;
-    }
-    let entry = history::HistoryEntry::from_report(command, items, report);
-    let path = history::default_path();
-    match history::record(&entry, &path) {
-        Ok(()) => Some(entry.run_id),
-        Err(e) => {
-            log::warn!("写入清理账本失败（已忽略，不影响清理结果）: {e:?}");
-            None
-        }
-    }
 }

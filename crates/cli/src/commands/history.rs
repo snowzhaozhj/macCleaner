@@ -5,7 +5,7 @@
 //! 这里只负责"拿到清理报告后追加一条 + 失败优雅降级"。
 
 use crate::Cli;
-use mc_core::history::{self, HistoryCommand, HistoryEntry};
+use mc_core::history::{self, HistoryCommand};
 use mc_core::models::{CleanReport, ScanItem};
 
 use anyhow::Result;
@@ -15,16 +15,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// clean/purge 成功清理后调用：构建账本条目并追加写入。
 ///
 /// **优雅降级**：写失败只记 warn，绝不返回 Err、绝不中断清理主流程（账本是旁路观测，
-/// 不是清理的一部分）。无成功项时不写（避免空记录污染账本）。
+/// 不是清理的一部分）。无成功项时不写（避免空记录污染账本）。实际写入逻辑在
+/// `mc_core::history::record_run`（CLI/GUI 共享真源）；CLI 不需要它回传的 `run_id`，丢弃即可。
 pub fn record(command: HistoryCommand, items: &[&ScanItem], report: &CleanReport) {
-    if report.success_count == 0 {
-        return;
-    }
-    let entry = HistoryEntry::from_report(command, items, report);
-    let path = history::default_path();
-    if let Err(e) = history::record(&entry, &path) {
-        log::warn!("写入清理账本失败（已忽略，不影响清理结果）: {e:?}");
-    }
+    let _ = history::record_run(command, items, report);
 }
 
 pub fn run(cli: &Cli) -> Result<()> {

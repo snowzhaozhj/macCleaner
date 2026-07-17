@@ -10,10 +10,10 @@ use mc_core::progress::ProgressEvent;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 
-use crate::commands::{authorize_deletion, record_history, CleanResponse};
+use crate::commands::{authorize_deletion, CleanResponse};
 use crate::reporter::TauriReporter;
 use crate::AppState;
-use mc_core::history::HistoryCommand;
+use mc_core::history::{self, HistoryCommand};
 
 /// 按路径集从扫描结果中挑出待删项（纯函数，便于单测）。
 /// 前端传来用户选中/标记的路径；Risky 项须经 type-to-confirm（U8）后才会出现在此集合中。
@@ -86,7 +86,7 @@ pub async fn clean(
         let report =
             Engine::clean(&refs, DeleteMode::Trash, &reporter).map_err(|e| format!("清理失败: {e}"))?;
         // 旁路写账本 + 回传 run_id 供回执一键撤销（无成功项/写失败 → None，前端不显撤销）。
-        let run_id = record_history(HistoryCommand::Clean, &refs, &report);
+        let run_id = history::record_run(HistoryCommand::Clean, &refs, &report);
         Ok(CleanResponse { report, run_id })
     })
     .await
