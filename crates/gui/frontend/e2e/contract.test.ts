@@ -98,8 +98,8 @@ const rustArgs = parseRustCommandArgs(commandSrcs);
 const ipcCalls = parseIpcInvocations(ipcSrc);
 
 describe("IPC 契约守卫（R4）", () => {
-  it("Rust 注册表解析出 15 个命令", () => {
-    expect(registered.length).toBe(15);
+  it("Rust 注册表解析出 16 个命令", () => {
+    expect(registered.length).toBe(16);
     expect(new Set(registered)).toEqual(
       new Set([
         "scan_clean",
@@ -116,6 +116,7 @@ describe("IPC 契约守卫（R4）", () => {
         "check_fda",
         "open_fda_settings",
         "open_trash",
+        "undo",
         "reveal_in_finder",
       ]),
     );

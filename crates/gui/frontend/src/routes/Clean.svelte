@@ -5,7 +5,9 @@
     clean,
     cancelScan,
     openTrash,
+    undo,
     type CleanReport,
+    type RestoreReport,
     type ScanResult,
   } from "../lib/ipc";
   import {
@@ -41,6 +43,7 @@
   let confirmItems = $state<ConfirmItem[] | null>(null);
   let cleaningPath = $state("");
   let lastReport = $state<CleanReport | null>(null);
+  let lastRunId = $state<string | null>(null);
   let toast = $state<ToastState>(null);
 
   const scanning = $derived(phase === "scanning");
@@ -169,17 +172,21 @@
     cleaningPath = "";
     setPhase("cleaning");
     let report: CleanReport | null = null;
+    let runId: string | null = null;
     try {
-      report = await clean(paths, token, (e) => {
+      const resp = await clean(paths, token, (e) => {
         if (typeof e === "string") return;
         if ("CleaningFile" in e) cleaningPath = e.CleaningFile.path;
         else if ("Error" in e) error = e.Error;
       });
+      report = resp.report;
+      runId = resp.run_id;
     } catch (err) {
       error = String(err);
     }
     if (report) {
       lastReport = report;
+      lastRunId = runId;
       // 单实例 toast：诚实「已移到废纸篓」（R11/R13）。
       if (report.success_count > 0) {
         toast = nextToast(toast, report.success_count, report.total_freed);
@@ -190,6 +197,17 @@
 
   function restoreInFinder() {
     void openTrash();
+  }
+
+  // 真一键撤销：仅当本次清理写出了账本条目（run_id 非空）时可用；否则回执/toast 不呈现撤销、
+  // 退回 Finder 手动放回（R2/R4）。按 run_id 精确命中，杜绝共享账本竞态劫持（KTD1）。
+  const undoAction = $derived<(() => Promise<RestoreReport>) | null>(
+    lastRunId ? () => undo(lastRunId as string) : null,
+  );
+
+  // 撤销成功后收起 toast，避免「已移到废纸篓」文案与已撤销事实矛盾（R7）。
+  function onUndone() {
+    toast = dismissToast();
   }
 
   // toast 自动消失（6s）；新一次删除会重置计时（seq 变化触发 effect 重跑）。
@@ -235,7 +253,12 @@
 <Shell>
   {#snippet summary()}
     {#if phase === "done" && lastReport}
-      <CleanReceipt report={lastReport} onRestore={restoreInFinder} />
+      <CleanReceipt
+        report={lastReport}
+        onRestore={restoreInFinder}
+        onUndo={undoAction}
+        {onUndone}
+      />
     {:else}
       <SummaryHeader amount={selectedSize} {segments} {scanning} />
       <!-- 扫描期不在摘要区显示错误横幅：其高度变化会推动列表位移（防跳变）；错误在完成后呈现 -->
@@ -323,6 +346,7 @@
       count={toast.count}
       freed={toast.freed}
       onRestore={restoreInFinder}
+      onUndo={undoAction}
       onDismiss={() => (toast = dismissToast())}
     />
   {/key}

@@ -74,6 +74,60 @@ export type CleanReport = {
 };
 
 /**
+ * clean/purge 命令的响应：清理报告 + 本次账本条目 run_id（供回执一键撤销精确命中）。
+ * `run_id` 为 null 表示无可撤销目标（无成功项或写账本失败）——前端据此不显示「撤销清理」，
+ * 退回「在访达中恢复」手动路径。
+ */
+export type CleanResponse = {
+  report: CleanReport;
+  run_id: string | null;
+};
+
+/**
+ * 单项恢复状态。逐字对齐 mc-core `RestoreStatus`（serde snake_case）。
+ * skipped_* 表示安全跳过（原文件未受影响），与 failed 语义不同、视觉应分列。
+ */
+export type RestoreStatus =
+  | "restored"
+  | "skipped_target_occupied"
+  | "skipped_trash_missing"
+  | "failed";
+
+export type RestoreOutcome = {
+  original: string;
+  trashed_to: string;
+  status: RestoreStatus;
+  error: string | null;
+};
+
+/**
+ * 一次撤销的汇总报告。逐字对齐 mc-core `RestoreReport`——**只序列化 outcomes + dry_run**；
+ * `restored_count`/`skipped_count`/`failed_count` 在 Rust 侧是方法而非字段，不过 IPC，
+ * 故前端须自行按 status 从 outcomes 派生计数（见 `countRestore`）。
+ */
+export type RestoreReport = {
+  outcomes: RestoreOutcome[];
+  dry_run: boolean;
+};
+
+/** 从 RestoreReport.outcomes 派生放回/跳过/失败计数（Rust 的计数方法不过 IPC）。 */
+export function countRestore(report: RestoreReport): {
+  restored: number;
+  skipped: number;
+  failed: number;
+} {
+  let restored = 0;
+  let skipped = 0;
+  let failed = 0;
+  for (const o of report.outcomes) {
+    if (o.status === "restored") restored += 1;
+    else if (o.status === "failed") failed += 1;
+    else skipped += 1; // skipped_target_occupied | skipped_trash_missing
+  }
+  return { restored, skipped, failed };
+}
+
+/**
  * 已安装应用信息。字段用 snake_case——mc-core 的 AppInfo 无 #[serde(rename_all)]，
  * Tauri 返回即 snake_case（与本文件其它返回体一致）。写成 bundleId 会运行时 undefined、
  * 导致每个应用都落入「未能解析残留」分支，核心功能静默失效。
@@ -114,10 +168,10 @@ export function clean(
   paths: string[],
   confirmToken: string,
   onEvent: (e: ProgressEvent) => void,
-): Promise<CleanReport> {
+): Promise<CleanResponse> {
   const channel = new Channel<ProgressEvent>();
   channel.onmessage = onEvent;
-  return invoke<CleanReport>("clean", { paths, confirmToken, onEvent: channel });
+  return invoke<CleanResponse>("clean", { paths, confirmToken, onEvent: channel });
 }
 
 /**
@@ -143,10 +197,10 @@ export function purge(
   paths: string[],
   confirmToken: string,
   onEvent: (e: ProgressEvent) => void,
-): Promise<CleanReport> {
+): Promise<CleanResponse> {
   const channel = new Channel<ProgressEvent>();
   channel.onmessage = onEvent;
-  return invoke<CleanReport>("purge", { paths, confirmToken, onEvent: channel });
+  return invoke<CleanResponse>("purge", { paths, confirmToken, onEvent: channel });
 }
 
 /**
@@ -248,6 +302,15 @@ export function openFdaSettings(): Promise<void> {
 /** 在 Finder 中打开系统废纸篓（U5「在访达中恢复」——用 Finder 原生「放回原处」恢复）。 */
 export function openTrash(): Promise<void> {
   return invoke("open_trash");
+}
+
+/**
+ * 撤销 `runId` 那次清理：按回执自身 run_id 精确命中账本条目，从废纸篓确定性放回原处。
+ * 恒实际执行（非预览）。命中无落点/run_id 不存在 → 返回空报告（outcomes 为空），
+ * 调用方据此退回「在访达中恢复」手动降级。
+ */
+export function undo(runId: string): Promise<RestoreReport> {
+  return invoke<RestoreReport>("undo", { runId });
 }
 
 /**

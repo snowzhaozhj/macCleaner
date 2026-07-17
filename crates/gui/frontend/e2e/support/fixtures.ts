@@ -10,6 +10,9 @@ import type {
   ScanItem,
   CategoryGroup,
   CleanReport,
+  CleanResponse,
+  RestoreReport,
+  RestoreStatus,
   DirNode,
   FdaStatus,
   SafetyLevel,
@@ -108,6 +111,47 @@ export function cleanReport(paths: string[], sizePer: number, opts: { fail?: str
   };
 }
 
+/**
+ * clean/purge 命令响应（report + run_id）。默认给一个非空 run_id 使回执/toast 呈现「撤销清理」；
+ * 传 `runId: null` 模拟无成功项/写账本失败 → 前端退回 Finder 手动放回。
+ */
+export function cleanResponse(
+  paths: string[],
+  sizePer: number,
+  opts: { fail?: string[]; runId?: string | null } = {},
+): CleanResponse {
+  return {
+    report: cleanReport(paths, sizePer, { fail: opts.fail }),
+    run_id: "runId" in opts ? (opts.runId ?? null) : "run-e2e-1",
+  };
+}
+
+/**
+ * 一次撤销的报告（RestoreReport）。按 status 组装 outcomes；前端从 outcomes 派生计数。
+ * `restored` 放回、`skipped` 原址占用跳过、`failed` 放回失败。
+ */
+export function restoreReport(opts: {
+  restored?: string[];
+  skipped?: string[];
+  failed?: string[];
+} = {}): RestoreReport {
+  const mk = (paths: string[], status: RestoreStatus, error: string | null = null) =>
+    paths.map((p) => ({ original: p, trashed_to: `/Trash/${p}`, status, error }));
+  return {
+    outcomes: [
+      ...mk(opts.restored ?? [], "restored"),
+      ...mk(opts.skipped ?? [], "skipped_target_occupied"),
+      ...mk(opts.failed ?? [], "failed", "跨卷 rename 失败"),
+    ],
+    dry_run: false,
+  };
+}
+
+/** 空撤销报告（run_id 未命中/无落点）——前端据此退回 Finder 手动放回。 */
+export function emptyRestoreReport(): RestoreReport {
+  return { outcomes: [], dry_run: false };
+}
+
 // ---- Uninstall 应用 ----
 
 /** 构造一条已安装应用信息（move 7 第二段 / plan 021）。 */
@@ -192,9 +236,10 @@ export function defaultHandlers(): Handlers {
   return {
     check_fda: { result: fdaAuthorized() },
     scan_clean: { events: scanStream([]), result: scanResult([]) },
-    clean: { events: [], result: cleanReport([], 0) },
+    clean: { events: [], result: cleanResponse([], 0, { runId: null }) },
     scan_purge: { events: scanStream([]), result: scanResult([]) },
-    purge: { events: [], result: cleanReport([], 0) },
+    purge: { events: [], result: cleanResponse([], 0, { runId: null }) },
+    undo: { result: emptyRestoreReport() },
     // Uninstall（plan 021）：进入 tab 即调 scan_uninstall；resolve_leftovers 选应用时触发。
     scan_uninstall: { result: [] as AppInfo[] },
     resolve_leftovers: { result: scanResult([]) },

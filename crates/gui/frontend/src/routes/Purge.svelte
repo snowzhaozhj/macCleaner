@@ -12,8 +12,10 @@
     purge,
     cancelScan,
     openTrash,
+    undo,
     userHome,
     type CleanReport,
+    type RestoreReport,
     type ScanResult,
   } from "../lib/ipc";
   import {
@@ -51,6 +53,7 @@
   let confirmItems = $state<ConfirmItem[] | null>(null);
   let cleaningPath = $state("");
   let lastReport = $state<CleanReport | null>(null);
+  let lastRunId = $state<string | null>(null);
   let toast = $state<ToastState>(null);
 
   const scanning = $derived(phase === "scanning");
@@ -227,17 +230,21 @@
     cleaningPath = "";
     setPhase("cleaning");
     let report: CleanReport | null = null;
+    let runId: string | null = null;
     try {
-      report = await purge(paths, token, (e) => {
+      const resp = await purge(paths, token, (e) => {
         if (typeof e === "string") return;
         if ("CleaningFile" in e) cleaningPath = e.CleaningFile.path;
         else if ("Error" in e) error = e.Error;
       });
+      report = resp.report;
+      runId = resp.run_id;
     } catch (err) {
       error = String(err);
     }
     if (report) {
       lastReport = report;
+      lastRunId = runId;
       if (report.success_count > 0) {
         toast = nextToast(toast, report.success_count, report.total_freed);
       }
@@ -247,6 +254,15 @@
 
   function restoreInFinder() {
     void openTrash();
+  }
+
+  // 真一键撤销：仅当本次清理写出账本条目（run_id 非空）时可用，按 run_id 精确命中（KTD1）。
+  const undoAction = $derived<(() => Promise<RestoreReport>) | null>(
+    lastRunId ? () => undo(lastRunId as string) : null,
+  );
+
+  function onUndone() {
+    toast = dismissToast();
   }
 
   // toast 自动消失（6s），同 Clean。
@@ -280,7 +296,12 @@
 <Shell>
   {#snippet summary()}
     {#if phase === "done" && lastReport}
-      <CleanReceipt report={lastReport} onRestore={restoreInFinder} />
+      <CleanReceipt
+        report={lastReport}
+        onRestore={restoreInFinder}
+        onUndo={undoAction}
+        {onUndone}
+      />
     {:else}
       <SummaryHeader amount={selectedSize} {segments} {scanning} />
       {#if error && !scanning}<p class="error" role="alert">出错：{error}</p>{/if}
@@ -382,6 +403,7 @@
       count={toast.count}
       freed={toast.freed}
       onRestore={restoreInFinder}
+      onUndo={undoAction}
       onDismiss={() => (toast = dismissToast())}
     />
   {/key}
