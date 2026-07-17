@@ -48,6 +48,11 @@ pub enum Commands {
     },
     /// 查看清理历史（上次清理以来的回收趋势）
     History,
+    /// 从废纸篓放回上次清理的项（撤销上一次 clean/purge）
+    Undo {
+        /// 指定要撤销的清理记录 run-id（默认取最近一条可恢复的记录）
+        run_id: Option<String>,
+    },
     /// 诊断磁盘访问权限（检查 Full Disk Access，只读）
     Doctor,
 }
@@ -63,6 +68,7 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Analyze { .. }) => commands::analyze::run(&cli)?,
         Some(Commands::Purge { .. }) => commands::purge::run(&cli)?,
         Some(Commands::History) => commands::history::run(&cli)?,
+        Some(Commands::Undo { ref run_id }) => commands::undo::run(&cli, run_id.as_deref())?,
         Some(Commands::Doctor) => commands::doctor::run(&cli)?,
     }
 

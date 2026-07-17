@@ -10,6 +10,14 @@ pub fn get_home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/Users/unknown"))
 }
 
+/// 用户废纸篓目录 `~/.Trash`。落点捕获（`Cleaner`）与恢复（`restore`）的落脚点。
+///
+/// 注意：外置/网络卷的删除会落到该卷的 `.Trashes/<uid>` 而非这里——那类项落点捕获会返回
+/// `None`（诚实降级，见 `cleaner::pick_new_trash_entry`），`mc undo` 对其提示用 Finder。
+pub fn trash_dir() -> PathBuf {
+    get_home_dir().join(".Trash")
+}
+
 /// 返回系统缓存/日志/临时文件相关路径
 pub fn get_cache_paths() -> Vec<PathBuf> {
     let home = get_home_dir();

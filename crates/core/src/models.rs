@@ -127,6 +127,17 @@ pub struct CleanedItem {
     pub size: u64,
     pub success: bool,
     pub error: Option<String>,
+    /// 移入废纸篓后的实际落点（`~/.Trash/<name>`）。仅 `DeleteMode::Trash` 且捕获成功时为 `Some`；
+    /// 永久删除、捕获失败（读不到 `~/.Trash`、差集歧义、非 home 卷）恒 `None`。
+    /// 这是 `mc undo` 确定性放回的数据源。`#[serde(default)]` 保证旧 `CleanReport` JSON 向后兼容。
+    #[serde(default)]
+    pub trashed_to: Option<PathBuf>,
+    /// 落点文件的 inode 号。与 `trashed_to` 同时捕获（二者必须成对，缺一即视为未捕获）。
+    /// 恢复时用它校验"废纸篓里这个名字仍是我们当初删的那个文件"——macOS 清空废纸篓后会**复用名字**，
+    /// 仅凭路径会把无关的同名文件误恢复到原址（审查 headline）。inode 不受 xattr/Spotlight 触碰影响，
+    /// 比 ctime 更稳，避免延迟 undo 被误判为已失效。
+    #[serde(default)]
+    pub trashed_ino: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

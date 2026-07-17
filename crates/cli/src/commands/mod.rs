@@ -4,3 +4,4 @@ pub mod doctor;
 pub mod history;
 pub mod purge;
 pub mod uninstall;
+pub mod undo;
