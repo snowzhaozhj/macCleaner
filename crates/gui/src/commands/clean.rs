@@ -5,14 +5,15 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use mc_core::engine::Engine;
-use mc_core::models::{CleanReport, DeleteMode, ScanItem, ScanResult};
+use mc_core::models::{DeleteMode, ScanItem, ScanResult};
 use mc_core::progress::ProgressEvent;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 
-use crate::commands::authorize_deletion;
+use crate::commands::{authorize_deletion, record_history, CleanResponse};
 use crate::reporter::TauriReporter;
 use crate::AppState;
+use mc_core::history::HistoryCommand;
 
 /// 按路径集从扫描结果中挑出待删项（纯函数，便于单测）。
 /// 前端传来用户选中/标记的路径；Risky 项须经 type-to-confirm（U8）后才会出现在此集合中。
@@ -63,7 +64,7 @@ pub async fn clean(
     paths: Vec<PathBuf>,
     confirm_token: String,
     on_event: Channel<ProgressEvent>,
-) -> Result<CleanReport, String> {
+) -> Result<CleanResponse, String> {
     let (cancelled, last_scan) = {
         let state = app.state::<AppState>();
         (state.begin_operation(), state.last_scan.clone())
@@ -82,7 +83,11 @@ pub async fn clean(
         authorize_deletion(&items, &confirm_token)?;
         let refs: Vec<&ScanItem> = items.iter().collect();
         let reporter = TauriReporter::new(on_event, cancelled);
-        Engine::clean(&refs, DeleteMode::Trash, &reporter).map_err(|e| format!("清理失败: {e}"))
+        let report =
+            Engine::clean(&refs, DeleteMode::Trash, &reporter).map_err(|e| format!("清理失败: {e}"))?;
+        // 旁路写账本 + 回传 run_id 供回执一键撤销（无成功项/写失败 → None，前端不显撤销）。
+        let run_id = record_history(HistoryCommand::Clean, &refs, &report);
+        Ok(CleanResponse { report, run_id })
     })
     .await
     .map_err(|e| format!("清理线程异常: {e}"))?

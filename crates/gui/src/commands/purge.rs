@@ -6,12 +6,13 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use mc_core::engine::Engine;
-use mc_core::models::{CleanReport, DeleteMode, ScanItem, ScanResult};
+use mc_core::history::HistoryCommand;
+use mc_core::models::{DeleteMode, ScanItem, ScanResult};
 use mc_core::progress::ProgressEvent;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 
-use crate::commands::{authorize_deletion, clean::select_by_paths};
+use crate::commands::{authorize_deletion, clean::select_by_paths, record_history, CleanResponse};
 use crate::reporter::TauriReporter;
 use crate::AppState;
 
@@ -55,7 +56,7 @@ pub async fn purge(
     paths: Vec<PathBuf>,
     confirm_token: String,
     on_event: Channel<ProgressEvent>,
-) -> Result<CleanReport, String> {
+) -> Result<CleanResponse, String> {
     let (cancelled, last_purge) = {
         let state = app.state::<AppState>();
         (state.begin_operation(), state.last_purge.clone())
@@ -72,7 +73,11 @@ pub async fn purge(
         authorize_deletion(&items, &confirm_token)?;
         let refs: Vec<&ScanItem> = items.iter().collect();
         let reporter = TauriReporter::new(on_event, cancelled);
-        Engine::clean(&refs, DeleteMode::Trash, &reporter).map_err(|e| format!("清理失败: {e}"))
+        let report =
+            Engine::clean(&refs, DeleteMode::Trash, &reporter).map_err(|e| format!("清理失败: {e}"))?;
+        // 旁路写账本 + 回传 run_id（HistoryCommand::Purge），供回执一键撤销。
+        let run_id = record_history(HistoryCommand::Purge, &refs, &report);
+        Ok(CleanResponse { report, run_id })
     })
     .await
     .map_err(|e| format!("清理线程异常: {e}"))?
