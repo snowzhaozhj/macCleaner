@@ -5,7 +5,9 @@
     clean,
     cancelScan,
     openTrash,
+    undo,
     type CleanReport,
+    type RestoreReport,
     type ScanResult,
   } from "../lib/ipc";
   import {
@@ -41,6 +43,7 @@
   let confirmItems = $state<ConfirmItem[] | null>(null);
   let cleaningPath = $state("");
   let lastReport = $state<CleanReport | null>(null);
+  let lastRunId = $state<string | null>(null);
   let toast = $state<ToastState>(null);
 
   const scanning = $derived(phase === "scanning");
@@ -169,17 +172,22 @@
     cleaningPath = "";
     setPhase("cleaning");
     let report: CleanReport | null = null;
+    let runId: string | null = null;
     try {
-      report = await clean(paths, token, (e) => {
+      const resp = await clean(paths, token, (e) => {
         if (typeof e === "string") return;
         if ("CleaningFile" in e) cleaningPath = e.CleaningFile.path;
         else if ("Error" in e) error = e.Error;
       });
+      report = resp.report;
+      runId = resp.run_id;
     } catch (err) {
       error = String(err);
     }
     if (report) {
       lastReport = report;
+      lastRunId = runId;
+      undoResult = null; // 新一次清理：清掉上次撤销缓存，使本次撤销重新可发 IPC。
       // 单实例 toast：诚实「已移到废纸篓」（R11/R13）。
       if (report.success_count > 0) {
         toast = nextToast(toast, report.success_count, report.total_freed);
@@ -190,6 +198,42 @@
 
   function restoreInFinder() {
     void openTrash();
+  }
+
+  // 真一键撤销：仅当本次清理写出了账本条目（run_id 非空）时可用；否则回执/toast 不呈现撤销、
+  // 退回 Finder 手动放回（R2/R4）。按 run_id 精确命中，杜绝共享账本竞据劫持（KTD1）。
+  //
+  // **撤销至多发一次 IPC**（评审 #1）：回执与吐司两个入口绑定同一 undoAction，各自只守着自身组件内
+  // 的 in-flight 状态、彼此看不见——先点吐司（成功即消失）再点回执仍 idle 的按钮，会对已放回的文件
+  // 二次 restore，得到全 SkippedTrashMissing 的「已放回 0 项·跳过 N」误导报告，架空回执的 R7 护栏。
+  // 故把撤销生命周期上提到父组件：`undoPromise` 合并并发调用；`undoResult` 缓存**有实际放回**的结果，
+  // 后续任一入口再点都重放缓存、不再发 IPC——回执照样渲染真实「已放回 N」，二次 restore 不可能发生。
+  // 空报告（无落点）不缓存：各入口据此走 Finder 降级、允许重试（R4），且重试仍空、不会误报。
+  let undoResult: RestoreReport | null = null;
+  let undoPromise: Promise<RestoreReport> | null = null;
+
+  function runUndo(): Promise<RestoreReport> {
+    const id = lastRunId;
+    if (!id) return Promise.resolve({ outcomes: [], dry_run: false });
+    if (undoResult) return Promise.resolve(undoResult); // 已成功放回：重放缓存，绝不二次 restore。
+    undoPromise ??= undo(id)
+      .then((r) => {
+        if (r.outcomes.length > 0) undoResult = r;
+        return r;
+      })
+      .finally(() => {
+        undoPromise = null;
+      });
+    return undoPromise;
+  }
+
+  const undoAction = $derived<(() => Promise<RestoreReport>) | null>(
+    lastRunId ? runUndo : null,
+  );
+
+  // 撤销成功后收起 toast，避免「已移到废纸篓」文案与已撤销事实矛盾（R7）。
+  function onUndone() {
+    toast = dismissToast();
   }
 
   // toast 自动消失（6s）；新一次删除会重置计时（seq 变化触发 effect 重跑）。
@@ -235,7 +279,12 @@
 <Shell>
   {#snippet summary()}
     {#if phase === "done" && lastReport}
-      <CleanReceipt report={lastReport} onRestore={restoreInFinder} />
+      <CleanReceipt
+        report={lastReport}
+        onRestore={restoreInFinder}
+        onUndo={undoAction}
+        {onUndone}
+      />
     {:else}
       <SummaryHeader amount={selectedSize} {segments} {scanning} />
       <!-- 扫描期不在摘要区显示错误横幅：其高度变化会推动列表位移（防跳变）；错误在完成后呈现 -->
@@ -323,6 +372,7 @@
       count={toast.count}
       freed={toast.freed}
       onRestore={restoreInFinder}
+      onUndo={undoAction}
       onDismiss={() => (toast = dismissToast())}
     />
   {/key}

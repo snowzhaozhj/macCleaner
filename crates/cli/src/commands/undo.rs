@@ -12,26 +12,11 @@ use mc_core::restore::{self, RestoreStatus};
 
 use anyhow::Result;
 
-/// 选出要恢复的账本条目。
-///
-/// - 给定 `run_id`：精确匹配该次运行（即便它无可恢复映射，也交由调用方给出降级提示）。
-/// - 未给定：取**最近一条含可恢复映射**的条目（跳过无映射的旧记录，避免"undo 却说没东西可恢复"）。
-#[must_use]
-pub fn select_entry<'a>(
-    entries: &'a [HistoryEntry],
-    run_id: Option<&str>,
-) -> Option<&'a HistoryEntry> {
-    match run_id {
-        Some(id) => entries.iter().find(|e| e.run_id == id),
-        None => entries.iter().rev().find(|e| !e.restorable.is_empty()),
-    }
-}
-
 pub fn run(cli: &Cli, run_id: Option<&str>) -> Result<()> {
     let path = history::default_path();
     let entries = history::load(&path);
 
-    let Some(entry) = select_entry(&entries, run_id) else {
+    let Some(entry) = history::select_entry(&entries, run_id) else {
         // 找不到目标条目：给定的 run-id 不存在，或账本里根本没有可恢复的记录。
         if cli.json {
             print_empty_json(cli.dry_run)?;
@@ -112,71 +97,5 @@ fn render(report: &restore::RestoreReport, entry: &HistoryEntry) {
 
     if skipped > 0 || failed > 0 {
         println!("\n共跳过 {skipped} 项，失败 {failed} 项。");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use mc_core::history::{HistoryCommand, RestoreEntry};
-    use std::path::PathBuf;
-
-    fn entry(run_id: &str, restorable: Vec<&str>) -> HistoryEntry {
-        HistoryEntry {
-            run_id: run_id.into(),
-            timestamp: 1,
-            command: HistoryCommand::Clean,
-            freed: 0,
-            count: restorable.len(),
-            categories: vec![],
-            deleted_paths: vec![],
-            restorable: restorable
-                .into_iter()
-                .map(|p| RestoreEntry {
-                    original: PathBuf::from(p),
-                    trashed_to: PathBuf::from(format!("/T/{p}")),
-                    trashed_ino: 1,
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn select_none_picks_latest_with_mapping() {
-        // 最后一条有映射 → 选它。
-        let entries = vec![entry("r1", vec!["/a"]), entry("r2", vec!["/b"])];
-        assert_eq!(select_entry(&entries, None).unwrap().run_id, "r2");
-    }
-
-    #[test]
-    fn select_none_skips_trailing_entries_without_mapping() {
-        // 最后一条无映射（旧记录），更早一条有 → 选更早那条有映射的。
-        let entries = vec![entry("r1", vec!["/a"]), entry("r2", vec![])];
-        assert_eq!(select_entry(&entries, None).unwrap().run_id, "r1");
-    }
-
-    #[test]
-    fn select_none_returns_none_when_no_mapping_anywhere() {
-        let entries = vec![entry("r1", vec![]), entry("r2", vec![])];
-        assert!(select_entry(&entries, None).is_none());
-    }
-
-    #[test]
-    fn select_by_run_id_hits_exact() {
-        let entries = vec![entry("r1", vec!["/a"]), entry("r2", vec!["/b"])];
-        assert_eq!(select_entry(&entries, Some("r1")).unwrap().run_id, "r1");
-    }
-
-    #[test]
-    fn select_by_run_id_missing_returns_none() {
-        let entries = vec![entry("r1", vec!["/a"])];
-        assert!(select_entry(&entries, Some("nope")).is_none());
-    }
-
-    #[test]
-    fn select_empty_ledger_returns_none() {
-        let entries: Vec<HistoryEntry> = vec![];
-        assert!(select_entry(&entries, None).is_none());
-        assert!(select_entry(&entries, Some("r1")).is_none());
     }
 }

@@ -154,6 +154,24 @@ pub fn default_path() -> PathBuf {
         .join(".local/state/mc/history.jsonl")
 }
 
+/// 选出要恢复的账本条目（CLI `mc undo` 与 GUI 撤销共享的单一真源）。
+///
+/// - 给定 `run_id`：精确匹配该次运行（即便它无可恢复映射，也交由调用方给出降级提示）。
+///   GUI 回执撤销**必须**走这条：账本是 CLI/GUI 共享文件，只有按回执自身 `run_id` 精确命中
+///   才能保证撤销的是"这张回执那次"，而非被终端 `mc clean` 或后续清理写入的更新条目劫持。
+/// - 未给定：取**最近一条含可恢复映射**的条目（跳过无映射的旧记录，避免"undo 却说没东西可恢复"）。
+///   CLI `mc undo`（无参）用此默认。
+#[must_use]
+pub fn select_entry<'a>(
+    entries: &'a [HistoryEntry],
+    run_id: Option<&str>,
+) -> Option<&'a HistoryEntry> {
+    match run_id {
+        Some(id) => entries.iter().find(|e| e.run_id == id),
+        None => entries.iter().rev().find(|e| !e.restorable.is_empty()),
+    }
+}
+
 /// 追加一条账本记录（JSONL：序列化成一行 + 换行，`O_APPEND` 不覆盖既有内容）。
 ///
 /// 失败即返回 Err（父目录建不出、无写权限等），由调用方优雅降级——**绝不 panic、
@@ -170,6 +188,34 @@ pub fn record(entry: &HistoryEntry, path: &Path) -> anyhow::Result<()> {
         .open(path)?;
     file.write_all(line.as_bytes())?;
     Ok(())
+}
+
+/// 成功清理后写账本（CLI `mc clean/purge` 与 GUI 共享的旁路写入真源）。
+///
+/// **旁路观测语义**：账本是清理的旁路记录，不是清理的一部分。
+/// - 无成功项 → 不写、返回 `None`（避免空记录污染账本）。
+/// - 写失败 → 只 `log::warn!`、返回 `None`，**绝不** panic、绝不让清理主流程失败。
+///
+/// 成功写入才返回 `Some(run_id)`——只有此时才存在可确定性撤销/恢复的账本条目。
+/// CLI 忽略返回值（`let _ = …`）；GUI 用它作回执一键撤销的精确命中锚点（见 `select_entry`）。
+#[must_use]
+pub fn record_run(
+    command: HistoryCommand,
+    items: &[&ScanItem],
+    report: &CleanReport,
+) -> Option<String> {
+    if report.success_count == 0 {
+        return None;
+    }
+    let entry = HistoryEntry::from_report(command, items, report);
+    let path = default_path();
+    match record(&entry, &path) {
+        Ok(()) => Some(entry.run_id),
+        Err(e) => {
+            log::warn!("写入清理账本失败（已忽略，不影响清理结果）: {e:?}");
+            None
+        }
+    }
 }
 
 /// 读回全部账本记录（按文件顺序，即时间先后）。
@@ -415,5 +461,75 @@ mod tests {
         assert_eq!(loaded[0].freed, 42);
         assert!(loaded[0].restorable.is_empty(), "缺失 restorable 字段应默认空 Vec");
         assert_eq!(loaded[0].deleted_paths, vec![PathBuf::from("/old/x")]);
+    }
+
+    // --- select_entry：CLI mc undo 与 GUI 撤销共享的选取真源（从 cli/undo.rs 上提）---
+
+    fn sel_entry(run_id: &str, restorable: Vec<&str>) -> HistoryEntry {
+        HistoryEntry {
+            run_id: run_id.into(),
+            timestamp: 1,
+            command: HistoryCommand::Clean,
+            freed: 0,
+            count: restorable.len(),
+            categories: vec![],
+            deleted_paths: vec![],
+            restorable: restorable
+                .into_iter()
+                .map(|p| RestoreEntry {
+                    original: PathBuf::from(p),
+                    trashed_to: PathBuf::from(format!("/T/{p}")),
+                    trashed_ino: 1,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn select_none_picks_latest_with_mapping() {
+        // 最后一条有映射 → 选它。
+        let entries = vec![sel_entry("r1", vec!["/a"]), sel_entry("r2", vec!["/b"])];
+        assert_eq!(select_entry(&entries, None).unwrap().run_id, "r2");
+    }
+
+    #[test]
+    fn select_none_skips_trailing_entries_without_mapping() {
+        // 最后一条无映射（旧记录），更早一条有 → 选更早那条有映射的。
+        let entries = vec![sel_entry("r1", vec!["/a"]), sel_entry("r2", vec![])];
+        assert_eq!(select_entry(&entries, None).unwrap().run_id, "r1");
+    }
+
+    #[test]
+    fn select_none_returns_none_when_no_mapping_anywhere() {
+        let entries = vec![sel_entry("r1", vec![]), sel_entry("r2", vec![])];
+        assert!(select_entry(&entries, None).is_none());
+    }
+
+    #[test]
+    fn select_by_run_id_hits_exact() {
+        let entries = vec![sel_entry("r1", vec!["/a"]), sel_entry("r2", vec!["/b"])];
+        assert_eq!(select_entry(&entries, Some("r1")).unwrap().run_id, "r1");
+    }
+
+    #[test]
+    fn select_by_run_id_missing_returns_none() {
+        let entries = vec![sel_entry("r1", vec!["/a"])];
+        assert!(select_entry(&entries, Some("nope")).is_none());
+    }
+
+    #[test]
+    fn select_empty_ledger_returns_none() {
+        let entries: Vec<HistoryEntry> = vec![];
+        assert!(select_entry(&entries, None).is_none());
+        assert!(select_entry(&entries, Some("r1")).is_none());
+    }
+
+    #[test]
+    fn select_by_run_id_ignores_newer_unrelated_entry() {
+        // 共享账本竞态：给定旧 run_id，即便存在更新的、不同 run_id 的含落点条目，也只命中旧条目。
+        let entries = vec![sel_entry("old", vec!["/a"]), sel_entry("newer", vec!["/b"])];
+        let hit = select_entry(&entries, Some("old")).unwrap();
+        assert_eq!(hit.run_id, "old");
+        assert_eq!(hit.restorable[0].original, PathBuf::from("/a"));
     }
 }

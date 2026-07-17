@@ -2500,6 +2500,7 @@ dependencies = [
 name = "mc-gui"
 version = "0.1.0"
 dependencies = [
+ "log",
  "mc-core",
  "serde",
  "tauri",
