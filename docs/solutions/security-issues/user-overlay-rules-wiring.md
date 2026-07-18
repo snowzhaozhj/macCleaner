@@ -11,6 +11,12 @@ symptoms:
   - "接入用户规则时担心 Exact/DirName 混合规则集会被错误策略处理，或绕过删除授权隔离"
 root_cause: incomplete_wiring
 resolution_type: code_fix
+tags:
+  - user-rules
+  - rules-loading
+  - deletion-authorization
+  - fail-closed
+  - scanning
 related_components:
   - crates/core/src/scanner.rs
   - crates/core/src/rules.rs
@@ -45,7 +51,7 @@ Self::scan_purge_dir(base_path, &rules, reporter)
 `DirName` 剪枝。把完整 `user_rules()`（可含两类 pattern）附加给任一策略是**安全**的：
 不匹配该策略的 pattern 被既有 filter 自然忽略，无需在接线层做预分流。更简单、更少出错。
 
-## 两个 load-bearing 不变量
+## 三个 load-bearing 不变量
 
 1. **删除授权隔离不变**（安全核心）：`deletion_evidence_for_path` 继续只信
    `builtin_rules()`。用户规则扩大的是**扫描发现的项**（这些项带 `preselect=false`，
@@ -56,6 +62,17 @@ Self::scan_purge_dir(base_path, &rules, reporter)
 2. **preselect=false 语义链**：`user_rules_from_str` 强制 `preselect=false`，经
    `Meta::from_rule` → `with_preselect` 流到 `ScanItem.selected`。用户规则命中项永不预选，
    `--yes`/默认勾选不删。
+
+3. **自声明 safety 强制 Risky**（代码评审补齐）：`user_rules_from_str` 同时把用户规则的
+   `safety` 强制为 `Risky`。**为什么 preselect=false 不够**：TUI 的 `select_all_safe`（`a` 键，
+   `app.rs:386`）按 `safety != Risky` 全选、`confirm_has_risky`（`app.rs:520`）按
+   `item.safety == Risky` 决定是否升级 type-to-confirm——二者都读 `ScanItem.safety`，
+   而非 `preselect`/`selected`。若沿用用户自声明的 `safety="Safe"`，一条指向真实数据的
+   规则会被 `a` 键扫入待删集、且以普通 [y/N] 放行，绕过 Risky 的 type-to-confirm。
+   `preselect=false` 只挡住 `--yes`/默认勾选，挡不住手动"全选安全项"。强制 Risky 让未审计
+   用户项落入最保守档，与不变量 1 对「未知路径」的处理一致。**教训**：`preselect` 与 `safety`
+   是两条独立的信任轴，封住自动删除（preselect）不等于封住安全档信任（safety）——凡消费
+   `ScanItem.safety` 的界面（bulk-select、确认升级）都是独立信任面。
 
 ## 踩到的认知偏差（proof-first 的价值）
 
