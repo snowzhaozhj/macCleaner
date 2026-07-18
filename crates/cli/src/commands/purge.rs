@@ -59,7 +59,7 @@ pub fn run(cli: &Cli) -> Result<()> {
     let reporter = CliReporter::default();
     eprintln!("正在扫描 {} 中的开发产物...\n", path.display());
 
-    // 用户叠加规则加载提示（#2 规则外部化）：见 super::print_user_rules_notice。
+    // 用户叠加规则加载提示（#2 规则外部化）。
     super::print_user_rules_notice();
     let result = Engine::scan_purge(&path, &reporter)?;
 

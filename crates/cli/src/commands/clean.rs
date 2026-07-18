@@ -71,7 +71,7 @@ pub fn run(cli: &Cli) -> Result<()> {
 
     // 1. 扫描
     eprintln!("正在扫描...\n");
-    // 用户叠加规则加载提示（#2 规则外部化）：见 super::print_user_rules_notice。
+    // 用户叠加规则加载提示（#2 规则外部化）。
     super::print_user_rules_notice();
     let result = Engine::scan_clean(&reporter)?;
 

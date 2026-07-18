@@ -353,8 +353,9 @@ impl Scanner {
         base_path: &Path,
         reporter: &dyn ProgressReporter,
     ) -> anyhow::Result<ScanResult> {
-        // 内置 purge 规则 + 用户叠加规则。scan_purge_dir 只按 DirName 剪枝，用户规则里的
-        // Exact 模式在此被自然忽略（属 clean 语义）。
+        // 内置 purge 规则 + 用户叠加规则。scan_purge_dir 按 DirName 剪枝，并处理落在 base_path
+        // 之内的 Exact 路径（见 scan_purge_dir 内 exact_entries）——用户规则的 Exact 模式仅当目标
+        // 恰在 purge 的 base 下才命中，base 之外不参与。user_rules() 已优雅降级。
         let mut rules = purge_rules();
         rules.extend(user_rules());
         Self::scan_purge_dir(base_path, &rules, reporter)
@@ -1422,16 +1423,16 @@ mod tests {
     // 薄封装本身只是 extend；正确性风险在于「混合规则集里各 pattern 被哪条策略处理」。
     //
     // 两条策略处理 pattern 的方式（已核实代码，与直觉不同）：
-    //   - scan_with_rules（clean）：**只**处理 Exact 模式（:367），遍历基路径下的文件，每个
+    //   - scan_with_rules（clean）：**只**处理 Exact 模式，遍历基路径下的文件，每个
     //     文件成为一个 ScanItem（item.path = 文件路径），DirName 模式被忽略。
-    //   - scan_purge_dir（purge）：DirName 剪枝（:520）**加** Exact 路径（:536，条件是
-    //     exact_path 在 base_path 下），命中目录本身成为一个 ScanItem。
+    //   - scan_purge_dir（purge）：DirName 剪枝**加** Exact 路径（条件是 exact_path 在
+    //     base_path 下），命中目录本身成为一个 ScanItem。
     // 故：用户 DirName 规则只在 purge 生效；用户 Exact 规则在 clean 生效，在 purge 里也仅当
     // 目标恰在 purge 的 base 下才生效（合理——purge 该目录时顺带清它）。
 
-    /// 造一条用户风格 `Exact` 规则。模拟经 `user_rules_from_str` 门禁后的规则：preselect 由调用方指定
-    /// （门禁会把它强制成 false，此处显式传入以便断言 selected 语义）。
-    fn user_exact_rule(base: PathBuf, category: &str, preselect: bool) -> CleanRule {
+    /// 造一条用户风格 `Exact` 规则。模拟经 `user_rules_from_str` 门禁后的规则：门禁一律强制
+    /// `preselect=false`，故此处也固定 false（与 `user_dirname_rule` 一致）。
+    fn user_exact_rule(base: PathBuf, category: &str) -> CleanRule {
         CleanRule {
             name: "user-exact".into(),
             description: String::new(),
@@ -1441,7 +1442,7 @@ mod tests {
             impact: String::new(),
             recovery: String::new(),
             root_markers: Vec::new(),
-            preselect,
+            preselect: false,
         }
     }
 
@@ -1469,7 +1470,7 @@ mod tests {
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join("blob.bin"), "payload").unwrap();
 
-        let rules = vec![user_exact_rule(cache.clone(), "我的工具缓存", false)];
+        let rules = vec![user_exact_rule(cache.clone(), "我的工具缓存")];
         let (reporter, _events) = TestReporter::new();
         let result = Scanner::scan_with_rules(&rules, &reporter).unwrap();
 
@@ -1490,7 +1491,7 @@ mod tests {
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join("f.bin"), "x").unwrap();
 
-        let rules = vec![user_exact_rule(cache.clone(), "用户缓存", false)];
+        let rules = vec![user_exact_rule(cache.clone(), "用户缓存")];
         let (reporter, _events) = TestReporter::new();
         let result = Scanner::scan_with_rules(&rules, &reporter).unwrap();
 
@@ -1535,7 +1536,7 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("f.bin"), "x").unwrap();
 
-        let rules = vec![user_exact_rule(outside, "外部缓存", false)];
+        let rules = vec![user_exact_rule(outside, "外部缓存")];
         let (reporter, _events) = TestReporter::new();
         let result = Scanner::scan_purge_dir(&base, &rules, &reporter).unwrap();
 
