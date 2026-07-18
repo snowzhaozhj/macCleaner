@@ -2,7 +2,7 @@ use crate::models::{CategoryGroup, SafetyLevel, ScanItem, ScanResult};
 use crate::park_walk::{park_walk, prefetch_sizes};
 use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::rules::{
-    clean_rules, matches_root_markers, purge_rules, CleanRule, PathPattern, RootMarker,
+    clean_rules, matches_root_markers, purge_rules, user_rules, CleanRule, PathPattern, RootMarker,
 };
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -340,7 +340,11 @@ pub struct Scanner;
 impl Scanner {
     /// 使用 clean 规则扫描（用于 `mc clean` 命令）
     pub fn scan_clean(reporter: &dyn ProgressReporter) -> anyhow::Result<ScanResult> {
-        let rules = clean_rules();
+        // 内置 clean 规则 + 用户叠加规则。scan_with_rules 只处理 Exact 模式，用户规则里的
+        // DirName 模式在此被自然忽略（属 purge 语义）。user_rules() 已优雅降级：文件不存在/
+        // 读失败/门禁不过均返回空。
+        let mut rules = clean_rules();
+        rules.extend(user_rules());
         Self::scan_with_rules(&rules, reporter)
     }
 
@@ -349,7 +353,10 @@ impl Scanner {
         base_path: &Path,
         reporter: &dyn ProgressReporter,
     ) -> anyhow::Result<ScanResult> {
-        let rules = purge_rules();
+        // 内置 purge 规则 + 用户叠加规则。scan_purge_dir 只按 DirName 剪枝，用户规则里的
+        // Exact 模式在此被自然忽略（属 clean 语义）。
+        let mut rules = purge_rules();
+        rules.extend(user_rules());
         Self::scan_purge_dir(base_path, &rules, reporter)
     }
 
@@ -1408,5 +1415,155 @@ mod tests {
         let venv_hits: Vec<_> = matched.iter().filter(|p| p.ends_with("venv")).collect();
         assert_eq!(venv_hits.len(), 1, "只有含 pyvenv.cfg 的 venv 应匹配");
         assert!(venv_hits[0].starts_with(&py));
+    }
+
+    // ── 用户叠加规则接线（#2 规则外部化第一阶段）──────────────────────────────
+    // scan_clean = clean_rules() + user_rules()，scan_purge = purge_rules() + user_rules()。
+    // 薄封装本身只是 extend；正确性风险在于「混合规则集里各 pattern 被哪条策略处理」。
+    //
+    // 两条策略处理 pattern 的方式（已核实代码，与直觉不同）：
+    //   - scan_with_rules（clean）：**只**处理 Exact 模式（:367），遍历基路径下的文件，每个
+    //     文件成为一个 ScanItem（item.path = 文件路径），DirName 模式被忽略。
+    //   - scan_purge_dir（purge）：DirName 剪枝（:520）**加** Exact 路径（:536，条件是
+    //     exact_path 在 base_path 下），命中目录本身成为一个 ScanItem。
+    // 故：用户 DirName 规则只在 purge 生效；用户 Exact 规则在 clean 生效，在 purge 里也仅当
+    // 目标恰在 purge 的 base 下才生效（合理——purge 该目录时顺带清它）。
+
+    /// 造一条用户风格 `Exact` 规则。模拟经 `user_rules_from_str` 门禁后的规则：preselect 由调用方指定
+    /// （门禁会把它强制成 false，此处显式传入以便断言 selected 语义）。
+    fn user_exact_rule(base: PathBuf, category: &str, preselect: bool) -> CleanRule {
+        CleanRule {
+            name: "user-exact".into(),
+            description: String::new(),
+            patterns: vec![PathPattern::Exact(base)],
+            safety: SafetyLevel::Safe,
+            category: category.into(),
+            impact: String::new(),
+            recovery: String::new(),
+            root_markers: Vec::new(),
+            preselect,
+        }
+    }
+
+    /// 造一条用户风格 `DirName` 规则（带 inside 守卫）。
+    fn user_dirname_rule(dir: &str, marker: &str, category: &str) -> CleanRule {
+        CleanRule {
+            name: "user-dirname".into(),
+            description: String::new(),
+            patterns: vec![PathPattern::DirName(dir.into())],
+            safety: SafetyLevel::Safe,
+            category: category.into(),
+            impact: String::new(),
+            recovery: String::new(),
+            root_markers: vec![RootMarker::Inside(marker.into())],
+            preselect: false,
+        }
+    }
+
+    #[test]
+    fn clean_scan_includes_user_exact_rule_hits() {
+        // R1：用户规则的 Exact 模式命中真实目录 → 目录下的文件出现在 clean 结果
+        //（clean 以文件为项，item.path 是文件路径，归入基路径所属分类）。
+        let tmp = tempdir().unwrap();
+        let cache = tmp.path().join("my-tool-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("blob.bin"), "payload").unwrap();
+
+        let rules = vec![user_exact_rule(cache.clone(), "我的工具缓存", false)];
+        let (reporter, _events) = TestReporter::new();
+        let result = Scanner::scan_with_rules(&rules, &reporter).unwrap();
+
+        let hit = result
+            .categories
+            .iter()
+            .flat_map(|c| c.items.iter())
+            .find(|i| i.path.starts_with(&cache));
+        assert!(hit.is_some(), "用户 Exact 规则命中目录下的文件应出现在 clean 结果");
+    }
+
+    #[test]
+    fn user_rule_hits_are_never_preselected() {
+        // R3：用户规则经门禁被强制 preselect=false → 命中项 selected=false，--yes/默认勾选不删。
+        // 此处显式传 preselect=false（门禁的效果），断言它正确流到 ScanItem.selected。
+        let tmp = tempdir().unwrap();
+        let cache = tmp.path().join("user-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("f.bin"), "x").unwrap();
+
+        let rules = vec![user_exact_rule(cache.clone(), "用户缓存", false)];
+        let (reporter, _events) = TestReporter::new();
+        let result = Scanner::scan_with_rules(&rules, &reporter).unwrap();
+
+        let hit = result
+            .categories
+            .iter()
+            .flat_map(|c| c.items.iter())
+            .find(|i| i.path.starts_with(&cache))
+            .expect("应命中用户缓存目录下的文件");
+        assert!(!hit.selected, "用户规则命中项永不预选（preselect=false）");
+    }
+
+    #[test]
+    fn clean_scan_ignores_dirname_user_rule() {
+        // 跨策略隔离：只含 DirName 模式的用户规则塞进 clean 扫描 → 不产生任何项
+        // （scan_with_rules 只处理 Exact，DirName 属 purge 语义）。这是薄封装把完整
+        // user_rules() 附加给 scan_clean 的安全性依据。
+        let tmp = tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(proj.join("node_modules")).unwrap();
+        std::fs::write(proj.join("node_modules").join("a.js"), "x").unwrap();
+        std::fs::write(proj.join("package.json"), "{}").unwrap();
+
+        let rules = vec![user_dirname_rule("node_modules", "package.json", "开发产物")];
+        let (reporter, _events) = TestReporter::new();
+        let result = Scanner::scan_with_rules(&rules, &reporter).unwrap();
+
+        let count: usize = result.categories.iter().map(|c| c.items.len()).sum();
+        assert_eq!(count, 0, "DirName 用户规则在 clean 扫描中应被忽略");
+    }
+
+    #[test]
+    fn purge_scan_exact_rule_only_hits_within_base() {
+        // scan_purge_dir 同时处理 DirName 剪枝与 Exact 路径（Exact 条件为在 base 下）。
+        // 用户 Exact 规则若目标不在 purge 的 base 下 → 不命中（starts_with(base) 为假）。
+        // 这钉死接线后的边界：把完整 user_rules() 附加给 purge 不会误清 base 之外的 Exact 目标。
+        let tmp = tempdir().unwrap();
+        let base = tmp.path().join("code");
+        std::fs::create_dir_all(&base).unwrap();
+        // Exact 目标在 base 之外（模拟 ~/Library/Caches/xxx 而 purge 的是 ~/code）。
+        let outside = tmp.path().join("outside-cache");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("f.bin"), "x").unwrap();
+
+        let rules = vec![user_exact_rule(outside, "外部缓存", false)];
+        let (reporter, _events) = TestReporter::new();
+        let result = Scanner::scan_purge_dir(&base, &rules, &reporter).unwrap();
+
+        let count: usize = result.categories.iter().map(|c| c.items.len()).sum();
+        assert_eq!(count, 0, "base 之外的 Exact 用户规则在 purge 扫描中不应命中");
+    }
+
+    #[test]
+    fn purge_scan_includes_user_dirname_rule_hits() {
+        // R2：用户规则的 DirName 模式（满足 root_markers 守卫）命中 → 出现在 purge 扫描结果。
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let proj = base.join("proj");
+        let cache_dir = proj.join(".mytool-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("blob"), "data").unwrap();
+        // inside 守卫标记：cache_dir 内需有 .mytool-marker 才匹配
+        std::fs::write(cache_dir.join(".mytool-marker"), "").unwrap();
+
+        let rules = vec![user_dirname_rule(".mytool-cache", ".mytool-marker", "我的工具产物")];
+        let (reporter, _events) = TestReporter::new();
+        let result = Scanner::scan_purge_dir(base, &rules, &reporter).unwrap();
+
+        let hit = result
+            .categories
+            .iter()
+            .flat_map(|c| c.items.iter())
+            .find(|i| i.path.ends_with(".mytool-cache"));
+        assert!(hit.is_some(), "满足守卫的用户 DirName 规则应命中");
     }
 }
