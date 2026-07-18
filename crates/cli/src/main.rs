@@ -55,6 +55,8 @@ pub enum Commands {
     },
     /// 诊断磁盘访问权限（检查 Full Disk Access，只读）
     Doctor,
+    /// 扫描孤儿残留（父应用已卸载但 ~/Library 残留仍在，反向卸载）
+    Orphans,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -70,6 +72,7 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::History) => commands::history::run(&cli)?,
         Some(Commands::Undo { ref run_id }) => commands::undo::run(&cli, run_id.as_deref())?,
         Some(Commands::Doctor) => commands::doctor::run(&cli)?,
+        Some(Commands::Orphans) => commands::orphans::run(&cli)?,
     }
 
     Ok(())
