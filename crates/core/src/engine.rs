@@ -41,6 +41,14 @@ impl Engine {
         AppResolver::find_leftovers(bundle_id)
     }
 
+    /// 反向卸载：扫描父 App 已不存在的孤儿残留。facade 平价：委托 `AppResolver::scan_orphans`，无逻辑。
+    ///
+    /// 孤儿项一律不预选（`AppResolver` 决定），删除授权侧不受影响（仍只信内置规则）。
+    #[must_use]
+    pub fn scan_orphans() -> Vec<ScanItem> {
+        AppResolver::scan_orphans()
+    }
+
     /// 读取 `.app` 的真实 bundle ID（只解析 Info.plist）。facade 平价：委托 `AppResolver`。
     ///
     /// GUI 卸载用它服务端派生 bundle ID，不信任前端回传的过宽前缀（防误匹配他应用残留）。
@@ -95,5 +103,18 @@ mod tests {
     fn bundle_id_at_delegates_and_handles_missing_app() {
         let bid = Engine::bundle_id_at(std::path::Path::new("/does/not/exist.app"));
         assert!(bid.is_none(), "不存在的 .app 应返回 None（委托 AppResolver::bundle_id_at）");
+    }
+
+    /// facade 平价：`Engine::scan_orphans` 与 `AppResolver::scan_orphans` 在同环境下等价，
+    /// 委托生效、不 panic（真机 `~/Library` 有无孤儿都稳健）。
+    #[test]
+    fn scan_orphans_delegates_to_app_resolver() {
+        let via_engine = Engine::scan_orphans();
+        let via_resolver = crate::app_resolver::AppResolver::scan_orphans();
+        assert_eq!(
+            via_engine.len(),
+            via_resolver.len(),
+            "Engine::scan_orphans 应原样委托 AppResolver::scan_orphans"
+        );
     }
 }
