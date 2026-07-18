@@ -1,5 +1,7 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use log::{debug, warn};
@@ -32,6 +34,21 @@ const USER_DATA_SUBDIRS: &[&str] = &[
     "HTTPStorages",
     "Saved Application State",
 ];
+
+/// 反向卸载（孤儿扫描）时排除的系统预留 / 共享 bundle-id 前缀。
+///
+/// 这些前缀下的残留常年存在于 `~/Library`，其"父 App"是系统组件或多产品共用的容器，
+/// 而非可卸载的独立应用——把它们当孤儿删会误杀系统状态或其他仍在用的应用数据。
+/// 首版只硬保 `com.apple.`（系统组件）；其余共享前缀（如 `com.google.` 下多产品共用目录）
+/// 按真机误报反馈迭代追加，不在首版穷举。判据见
+/// `docs/solutions/security-issues/orphan-leftover-scan-false-positive-defenses.md`。
+const RESERVED_BUNDLE_PREFIXES: &[&str] = &["com.apple."];
+
+/// 孤儿残留的默认最小龄（天）：残留目录 mtime 距今不足此值则跳过。
+///
+/// 刚删 App 的残留可能是用户临时操作、或马上要重装——给缓冲期减少误报。孤儿是"回收"
+/// 非"必删"，漏报可再扫，误杀不可逆代价更高（fail-closed 取向）。
+const ORPHAN_MIN_AGE_DAYS: u64 = 30;
 
 impl AppResolver {
     /// 扫描 /Applications 和 ~/Applications 中的 .app 包，
@@ -314,6 +331,162 @@ impl AppResolver {
             leftovers.len()
         );
         leftovers
+    }
+
+    /// 反向卸载：遍历 `~/Library` 标准子目录，找出**父 App 已不存在**的 bundle-id 残留（孤儿）。
+    ///
+    /// 与 [`find_leftovers`](Self::find_leftovers) 的正向语义互补：正向是"给定已装 App → 找它的残留"，
+    /// 反向是"枚举残留 → 反查父 App 是否还在"。用户装了又删的应用会在 `~/Library` 留下没有主人的残留，
+    /// 正向路径永远找不到它们（App 已不在列表里无从选起）。
+    ///
+    /// **三道误杀防线**（详见
+    /// `docs/solutions/security-issues/orphan-leftover-scan-false-positive-defenses.md`）：
+    /// 1. **fail-closed 析取**：从条目名析不出 bundle-id（不含 `.` 的普通名，如 `Caches/Google/`）→ 跳过，
+    ///    宁可漏报不误杀。
+    /// 2. **系统预留黑名单**（[`RESERVED_BUNDLE_PREFIXES`]）：`com.apple.` 等系统 / 共享前缀绝不当孤儿。
+    /// 3. **龄阈值**（[`ORPHAN_MIN_AGE_DAYS`]）：mtime 距今不足阈值的残留给缓冲期，跳过。
+    ///
+    /// 分级比正向**更保守**：孤儿一律 `preselect=false`（含 Safe 项）——用户没说要删任何东西，是工具主动
+    /// 发现的，App 已卸载但用户可能故意保留数据，故永不默认删、永不 `--yes` 自动删，须逐项手动勾。
+    #[must_use]
+    pub fn scan_orphans() -> Vec<ScanItem> {
+        let installed: HashSet<String> = Self::list_apps()
+            .into_iter()
+            .filter_map(|app| app.bundle_id.map(|b| b.to_lowercase()))
+            .collect();
+        let home = platform::get_home_dir();
+        let library = home.join("Library");
+        Self::scan_orphans_in(&library, &installed, Duration::from_secs(ORPHAN_MIN_AGE_DAYS * 86_400))
+    }
+
+    /// [`scan_orphans`](Self::scan_orphans) 的可注入内核，供测试传入临时 library 根、
+    /// 已装 bundle-id 集合、龄阈值，不依赖真机 `~/Library` 内容与系统时钟。
+    fn scan_orphans_in(
+        library: &Path,
+        installed: &HashSet<String>,
+        min_age: Duration,
+    ) -> Vec<ScanItem> {
+        let now = SystemTime::now();
+        let mut orphans = Vec::new();
+
+        for subdir in LEFTOVER_SUBDIRS {
+            let search_dir = library.join(subdir);
+            if !search_dir.exists() {
+                continue;
+            }
+            let entries = match fs::read_dir(&search_dir) {
+                Ok(e) => e,
+                Err(e) => {
+                    debug!("无法读取 {search_dir:?}: {e:?}");
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let entry_name = entry.file_name().to_string_lossy().to_string();
+
+                // 防线 1：从条目名析出候选 bundle-id 前缀；析不出则跳过（fail-closed）。
+                let Some(candidate) = Self::extract_bundle_id(&entry_name) else {
+                    continue;
+                };
+                let candidate_lower = candidate.to_lowercase();
+
+                // 防线 2：系统预留 / 共享前缀绝不当孤儿。
+                if RESERVED_BUNDLE_PREFIXES
+                    .iter()
+                    .any(|p| candidate_lower.starts_with(p))
+                {
+                    continue;
+                }
+
+                // 父 App 仍在（正向匹配规则的补集）→ 不是孤儿。
+                if Self::bundle_installed(&candidate_lower, installed) {
+                    continue;
+                }
+
+                let path = entry.path();
+
+                // 防线 3：龄不足阈值 → 缓冲期内，跳过。
+                if !Self::older_than(&path, now, min_age) {
+                    continue;
+                }
+
+                let size = match fs::symlink_metadata(&path) {
+                    Ok(m) => {
+                        if m.is_dir() {
+                            Self::calc_app_size(&path)
+                        } else {
+                            m.len()
+                        }
+                    }
+                    Err(_) => 0,
+                };
+
+                // 分级沿用 #25 rubric（USER_DATA → Moderate + 证据，其余 Safe），
+                // 但孤儿场景把 preselect 统一关掉（含 Safe 项）——见方法文档。
+                let item = if USER_DATA_SUBDIRS.contains(subdir) {
+                    ScanItem::new(path, size, SafetyLevel::Moderate, format!("孤儿残留 ({subdir})"))
+                        .with_evidence(
+                            "可能含应用数据（数据库、缓存的文档/草稿、存档等）；父应用已卸载".to_string(),
+                            "默认移入废纸篓可找回；清空废纸篓或 --permanent 后不可恢复".to_string(),
+                        )
+                        .with_preselect(false)
+                } else {
+                    ScanItem::new(path, size, SafetyLevel::Safe, format!("孤儿残留 ({subdir})"))
+                        .with_preselect(false)
+                };
+                orphans.push(item);
+            }
+        }
+
+        debug!("反向扫描找到 {} 个孤儿残留项", orphans.len());
+        orphans
+    }
+
+    /// 从 `~/Library` 残留条目名析出候选 bundle-id 前缀。
+    ///
+    /// 残留条目名通常是 `com.vendor.App` / `com.vendor.App.plist` / `com.vendor.App-hash` 形态。
+    /// 剥掉已知扩展（`.plist`/`.savedState` 等由 `.` 引出的后缀）后，要求结果**含至少两个 `.`**
+    /// （形如 `com.vendor.App` 的反向域名）才认作 bundle-id——普通目录名（`Google`、`Microsoft`）
+    /// 或单段名析不出，返回 `None`（fail-closed，交由调用方跳过）。
+    fn extract_bundle_id(entry_name: &str) -> Option<String> {
+        // 反向域名前缀：取到与已装集合比对时用的核心段。条目名可能带 `-hash` 或 `.suffix`，
+        // 用 `.` 分段计数判定是否像 bundle-id；匹配阶段再做前缀关系判断，故这里保留原始主体。
+        let trimmed = entry_name.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // 至少两个 `.`（com.vendor.app）才像 bundle-id，挡掉 `Google` / `Adobe` 这类普通目录名。
+        if trimmed.matches('.').count() < 2 {
+            return None;
+        }
+        Some(trimmed.to_string())
+    }
+
+    /// 候选 bundle-id 是否命中已装集合（正向匹配规则的补集判定）。
+    ///
+    /// 与 [`find_leftovers`](Self::find_leftovers) 的匹配规则对称：相等，或候选是某已装 id 的
+    /// `id.` / `id-` 派生（残留带后缀），或某已装 id 是候选的同形派生。双向前缀关系确保
+    /// `com.foo.App` 残留能匹配到已装的 `com.foo.App`，也能让带 hash 后缀的残留归位。
+    fn bundle_installed(candidate_lower: &str, installed: &HashSet<String>) -> bool {
+        installed.iter().any(|id| {
+            candidate_lower == id
+                || candidate_lower.starts_with(&format!("{id}."))
+                || candidate_lower.starts_with(&format!("{id}-"))
+                || id.starts_with(&format!("{candidate_lower}."))
+                || id.starts_with(&format!("{candidate_lower}-"))
+        })
+    }
+
+    /// 路径 mtime 距 `now` 是否 ≥ `min_age`。读不到 mtime 时保守返回 `false`（视为"太新"→ 跳过，
+    /// fail-closed：无法判定龄就不删）。
+    fn older_than(path: &Path, now: SystemTime, min_age: Duration) -> bool {
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        let Ok(mtime) = meta.modified() else {
+            return false;
+        };
+        now.duration_since(mtime).is_ok_and(|age| age >= min_age)
     }
 
     /// 读取指定 `.app` 的 bundle ID（只解析 Info.plist，不计算体积）。
@@ -624,5 +797,159 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- 反向卸载（孤儿扫描）测试 ----
+
+    /// 在临时 library 根的某子目录下建一个残留条目，并把其 mtime 设为 `age_days` 天前，
+    /// 以便可控地测试龄阈值。返回残留路径。
+    fn make_leftover(library: &Path, subdir: &str, name: &str, age_days: u64) -> PathBuf {
+        let dir = library.join(subdir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("data.bin"), b"x").unwrap();
+        // 把残留目录 mtime 回拨 age_days 天（std File::set_modified，无需额外依赖）。
+        // Unix 下目录可只读打开并经 futimens 设时间。
+        let past = SystemTime::now() - Duration::from_secs(age_days * 86_400);
+        let handle = fs::OpenOptions::new().read(true).open(&path).unwrap();
+        handle.set_modified(past).unwrap();
+        path
+    }
+
+    fn installed_set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_lowercase()).collect()
+    }
+
+    const OLD: u64 = 60; // 远超默认 30 天阈值
+    fn min_age_30d() -> Duration {
+        Duration::from_secs(ORPHAN_MIN_AGE_DAYS * 86_400)
+    }
+
+    #[test]
+    fn scan_orphans_lists_missing_parent_and_skips_installed() {
+        // R1：父 App 不存在的残留被列为孤儿；父 App 仍在的残留不被列出。
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path();
+        make_leftover(lib, "Caches", "com.gone.App", OLD);
+        make_leftover(lib, "Caches", "com.installed.App", OLD);
+
+        let installed = installed_set(&["com.installed.App"]);
+        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d());
+
+        let names: Vec<String> = orphans
+            .iter()
+            .map(|i| i.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"com.gone.App".to_string()), "父不在应列为孤儿: {names:?}");
+        assert!(
+            !names.contains(&"com.installed.App".to_string()),
+            "父仍在不应列为孤儿: {names:?}"
+        );
+        // 孤儿一律不预选（KTD2），即使 Caches 是 Safe。
+        for item in &orphans {
+            assert!(!item.selected, "孤儿残留一律不预选: {:?}", item.path);
+        }
+    }
+
+    #[test]
+    fn scan_orphans_excludes_reserved_apple_prefix() {
+        // R5：com.apple.* 系统预留前缀绝不当孤儿，即便已装集合不含它。
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path();
+        make_leftover(lib, "Caches", "com.apple.Safari", OLD);
+
+        let installed = installed_set(&[]); // 空：Safari 不在已装集合
+        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d());
+
+        assert!(orphans.is_empty(), "com.apple.* 应被黑名单排除: {orphans:?}");
+    }
+
+    #[test]
+    fn scan_orphans_fail_closed_on_non_bundle_name() {
+        // R2 fail-closed：条目名不含足够的 `.`（普通目录名）→ 析不出 bundle-id，跳过、不当孤儿。
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path();
+        make_leftover(lib, "Caches", "Google", OLD); // 普通目录名
+        make_leftover(lib, "Caches", "com.single", OLD); // 只有一个 `.`，不像 bundle-id
+
+        let installed = installed_set(&[]);
+        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d());
+
+        assert!(orphans.is_empty(), "析不出 bundle-id 的条目应跳过: {orphans:?}");
+    }
+
+    #[test]
+    fn scan_orphans_grading_moderate_for_user_data_safe_otherwise() {
+        // R3：USER_DATA 子目录派生 → Moderate + 证据 + 不预选；其余 → Safe + 不预选。
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path();
+        make_leftover(lib, "Application Support", "com.gone.App", OLD); // USER_DATA
+        make_leftover(lib, "Caches", "com.gone.App", OLD); // 非 USER_DATA
+
+        let installed = installed_set(&[]);
+        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d());
+
+        let user_data = orphans
+            .iter()
+            .find(|i| i.category.contains("Application Support"))
+            .expect("应含 Application Support 孤儿");
+        assert_eq!(user_data.safety, SafetyLevel::Moderate);
+        assert!(!user_data.selected, "USER_DATA 孤儿不预选");
+        assert!(
+            !user_data.impact.is_empty() && !user_data.recovery.is_empty(),
+            "USER_DATA 孤儿应有非空证据文案"
+        );
+
+        let cache = orphans
+            .iter()
+            .find(|i| i.category.contains("Caches"))
+            .expect("应含 Caches 孤儿");
+        assert_eq!(cache.safety, SafetyLevel::Safe);
+        assert!(!cache.selected, "Safe 孤儿也不预选（KTD2）");
+    }
+
+    #[test]
+    fn scan_orphans_respects_age_threshold() {
+        // 龄阈值：mtime 在阈值内的孤儿被跳过；超阈值的被列出。
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path();
+        make_leftover(lib, "Caches", "com.fresh.App", 5); // 5 天 < 30
+        make_leftover(lib, "Caches", "com.stale.App", OLD); // 60 天 > 30
+
+        let installed = installed_set(&[]);
+        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d());
+
+        let names: Vec<String> = orphans
+            .iter()
+            .map(|i| i.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"com.stale.App".to_string()), "超龄应列出: {names:?}");
+        assert!(
+            !names.contains(&"com.fresh.App".to_string()),
+            "龄不足阈值应跳过: {names:?}"
+        );
+    }
+
+    #[test]
+    fn scan_orphans_empty_library_no_panic() {
+        // 空 library 根：子目录都不存在 → 返回空、不崩。
+        let tmp = tempfile::tempdir().unwrap();
+        let installed = installed_set(&[]);
+        let orphans = AppResolver::scan_orphans_in(tmp.path(), &installed, min_age_30d());
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn scan_orphans_prefix_derived_leftover_matches_installed() {
+        // 带 hash/后缀的残留（com.gone.App.plist 形态由 Preferences 派生）——若父在应归位、不当孤儿。
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path();
+        // Saved Application State 常见形态：com.vendor.App.savedState
+        make_leftover(lib, "Saved Application State", "com.keep.App.savedState", OLD);
+
+        let installed = installed_set(&["com.keep.App"]);
+        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d());
+        assert!(orphans.is_empty(), "已装 App 的带后缀残留应归位、不当孤儿: {orphans:?}");
     }
 }
