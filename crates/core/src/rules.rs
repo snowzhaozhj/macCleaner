@@ -977,4 +977,39 @@ patterns = [{ dir_name = "build" }]
         let rules = user_rules_from_str("this is not = valid toml [[[", "test");
         assert!(rules.is_empty(), "解析失败应优雅降级为空而非崩溃");
     }
+
+    #[test]
+    fn readme_example_rules_pass_gate() {
+        // 契约测试：README「用户叠加规则」小节的示例 TOML 必须能通过门禁并加载。
+        // 防文档漂移——若示例失效（字段改名、守卫要求变化），此测试红。
+        // 与 README.md 的示例保持逐字一致。
+        let toml = r#"
+[[rules]]
+name = "mytool-cache"
+description = "MyTool 缓存目录"
+category = "自定义缓存"
+safety = "Safe"
+impact = "缓存文件，工具下次运行会重建"
+recovery = "重新运行 MyTool 即自动重建"
+preselect = false
+patterns = [{ exact = "Library/Caches/mytool" }]
+
+[[rules]]
+name = "mytool-build"
+description = "MyTool 构建产物"
+category = "自定义开发产物"
+safety = "Moderate"
+impact = "构建输出，重新构建即可再生"
+recovery = "重新运行构建命令"
+preselect = false
+root_markers = [{ sibling = "mytool.config" }]
+patterns = [{ dir_name = ".mytool-build" }]
+"#;
+        let rules = user_rules_from_str(toml, "README 示例");
+        assert_eq!(rules.len(), 2, "README 两条示例规则都应通过门禁并加载");
+        assert!(
+            rules.iter().all(|r| !r.preselect),
+            "用户规则一律强制 preselect=false"
+        );
+    }
 }
