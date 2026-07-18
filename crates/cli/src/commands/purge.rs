@@ -59,6 +59,8 @@ pub fn run(cli: &Cli) -> Result<()> {
     let reporter = CliReporter::default();
     eprintln!("正在扫描 {} 中的开发产物...\n", path.display());
 
+    // 用户叠加规则加载提示（#2 规则外部化）。
+    super::print_user_rules_notice();
     let result = Engine::scan_purge(&path, &reporter)?;
 
     // 扫描期间因权限跳过的路径单列展示，引导 mc doctor（#23）。

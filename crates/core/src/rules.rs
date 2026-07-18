@@ -177,8 +177,15 @@ pub fn validate_user_rule(rule: &CleanRule) -> Result<(), String> {
 
 /// 从 TOML 文本加载用户规则并跑安全门禁。**fail-closed**：TOML 解析失败或**任一条**规则违反
 /// `DirName` 守卫，都跳过整个文件（返回空），并 `log::error!` 打出具体原因——默认安全优先于「尽量加载」。
-/// 所有通过的规则都被无条件强制 `preselect = false`——这是防自动删除的**唯一且充分**的主闸：
-/// 用户规则永不自动预选，即便声明 preselect=true 也改回 false，仍可在 TUI 手动勾选。
+///
+/// 通过的规则被无条件强制两件事，共同封住「用户自声明安全等级」这个信任缺口：
+/// 1. `preselect = false`——永不自动预选，即便声明 preselect=true；`--yes`/默认勾选不删。
+/// 2. `safety = Risky`——用户规则的 safety 是**自声明、未经审计**的，不能作为任何删除界面的
+///    信任输入。若沿用声明值，一条 `safety="Safe"` 的规则会被 TUI 的 `select_all_safe`（按
+///    `safety != Risky` 全选）扫入待删集、且 `confirm_has_risky` 放行为普通确认，绕过 Risky 的
+///    type-to-confirm（安全审查发现）。强制 Risky 让未审计用户项落入最保守档：永不预选、全选安全
+///    项时被排除、删除必经 type-to-confirm——与 `analyze-unknown-path-deletion-fail-closed` 学习
+///    对「未知路径」的处理一致。用户仍可在 TUI 逐项确认删除，只是不再享有「安全」快捷路径。
 fn user_rules_from_str(toml_str: &str, source: &str) -> Vec<CleanRule> {
     let rules = match parse_rules_toml(toml_str, source) {
         Ok(r) => r,
@@ -197,6 +204,7 @@ fn user_rules_from_str(toml_str: &str, source: &str) -> Vec<CleanRule> {
         .into_iter()
         .map(|mut r| {
             r.preselect = false;
+            r.safety = SafetyLevel::Risky;
             r
         })
         .collect()
@@ -934,7 +942,8 @@ patterns = [{ exact = "Documents/old-exports" }]
 
     #[test]
     fn user_rules_from_str_forces_preselect_false() {
-        // 即便声明 preselect=true，加载后也必须强制为 false。
+        // 即便声明 preselect=true，加载后也必须强制为 false；且自声明 safety 被强制为 Risky
+        // （未审计的用户 safety 不能作为任何删除界面的信任输入——见 user_rules_from_str 文档）。
         let toml = r#"
 [[rules]]
 name = "My Cache"
@@ -947,6 +956,11 @@ patterns = [{ exact = ".cache/myapp" }]
         let rules = user_rules_from_str(toml, "test");
         assert_eq!(rules.len(), 1, "合法规则应被加载");
         assert!(!rules[0].preselect, "用户规则 preselect 必须被强制为 false");
+        assert_eq!(
+            rules[0].safety,
+            SafetyLevel::Risky,
+            "用户自声明 safety 必须被强制为 Risky（封住 select_all_safe 的信任缺口）"
+        );
     }
 
     #[test]
@@ -976,5 +990,44 @@ patterns = [{ dir_name = "build" }]
         // 坏 TOML 不 panic，优雅返回空。
         let rules = user_rules_from_str("this is not = valid toml [[[", "test");
         assert!(rules.is_empty(), "解析失败应优雅降级为空而非崩溃");
+    }
+
+    #[test]
+    fn readme_example_rules_pass_gate() {
+        // 契约测试：README「用户叠加规则」小节的示例 TOML 必须能通过门禁并加载。
+        // 防文档漂移——若示例失效（字段改名、守卫要求变化），此测试红。
+        // 与 README.md 的示例保持逐字一致。
+        let toml = r#"
+[[rules]]
+name = "mytool-cache"
+description = "MyTool 缓存目录"
+category = "自定义缓存"
+safety = "Safe"
+impact = "缓存文件，工具下次运行会重建"
+recovery = "重新运行 MyTool 即自动重建"
+preselect = false
+patterns = [{ exact = "Library/Caches/mytool" }]
+
+[[rules]]
+name = "mytool-build"
+description = "MyTool 构建产物"
+category = "自定义开发产物"
+safety = "Moderate"
+impact = "构建输出，重新构建即可再生"
+recovery = "重新运行构建命令"
+preselect = false
+root_markers = [{ sibling = "mytool.config" }]
+patterns = [{ dir_name = ".mytool-build" }]
+"#;
+        let rules = user_rules_from_str(toml, "README 示例");
+        assert_eq!(rules.len(), 2, "README 两条示例规则都应通过门禁并加载");
+        assert!(
+            rules.iter().all(|r| !r.preselect),
+            "用户规则一律强制 preselect=false"
+        );
+        assert!(
+            rules.iter().all(|r| r.safety == SafetyLevel::Risky),
+            "用户规则自声明 safety（示例里的 Safe/Moderate）一律被强制为 Risky"
+        );
     }
 }
