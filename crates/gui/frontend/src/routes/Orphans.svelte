@@ -138,11 +138,6 @@
       undoResult = null; // 新一次删除：清掉上次撤销缓存，使本次撤销重新可发 IPC。
       if (report.success_count > 0) {
         toast = nextToast(toast, report.success_count, report.total_freed);
-        // 删除成功的孤儿项从列表剔除（照 Clean/Analyze 删后剪除）：保留未删项供继续审查。
-        const deleted = new Set(
-          report.cleaned.filter((c) => c.success).map((c) => c.path),
-        );
-        items = items.filter((i) => !deleted.has(i.path));
       }
     }
     setPhase("done");
@@ -245,7 +240,7 @@
         {/each}
       </ul>
     {:else if phase === "empty"}
-      <p class="empty">未发现孤儿残留——已卸载应用未留下可回收的数据。</p>
+      <p class="empty">未发现孤儿残留。</p>
     {:else if phase === "ready" || phase === "deleting"}
       <StreamingList
         {items}
@@ -356,6 +351,12 @@
     }
     to {
       background-position: -200% 0;
+    }
+  }
+  /* 尊重减少动态偏好——与 Uninstall/Analyze 骨架一致（a11y）。 */
+  @media (prefers-reduced-motion: reduce) {
+    .skeleton-row {
+      animation: none;
     }
   }
   .scan-actions {

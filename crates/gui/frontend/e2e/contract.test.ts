@@ -149,7 +149,7 @@ describe("IPC 契约守卫（R4）", () => {
   });
 
   it("关键映射：删除确认参数保持前后端一致", () => {
-    for (const cmd of ["clean", "purge", "uninstall", "delete_marked"]) {
+    for (const cmd of ["clean", "purge", "uninstall", "clean_orphans", "delete_marked"]) {
       expect(ipcCalls.get(cmd)).toContain("confirmToken");
       expect(ipcCalls.get(cmd)).toContain("onEvent");
       expect(rustArgs.get(cmd)).toContain("confirm_token");
