@@ -42,11 +42,14 @@ tags:
 
 ## Resolution
 
-`AppResolver::scan_orphans`（`crates/core/src/app_resolver.rs`）用**三道串联防线**把误报压到最低，全部偏向 fail-closed：
+`AppResolver::scan_orphans`（`crates/core/src/app_resolver.rs`）用**四道串联防线**把误报压到最低，全部偏向 fail-closed：
 
 1. **fail-closed bundle-id 析取**（`extract_bundle_id`）：只有条目名含 ≥2 个 `.`（形如 `com.vendor.App` 的反向域名）才认作 bundle-id 候选；普通目录名、单段名析不出 → 直接跳过、不当孤儿。宁可漏掉一个真孤儿，也不误判一个共用容器。
 2. **系统预留黑名单**（`RESERVED_BUNDLE_PREFIXES`）：候选前缀命中 `com.apple.` 等系统/共享前缀 → 排除。首版只硬保 `com.apple.`；其余共享前缀（`com.google.` 下多产品共用等）按真机误报反馈迭代追加，不首版穷举（穷举易漏、且无真机数据支撑）。
 3. **龄阈值**（`ORPHAN_MIN_AGE_DAYS`，默认 30 天）：残留目录 mtime 距今不足阈值 → 跳过，给"刚删可能重装"缓冲期。读不到 mtime 时保守视为"太新"跳过（也是 fail-closed）。
+4. **空已装集合 fail-closed**（评审补强）：孤儿判定完全依赖 `list_apps()` 产出的「已装 bundle-id 集合」。`list_apps` 只扫 `/Applications`/`~/Applications` **顶层**且对读失败**静默降级**——若 `/Applications` 因权限读不到，集合退化为空，届时 `bundle_installed` 对每个候选都返回 false，**每一条**非 Apple、超龄残留都会被判成孤儿（实为在用 App 的数据）。故 `scan_orphans` 在集合为空时**直接返回空**，而非把「读不到已装应用」误当成「什么都没装」。这是评审（correctness/reliability/adversarial/testing 五方一致）挖出的 fail-**open** 缺口，与本文其余三道 fail-closed 防线方向相反，必须堵上。
+
+**已知局限（经 `preselect=false` + 移废纸篓 + 逐项人工勾选兜底，不静默误删）**：`list_apps` 只扫顶层，嵌套安装的 App（Setapp、`/Applications/Utilities/`、`Adobe Acrobat DC/` 等子目录）不在集合内，其在用残留可能被列为孤儿候选；辅助进程/更新器的 sibling bundle-id（`com.google.Keystone.Agent`、`com.adobe.ARMDCHelper`）与 TEAMID group-container（`5ZSL2CJU2T.com.vendor.*`）也不与父 App id 前缀匹配。递归扫描应用容器子目录、扩充黑名单是后续增强项。
 
 父应用存在性判定（`bundle_installed`）是**正向匹配规则的补集**，与 `find_leftovers` 的匹配语义对称：相等、或候选是某已装 id 的 `id.`/`id-` 派生（残留带 hash/后缀）、或某已装 id 是候选的同形派生。双向前缀关系确保带 `.savedState` 等后缀的残留能归位到仍安装的父应用、不误列孤儿。
 

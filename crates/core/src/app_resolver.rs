@@ -230,7 +230,7 @@ impl AppResolver {
     }
 
     /// 计算 .app 目录的大小，使用 `symlink_metadata` 避免跟随符号链接
-    fn calc_app_size(path: &PathBuf) -> u64 {
+    fn calc_app_size(path: &Path) -> u64 {
         let mut total: u64 = 0;
         let entries = match fs::read_dir(path) {
             Ok(e) => e,
@@ -252,6 +252,21 @@ impl AppResolver {
             }
         }
         total
+    }
+
+    /// 计算残留条目的体积：目录递归求和，文件取自身大小；读不到 metadata 时归 0。
+    /// 正向 `find_leftovers` 与反向 `scan_orphans` 共用。
+    fn entry_size(path: &Path) -> u64 {
+        match fs::symlink_metadata(path) {
+            Ok(m) => {
+                if m.is_dir() {
+                    Self::calc_app_size(path)
+                } else {
+                    m.len()
+                }
+            }
+            Err(_) => 0,
+        }
     }
 
     /// 根据 bundle ID 在 ~/Library 标准路径下查找应用残留
@@ -288,16 +303,7 @@ impl AppResolver {
                     || entry_lower.starts_with(&format!("{bid_lower}-"))
                 {
                     let path = entry.path();
-                    let size = match fs::symlink_metadata(&path) {
-                        Ok(m) => {
-                            if m.is_dir() {
-                                Self::calc_app_size(&path)
-                            } else {
-                                m.len()
-                            }
-                        }
-                        Err(_) => 0,
-                    };
+                    let size = Self::entry_size(&path);
                     // D3（issue #25 方案 B）：Application Support / WebKit / HTTPStorages /
                     // Saved Application State 可能存放应用的主用户数据（数据库、IndexedDB/
                     // localStorage、存档等），但移废纸篓可恢复。取舍：
@@ -339,12 +345,19 @@ impl AppResolver {
     /// 反向是"枚举残留 → 反查父 App 是否还在"。用户装了又删的应用会在 `~/Library` 留下没有主人的残留，
     /// 正向路径永远找不到它们（App 已不在列表里无从选起）。
     ///
-    /// **三道误杀防线**（详见
+    /// **四道误杀防线**（详见
     /// `docs/solutions/security-issues/orphan-leftover-scan-false-positive-defenses.md`）：
     /// 1. **fail-closed 析取**：从条目名析不出 bundle-id（不含 `.` 的普通名，如 `Caches/Google/`）→ 跳过，
     ///    宁可漏报不误杀。
     /// 2. **系统预留黑名单**（[`RESERVED_BUNDLE_PREFIXES`]）：`com.apple.` 等系统 / 共享前缀绝不当孤儿。
     /// 3. **龄阈值**（[`ORPHAN_MIN_AGE_DAYS`]）：mtime 距今不足阈值的残留给缓冲期，跳过。
+    /// 4. **空已装集合 fail-closed**：`list_apps` 读不到 `/Applications`（权限）会退化为空集合，此时
+    ///    「父已卸载」判断不可信，整体返回空而非把所有残留当孤儿（评审 R1）。
+    ///
+    /// **已知局限**：`list_apps` 只扫应用目录顶层，嵌套安装的 App（Setapp、Utilities、`Adobe Acrobat DC/`
+    /// 等子目录）不在集合内，其在用残留可能被列为孤儿候选；辅助进程/更新器的 sibling bundle-id
+    /// （`com.google.Keystone.Agent` 等）也不与父 App id 前缀匹配。这些经 `preselect=false` + 移废纸篓 +
+    /// 逐项人工勾选兜底，不会静默误删。
     ///
     /// 分级比正向**更保守**：孤儿一律 `preselect=false`（含 Safe 项）——用户没说要删任何东西，是工具主动
     /// 发现的，App 已卸载但用户可能故意保留数据，故永不默认删、永不 `--yes` 自动删，须逐项手动勾。
@@ -354,6 +367,15 @@ impl AppResolver {
             .into_iter()
             .filter_map(|app| app.bundle_id.map(|b| b.to_lowercase()))
             .collect();
+        // fail-closed（评审 R1）：孤儿判定完全依赖「已装 bundle-id 集合」。`list_apps` 只扫
+        // /Applications 与 ~/Applications 顶层、且对读失败静默降级——若 /Applications 因权限读不到，
+        // 集合会退化为空，于是**每一条**非 Apple、超龄的 ~/Library 残留都被判成孤儿（实为在用 App 的数据）。
+        // 空集合无法可信地支撑「父已卸载」判断，按 fail-closed 直接返回空（宁漏报不误杀），
+        // 而非把「读不到已装应用」误当成「什么都没装」。
+        if installed.is_empty() {
+            debug!("已装应用集合为空（可能 /Applications 不可读），孤儿扫描 fail-closed 返回空");
+            return Vec::new();
+        }
         let home = platform::get_home_dir();
         let library = home.join("Library");
         Self::scan_orphans_in(&library, &installed, Duration::from_secs(ORPHAN_MIN_AGE_DAYS * 86_400))
@@ -410,16 +432,7 @@ impl AppResolver {
                     continue;
                 }
 
-                let size = match fs::symlink_metadata(&path) {
-                    Ok(m) => {
-                        if m.is_dir() {
-                            Self::calc_app_size(&path)
-                        } else {
-                            m.len()
-                        }
-                    }
-                    Err(_) => 0,
-                };
+                let size = Self::entry_size(&path);
 
                 // 分级沿用 #25 rubric（USER_DATA → Moderate + 证据，其余 Safe），
                 // 但孤儿场景把 preselect 统一关掉（含 Safe 项）——见方法文档。
@@ -445,12 +458,11 @@ impl AppResolver {
     /// 从 `~/Library` 残留条目名析出候选 bundle-id 前缀。
     ///
     /// 残留条目名通常是 `com.vendor.App` / `com.vendor.App.plist` / `com.vendor.App-hash` 形态。
-    /// 剥掉已知扩展（`.plist`/`.savedState` 等由 `.` 引出的后缀）后，要求结果**含至少两个 `.`**
-    /// （形如 `com.vendor.App` 的反向域名）才认作 bundle-id——普通目录名（`Google`、`Microsoft`）
-    /// 或单段名析不出，返回 `None`（fail-closed，交由调用方跳过）。
+    /// **不剥后缀**：直接按 `.` 分段计数判定是否像 bundle-id——含至少两个 `.`（形如
+    /// `com.vendor.App` 的反向域名）才认作候选，挡掉普通目录名（`Google`、`Microsoft`）与单段名，
+    /// 后者返回 `None`（fail-closed，交由调用方跳过）。带 `.plist`/`-hash` 等后缀的条目名保留原样，
+    /// 与已装集合的归位由 [`bundle_installed`](Self::bundle_installed) 的前缀匹配处理。
     fn extract_bundle_id(entry_name: &str) -> Option<String> {
-        // 反向域名前缀：取到与已装集合比对时用的核心段。条目名可能带 `-hash` 或 `.suffix`，
-        // 用 `.` 分段计数判定是否像 bundle-id；匹配阶段再做前缀关系判断，故这里保留原始主体。
         let trimmed = entry_name.trim();
         if trimmed.is_empty() {
             return None;
@@ -468,12 +480,17 @@ impl AppResolver {
     /// `id.` / `id-` 派生（残留带后缀），或某已装 id 是候选的同形派生。双向前缀关系确保
     /// `com.foo.App` 残留能匹配到已装的 `com.foo.App`，也能让带 hash 后缀的残留归位。
     fn bundle_installed(candidate_lower: &str, installed: &HashSet<String>) -> bool {
+        // 精确命中先走 O(1) 哈希探测。
+        if installed.contains(candidate_lower) {
+            return true;
+        }
+        // 前缀关系哈希查不了，需线性扫；用 strip_prefix 原地比字节，避免 format! 逐个分配。
+        // `candidate` 是某 `id` 的 `id.`/`id-` 派生（残留带后缀），或反之。
         installed.iter().any(|id| {
-            candidate_lower == id
-                || candidate_lower.starts_with(&format!("{id}."))
-                || candidate_lower.starts_with(&format!("{id}-"))
-                || id.starts_with(&format!("{candidate_lower}."))
-                || id.starts_with(&format!("{candidate_lower}-"))
+            candidate_lower
+                .strip_prefix(id.as_str())
+                .or_else(|| id.strip_prefix(candidate_lower))
+                .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('-'))
         })
     }
 
@@ -739,7 +756,7 @@ mod tests {
         let mut f2 = File::create(&file2).unwrap();
         f2.write_all(b"world!").unwrap();
 
-        let size = AppResolver::calc_app_size(&dir.path().to_path_buf());
+        let size = AppResolver::calc_app_size(dir.path());
         assert_eq!(size, 11, "总大小应为 11 字节");
     }
 
