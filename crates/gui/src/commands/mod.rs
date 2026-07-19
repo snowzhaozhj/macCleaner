@@ -2,6 +2,7 @@
 
 pub mod analyze;
 pub mod clean;
+pub mod orphans;
 pub mod permission;
 pub mod purge;
 pub mod reveal;

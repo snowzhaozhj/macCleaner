@@ -30,6 +30,9 @@ pub struct AppState {
     pub last_uninstall: Arc<Mutex<Option<ScanResult>>>,
     /// 最近一次 analyze 树，供 `delete_marked` 按标记路径收集 (path, size)。
     pub last_analyze: Arc<Mutex<Option<DirNode>>>,
+    /// 最近一次 orphans 反向扫描结果，独立槽（KTD3：与 clean/purge/uninstall 隔离，
+    /// 切 tab 或交替操作时删除不会误取另一路径的项）。
+    pub last_orphans: Arc<Mutex<Option<ScanResult>>>,
 }
 
 impl Default for AppState {
@@ -40,6 +43,7 @@ impl Default for AppState {
             last_purge: Arc::new(Mutex::new(None)),
             last_uninstall: Arc::new(Mutex::new(None)),
             last_analyze: Arc::new(Mutex::new(None)),
+            last_orphans: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -80,6 +84,8 @@ pub fn run() {
             commands::analyze::analyze,
             commands::analyze::classify_marked,
             commands::analyze::delete_marked,
+            commands::orphans::scan_orphans,
+            commands::orphans::clean_orphans,
             commands::permission::check_fda,
             commands::permission::open_fda_settings,
             commands::trash::open_trash,
