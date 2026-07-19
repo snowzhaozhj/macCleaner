@@ -20,6 +20,9 @@ macCleaner 对外暴露四个顶层命令，互为对照——前三个按规则
 ### Uninstall
 卸载应用并清理其残留文件的清理命令。
 
+### Orphans（反向卸载）
+扫描 `~/Library` 标准子目录，找出**父应用已不存在**的 bundle-id 残留（用户装了又删的应用留下的无主残留）的清理命令。与 [Uninstall] 语义互补：Uninstall 是**正向**（给定仍安装的应用 → 找它的残留），Orphans 是**反向**（枚举残留 → 反查父应用是否还在，即正向匹配规则的补集）。三道误杀防线：① fail-closed 析取——从条目名析不出 bundle-id（不含足够 `.` 的普通目录名如 `Google`）即跳过，宁漏报不误杀；② 系统预留黑名单——`com.apple.*` 等系统/共享前缀绝不当孤儿（`RESERVED_BUNDLE_PREFIXES`，首版只硬保 Apple，其余按真机误报迭代）；③ 龄阈值——残留目录 mtime 距今不足默认 30 天则跳过（刚删可能马上重装，给缓冲期）。分级沿用应用残留 rubric（USER_DATA 子目录 → Moderate + 证据文案，其余 → Safe），但**孤儿一律 `preselect = false`（含 Safe 项）**：用户没主动选择要删、且应用已卸载但数据可能是有意保留的，故永不默认删、`--yes` 也不自动删。实现见 `crates/core/src/app_resolver.rs` 的 `scan_orphans` 与 `docs/solutions/security-issues/orphan-leftover-scan-false-positive-defenses.md`。
+
 ## GUI 信息层级 (GUI Information Layers)
 
 ### 决策面孔（Decision Face）
