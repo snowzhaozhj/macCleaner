@@ -175,6 +175,8 @@ fn start_command(
                                     }
                                 }
                             },
+                            // TUI analyze 暂不展示权限跳过（与 CLI 一致，本轮为 GUI-only 增强）：传 no-op。
+                            |_path| {},
                         );
                     }));
                 // 无论正常完成还是 panic，都发送 Finished

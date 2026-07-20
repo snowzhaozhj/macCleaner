@@ -90,12 +90,18 @@ fn park_threads() -> usize {
 /// （目录 size=0），并周期性查 `is_cancelled` 及时中止。内部按 `MC_WALK_ENGINE` 选后端，
 /// UI 侧（TUI 实时建树 / CLI 一次性建树）无需感知遍历实现。
 ///
+/// `on_skip(path)`：读目录遇 `PermissionDenied` 时对该路径回调一次（#23 分析入口对齐 clean/purge）。
+/// 只有权限类升此回调——其它 IO 错误静默跳过（不把"文件系统坏了"误报成"缺授权"）。调用方决定如何
+/// 承载(GUI 发 `AnalyzeEvent::SkippedNoPermission`，CLI/TUI 传 no-op)。park 分支在 worker 线程回调，
+/// 故 `on_skip` 需 `Send + Sync`；jwalk 分支在消费线程回调。
+///
 /// 交付顺序：jwalk 为 DFS 序，park 为完成序——消费方（`IncrementalTreeBuilder` 路径键控插入）
 /// 与顺序解耦，两者结果逐字节一致（R3）。
-pub fn analyze_walk<X, C>(root: &Path, is_cancelled: X, mut on_entry: C)
+pub fn analyze_walk<X, C, S>(root: &Path, is_cancelled: X, mut on_entry: C, on_skip: S)
 where
     X: Fn() -> bool,
     C: FnMut(String, PathBuf, u64, bool),
+    S: Fn(PathBuf) + Send + Sync,
 {
     let file_name = |path: &Path| {
         path.file_name()
@@ -106,9 +112,23 @@ where
             let walker = create_walker(root).process_read_dir(|_d, _p, _s, children| {
                 prefetch_metadata(children);
             });
-            for entry in walker.into_iter().flatten() {
+            for result in walker {
                 if is_cancelled() {
                     break;
+                }
+                // jwalk 把「读某目录内容失败」暴露在该目录 entry 的 read_children_error 字段
+                // （不作为迭代 Err 交付）——仅 PermissionDenied 升 on_skip，其它错误静默跳过。
+                let entry = match result {
+                    Ok(entry) => entry,
+                    Err(_) => continue, // 遍历自身的错误（罕见），非本目录权限类，静默
+                };
+                if let Some(err) = &entry.read_children_error {
+                    if err
+                        .io_error()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                    {
+                        on_skip(entry.path());
+                    }
                 }
                 let path = entry.path();
                 if path == root {
@@ -124,9 +144,12 @@ where
                 root,
                 park_threads(),
                 |children| prefetch_sizes(children),
-                // analyze 不做权限跳过上报（#23 只覆盖 clean/purge）：读不到的目录静默跳过，
-                // 保持与改 park 引擎前的行为一致。
-                |_p, _err| {},
+                // 仅 PermissionDenied 升 on_skip（#23 分流，同 jwalk 分支与 emit_park_permission_denied）：
+                |p, err| {
+                    if err.kind() == std::io::ErrorKind::PermissionDenied {
+                        on_skip(p.to_path_buf());
+                    }
+                },
                 is_cancelled,
                 |e| {
                     if e.path == root {
@@ -1376,6 +1399,44 @@ mod tests {
             evts.iter().any(|e| e.starts_with("Skipped:") && e.contains("locked_dir")),
             "无权限目录应产生 SkippedNoPermission 事件，实际: {evts:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn analyze_walk_invokes_on_skip_for_permission_denied_both_engines() {
+        // #23 分析入口对齐：analyze_walk 遇 PermissionDenied 目录时对该路径调 on_skip；
+        // park（默认）与 jwalk 两条引擎分支均须触发（最易实现错的双引擎供给路径）。
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Mutex;
+        for engine in ["park", "jwalk"] {
+            std::env::set_var("MC_WALK_ENGINE", engine);
+            let tmp = tempdir().unwrap();
+            let root = tmp.path();
+            let locked = root.join("locked_dir");
+            std::fs::create_dir(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // root 可穿透 0o000：环境不适合断言时复原后跳过本引擎。
+            if std::fs::read_dir(&locked).is_ok() {
+                let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+                continue;
+            }
+
+            let skipped: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+            analyze_walk(
+                root,
+                || false,
+                |_n, _p, _s, _f| {},
+                |p| skipped.lock().unwrap().push(p),
+            );
+            let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+
+            let got = skipped.lock().unwrap();
+            assert!(
+                got.iter().any(|p| p == &locked),
+                "{engine} 引擎下不可读目录应触发 on_skip，实际: {got:?}"
+            );
+        }
+        std::env::remove_var("MC_WALK_ENGINE");
     }
 
     #[test]

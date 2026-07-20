@@ -41,12 +41,24 @@ impl Engine {
         AppResolver::find_leftovers(bundle_id)
     }
 
+    /// 同 `find_leftovers`，但附带因 `PermissionDenied` 跳过的路径（#23）。GUI 用此变体展示「因权限跳过」区。
+    #[must_use]
+    pub fn find_leftovers_with_skips(bundle_id: &str) -> (Vec<ScanItem>, Vec<std::path::PathBuf>) {
+        AppResolver::find_leftovers_with_skips(bundle_id)
+    }
+
     /// 反向卸载：扫描父 App 已不存在的孤儿残留。facade 平价：委托 `AppResolver::scan_orphans`，无逻辑。
     ///
     /// 孤儿项一律不预选（`AppResolver` 决定），删除授权侧不受影响（仍只信内置规则）。
     #[must_use]
     pub fn scan_orphans() -> Vec<ScanItem> {
         AppResolver::scan_orphans()
+    }
+
+    /// 同 `scan_orphans`，但附带因 `PermissionDenied` 跳过的路径（#23）。GUI 用此变体展示「因权限跳过」区。
+    #[must_use]
+    pub fn scan_orphans_with_skips() -> (Vec<ScanItem>, Vec<std::path::PathBuf>) {
+        AppResolver::scan_orphans_with_skips()
     }
 
     /// 读取 `.app` 的真实 bundle ID（只解析 Info.plist）。facade 平价：委托 `AppResolver`。

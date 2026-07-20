@@ -65,6 +65,10 @@ pub enum AnalyzeEvent {
         file_count: u64,
         total_size: u64,
     },
+    /// 遍历遇 `PermissionDenied` 跳过的目录（#23 分析入口对齐）：与 `ProgressEvent::SkippedNoPermission`
+    /// 同义——只有权限类才升为结构化「跳过（需授权）」信号，供 GUI 分析视图单列「因权限跳过」区并引导授权。
+    /// 序列化字段须稳定（前端 ipc 类型依赖）。
+    SkippedNoPermission { path: PathBuf },
     /// 遍历完成
     Finished,
 }
@@ -117,10 +121,21 @@ mod tests {
             AnalyzeEvent::Entry { name: "node_modules".into(), path: PathBuf::from("/p/node_modules"), size: 0, is_file: false },
             AnalyzeEvent::Entry { name: "big.bin".into(), path: PathBuf::from("/p/big.bin"), size: 1 << 30, is_file: true },
             AnalyzeEvent::Progress { file_count: 500, total_size: 12345 },
+            AnalyzeEvent::SkippedNoPermission { path: PathBuf::from("/Users/x/Library/Mail") },
             AnalyzeEvent::Finished,
         ] {
             let json = serde_json::to_string(&evt).unwrap();
             let _back: AnalyzeEvent = serde_json::from_str(&json).unwrap();
         }
+    }
+
+    /// `AnalyzeEvent::SkippedNoPermission` 是分析视图 FDA UX 的结构化信号（#23 分析入口对齐），
+    /// 序列化字段须稳定——前端 ipc 类型依赖 `{ SkippedNoPermission: { path } }` 形状。
+    #[test]
+    fn analyze_event_skipped_serde_round_trip() {
+        let evt = AnalyzeEvent::SkippedNoPermission { path: PathBuf::from("/Users/x/Library/Mail") };
+        let json = serde_json::to_string(&evt).unwrap();
+        let back: AnalyzeEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, AnalyzeEvent::SkippedNoPermission { path } if path == std::path::Path::new("/Users/x/Library/Mail")));
     }
 }

@@ -258,6 +258,9 @@ pub(crate) fn handle_analyze_entry(
             }
         }
         AnalyzeEvent::Progress { .. } => { /* 统计已在 Entry 中更新 */ }
+        AnalyzeEvent::SkippedNoPermission { .. } => {
+            // TUI analyze 暂不展示权限跳过（本轮为 GUI-only 增强）：忽略该事件。
+        }
         AnalyzeEvent::Finished => {
             // Finished 应由 handle_analyze_finished 处理，此处不应到达
         }
