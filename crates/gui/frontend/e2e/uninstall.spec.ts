@@ -134,6 +134,25 @@ test("权限跳过展示：resolve_leftovers 返回跳过项时 review 相位可
   await expect(page.getByText("/Users/test/Library/Containers")).toBeVisible();
 });
 
+test("权限跳过状态隔离：切换应用后空结果清除旧提示", async ({ page }) => {
+  await installTauriMock(page, {
+    ...uninstallHandlers([SAFARI, NOTES]),
+    resolve_leftovers: {
+      sequence: [
+        { result: scanResult(leftoversFor(SAFARI), ["/Users/test/Library/Containers"]) },
+        { result: scanResult(leftoversFor(NOTES)) },
+      ],
+    },
+  });
+  await gotoUninstall(page);
+  await page.getByRole("button", { name: /Safari/ }).click();
+  await expect(page.getByRole("button", { name: /因权限跳过 1 项/ })).toBeVisible();
+
+  await page.getByRole("button", { name: "返回列表" }).click();
+  await page.getByRole("button", { name: /Notes/ }).click();
+  await expect(page.getByText(/因权限跳过/)).toHaveCount(0);
+});
+
 test("AE4 无 bundle_id：仅 app 本体，明示「未能解析残留」", async ({ page }) => {
   const noBundle = appInfo("Legacy", 40 * MB, { path: "/Applications/Legacy.app", bundle_id: null });
   await installTauriMock(page, {

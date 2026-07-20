@@ -121,8 +121,6 @@ fn dir_size_fast(path: &Path) -> u64 {
                 total += size;
             }
         },
-        // CLI analyze 不展示权限跳过（`mc doctor` 专司权限体检）：传 no-op。
-        |_path| {},
     );
     total
 }

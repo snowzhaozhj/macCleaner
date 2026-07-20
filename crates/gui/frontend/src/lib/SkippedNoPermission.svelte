@@ -1,7 +1,8 @@
 <script lang="ts">
-  // 「因权限跳过 N 项」展示块——五入口共用(#23 权限跳过展示对齐)。
-  // 与 Clean/Purge 内联块同构:折叠按钮 + 可展开路径列表。跳过项是**只读展示**,
-  // 不可勾选、永不进待删集(计划 R5:删除授权只读 categories[].items,从不读此列表)。
+  // 「因权限跳过 N 项」展示块——Analyze / Orphans / Uninstall 三入口共用（#23 权限跳过展示对齐）。
+  // 与 Clean/Purge 的内联块同构（同 toggle + 列表 + 样式）；clean/purge 保留内联（计划边界），
+  // 故此组件是三入口的去重载体，五入口行为一致。跳过项是**只读展示**，不可勾选、永不进待删集
+  // （计划 R5：删除授权只读 categories[].items，从不读此列表）。
   let { skipped }: { skipped: string[] } = $props();
   let show = $state(false);
 </script>
