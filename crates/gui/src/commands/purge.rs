@@ -30,6 +30,7 @@ pub async fn scan_purge(
         let state = app.state::<AppState>();
         (state.begin_operation(), state.last_purge.clone())
     };
+    let ticket = last_purge.begin();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let reporter = TauriReporter::new(on_event, cancelled.clone());
         let result = Engine::scan_purge(Path::new(&path), &reporter);
@@ -43,7 +44,8 @@ pub async fn scan_purge(
     })
     .await
     .map_err(|e| format!("扫描线程异常: {e}"))??;
-    *last_purge.lock().map_err(|_| "状态锁毒化".to_string())? = Some(result.clone());
+    // 代次守卫写槽：乱序完成时旧扫描不覆盖新结果（见 slot.rs）。
+    last_purge.commit(ticket, result.clone())?;
     Ok(result)
 }
 
@@ -66,8 +68,8 @@ pub async fn purge(
         // 短临界区 clone 出 owned 待删项后立即 drop 锁——与 clean 同理：
         // 避免删除全程持锁，Engine::clean panic 会毒化 last_purge 卡死后续命令。
         let items: Vec<ScanItem> = {
-            let guard = last_purge.lock().map_err(|_| "状态锁毒化".to_string())?;
-            let scan = guard.as_ref().ok_or_else(|| "无扫描结果可清理".to_string())?;
+            let guard = last_purge.read()?;
+            let scan = guard.1.as_ref().ok_or_else(|| "无扫描结果可清理".to_string())?;
             select_by_paths(scan, &selected).into_iter().cloned().collect()
         };
         authorize_deletion(&items, &confirm_token)?;

@@ -44,6 +44,7 @@ pub async fn resolve_leftovers(
     app_size: u64,
 ) -> Result<ScanResult, String> {
     let last_uninstall = app.state::<AppState>().last_uninstall.clone();
+    let ticket = last_uninstall.begin();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let canonical = validate_app_path(&app_path)?;
         // bundle_id 服务端派生优先（R11 信任边界）：从校验过的 canonical 路径读真实 bundle ID，
@@ -66,7 +67,8 @@ pub async fn resolve_leftovers(
     })
     .await
     .map_err(|e| format!("解析残留线程异常: {e}"))??;
-    *last_uninstall.lock().map_err(|_| "状态锁毒化".to_string())? = Some(result.clone());
+    // 代次守卫写槽：乱序完成时旧扫描不覆盖新结果（见 slot.rs）。
+    last_uninstall.commit(ticket, result.clone())?;
     Ok(result)
 }
 
@@ -88,8 +90,8 @@ pub async fn uninstall(
     tauri::async_runtime::spawn_blocking(move || {
         // 短临界区 clone 出 owned 待删项后立即 drop 锁（与 clean/purge 同理，避免删除全程持锁）。
         let items: Vec<ScanItem> = {
-            let guard = last_uninstall.lock().map_err(|_| "状态锁毒化".to_string())?;
-            let scan = guard.as_ref().ok_or_else(|| "无残留结果可清理".to_string())?;
+            let guard = last_uninstall.read()?;
+            let scan = guard.1.as_ref().ok_or_else(|| "无残留结果可清理".to_string())?;
             select_by_paths(scan, &selected).into_iter().cloned().collect()
         };
         authorize_deletion(&items, &confirm_token)?;
