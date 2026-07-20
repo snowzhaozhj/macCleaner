@@ -81,6 +81,11 @@ impl<T> VersionedSlot<T> {
 
 #[cfg(test)]
 mod tests {
+    //! 乱序覆盖回归契约。根治 `docs/residual-review-findings/feat-gui-orphans-entry.md`
+    //! 记录的 orphans P3 竞态及其余四个同构扫描槽窗口——`stale_ticket_does_not_overwrite_newer`
+    //! 锁死 R1（旧代次不覆盖新结果），`slots_have_independent_generations` 锁死 R2（per-slot
+    //! 隔离），`commit_checks_current_generation_inside_lock` 锁死评审 feasibility-P1（判等与
+    //! 写槽锁内原子）。这些是行为契约，重构不得回退。
     use super::*;
 
     /// 单次 begin→commit：写入成功，read 得该值。
