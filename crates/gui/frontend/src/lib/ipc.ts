@@ -237,6 +237,30 @@ export function uninstall(
   return invoke<CleanReport>("uninstall", { paths, confirmToken, onEvent: channel });
 }
 
+/**
+ * 反向卸载：同步扫描 `~/Library` 找父 App 已不存在的孤儿残留，存入后端 last_orphans 槽。
+ * 无流式事件——核心一次性返回全量快照，前端调用期呈加载态（同 scanUninstall）。
+ * 孤儿一律不预选（核心 scan_orphans 保证），前端 selected 映射即天然全未勾。
+ */
+export function scanOrphans(): Promise<ScanResult> {
+  return invoke<ScanResult>("scan_orphans");
+}
+
+/**
+ * 删除孤儿扫描出的选中路径（恒移废纸篓）。
+ * `confirmToken`：含 Risky 项时须传确认口令，后端二次校验（孤儿实际不产 Risky，纵深防御）。
+ * 纯非 Risky 删除传空串即可。
+ */
+export function cleanOrphans(
+  paths: string[],
+  confirmToken: string,
+  onEvent: (e: ProgressEvent) => void,
+): Promise<CleanResponse> {
+  const channel = new Channel<ProgressEvent>();
+  channel.onmessage = onEvent;
+  return invoke<CleanResponse>("clean_orphans", { paths, confirmToken, onEvent: channel });
+}
+
 /** 协作式取消（scan_clean / scan_purge / clean / analyze / uninstall 通用）。 */
 export function cancelScan(): Promise<void> {
   return invoke("cancel_scan");

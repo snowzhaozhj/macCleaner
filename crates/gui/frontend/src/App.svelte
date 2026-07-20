@@ -4,13 +4,14 @@
   import Purge from "./routes/Purge.svelte";
   import Uninstall from "./routes/Uninstall.svelte";
   import Analyze from "./routes/Analyze.svelte";
+  import Orphans from "./routes/Orphans.svelte";
   import Onboarding from "./routes/Onboarding.svelte";
   import CommandPalette from "./lib/CommandPalette.svelte";
   import type { Command } from "./lib/palette";
   import { routeCommands } from "./lib/palette-registry.svelte";
 
   type Boot = "checking" | "onboarding" | "ready";
-  type Tab = "clean" | "purge" | "uninstall" | "analyze";
+  type Tab = "clean" | "purge" | "uninstall" | "analyze" | "orphans";
 
   /** statusbar 模式文案（新增 tab 只需补一行，不再叠三元链）。 */
   const TAB_LABELS: Record<Tab, string> = {
@@ -18,6 +19,7 @@
     purge: "开发清理模式",
     uninstall: "卸载模式",
     analyze: "分析模式",
+    orphans: "孤儿残留模式",
   };
 
   let boot = $state<Boot>("checking");
@@ -35,6 +37,7 @@
     { id: "nav.purge", title: "开发清理", keywords: ["purge", "dev", "kaifa"], run: () => (tab = "purge") },
     { id: "nav.uninstall", title: "卸载", keywords: ["uninstall", "xiezai"], run: () => (tab = "uninstall") },
     { id: "nav.analyze", title: "分析", keywords: ["analyze", "fenxi"], run: () => (tab = "analyze") },
+    { id: "nav.orphans", title: "孤儿残留", keywords: ["orphans", "leftover", "guer", "canliu"], run: () => (tab = "orphans") },
     { id: "act.trash", title: "打开废纸篓", keywords: ["trash", "feizhilou"], run: () => void openTrash() },
     { id: "act.fda", title: "打开磁盘访问权限设置", keywords: ["fda", "permission", "quanxian"], run: () => void openFdaSettings() },
   ];
@@ -114,6 +117,9 @@
         >
           分析
         </button>
+        <button class="tab" class:active={tab === "orphans"} onclick={() => (tab = "orphans")}>
+          孤儿残留
+        </button>
       </nav>
     {/if}
   </header>
@@ -131,8 +137,10 @@
       <Purge />
     {:else if tab === "uninstall"}
       <Uninstall />
-    {:else}
+    {:else if tab === "analyze"}
       <Analyze />
+    {:else}
+      <Orphans />
     {/if}
   </main>
 

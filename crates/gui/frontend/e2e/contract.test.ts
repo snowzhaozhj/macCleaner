@@ -98,8 +98,8 @@ const rustArgs = parseRustCommandArgs(commandSrcs);
 const ipcCalls = parseIpcInvocations(ipcSrc);
 
 describe("IPC 契约守卫（R4）", () => {
-  it("Rust 注册表解析出 16 个命令", () => {
-    expect(registered.length).toBe(16);
+  it("Rust 注册表解析出 18 个命令", () => {
+    expect(registered.length).toBe(18);
     expect(new Set(registered)).toEqual(
       new Set([
         "scan_clean",
@@ -113,6 +113,8 @@ describe("IPC 契约守卫（R4）", () => {
         "analyze",
         "classify_marked",
         "delete_marked",
+        "scan_orphans",
+        "clean_orphans",
         "check_fda",
         "open_fda_settings",
         "open_trash",
@@ -147,7 +149,7 @@ describe("IPC 契约守卫（R4）", () => {
   });
 
   it("关键映射：删除确认参数保持前后端一致", () => {
-    for (const cmd of ["clean", "purge", "uninstall", "delete_marked"]) {
+    for (const cmd of ["clean", "purge", "uninstall", "clean_orphans", "delete_marked"]) {
       expect(ipcCalls.get(cmd)).toContain("confirmToken");
       expect(ipcCalls.get(cmd)).toContain("onEvent");
       expect(rustArgs.get(cmd)).toContain("confirm_token");
