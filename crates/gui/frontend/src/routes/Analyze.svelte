@@ -19,6 +19,7 @@
   import ConfirmDelete from "../lib/ConfirmDelete.svelte";
   import CopyButton from "../lib/CopyButton.svelte";
   import AnalyzeReviewRow from "../lib/AnalyzeReviewRow.svelte";
+  import SkippedNoPermission from "../lib/SkippedNoPermission.svelte";
   import type { ConfirmItem } from "../lib/ConfirmDelete.svelte";
   import type { Command } from "../lib/palette";
   import { registerRouteCommands } from "../lib/palette-registry.svelte";
@@ -34,6 +35,7 @@
   let fileCount = $state(0);
   let totalSize = $state(0);
   let error = $state<string | null>(null);
+  let skipped = $state<string[]>([]);
   let confirmItems = $state<ConfirmItem[] | null>(null);
   let deletingPath = $state("");
   let toast = $state<ToastState>(null);
@@ -124,6 +126,7 @@
     fileCount = 0;
     totalSize = 0;
     error = null;
+    skipped = [];
     setPhase("analyzing");
     try {
       const root = await userHome();
@@ -133,6 +136,8 @@
         if ("Progress" in e) {
           fileCount = e.Progress.file_count;
           totalSize = e.Progress.total_size;
+        } else if ("SkippedNoPermission" in e) {
+          skipped.push(e.SkippedNoPermission.path);
         }
       });
       setPhase("ready");
@@ -435,6 +440,7 @@
             </li>
           {/each}
         </ul>
+        <SkippedNoPermission {skipped} />
       {/if}
     {/if}
   {/snippet}

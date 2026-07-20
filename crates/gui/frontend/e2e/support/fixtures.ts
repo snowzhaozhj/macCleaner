@@ -41,7 +41,7 @@ export function scanItem(
   };
 }
 
-export function scanResult(items: ScanItem[]): ScanResult {
+export function scanResult(items: ScanItem[], skipped: string[] = []): ScanResult {
   const byCat = new Map<string, ScanItem[]>();
   for (const it of items) {
     const arr = byCat.get(it.category) ?? [];
@@ -58,6 +58,7 @@ export function scanResult(items: ScanItem[]): ScanResult {
     categories,
     total_size: items.reduce((s, i) => s + i.size, 0),
     file_count: items.length,
+    skipped_no_permission: skipped,
   };
 }
 
@@ -182,8 +183,12 @@ export function dirNode(
 }
 
 /** analyze 流：Progress → Finished。 */
-export function analyzeStream(fileCount: number, totalSize: number): AnalyzeEvent[] {
-  return [{ Progress: { file_count: fileCount, total_size: totalSize } }, "Finished"];
+export function analyzeStream(fileCount: number, totalSize: number, skipped: string[] = []): AnalyzeEvent[] {
+  return [
+    ...skipped.map((path) => ({ SkippedNoPermission: { path } }) as AnalyzeEvent),
+    { Progress: { file_count: fileCount, total_size: totalSize } },
+    "Finished",
+  ];
 }
 
 // ---- FDA ----

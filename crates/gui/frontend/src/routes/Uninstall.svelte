@@ -28,6 +28,7 @@
   import Shell from "../lib/Shell.svelte";
   import SummaryHeader from "../lib/SummaryHeader.svelte";
   import StreamingList from "../lib/StreamingList.svelte";
+  import SkippedNoPermission from "../lib/SkippedNoPermission.svelte";
   import CleanReceipt from "../lib/CleanReceipt.svelte";
   import UndoToast from "../lib/UndoToast.svelte";
   import ConfirmDelete from "../lib/ConfirmDelete.svelte";
@@ -47,6 +48,7 @@
   let selectedApp = $state<AppInfo | null>(null);
   let reviewItems = $state<LiveItem[]>([]);
   let error = $state<string | null>(null);
+  let skipped = $state<string[]>([]);
 
   let confirmItems = $state<ConfirmItem[] | null>(null);
   let cleaningPath = $state("");
@@ -131,6 +133,7 @@
     selectedApp = app;
     error = null;
     reviewItems = [];
+    skipped = [];
     setPhase("reviewLoading");
     try {
       const result = await resolveLeftovers(app.path, app.bundle_id, app.size);
@@ -145,6 +148,7 @@
           selected: it.selected,
         })),
       );
+      skipped = result.skipped_no_permission ?? [];
       setPhase("reviewReady");
     } catch (err) {
       error = String(err);
@@ -156,6 +160,7 @@
   function backToList() {
     selectedApp = null;
     reviewItems = [];
+    skipped = [];
     error = null;
     setPhase(apps.length > 0 ? "listReady" : "listEmpty");
   }
@@ -329,6 +334,7 @@
         cliCommand={`mc uninstall ${shellQuote(selectedApp?.name ?? "")}`}
         cliNote="卸载该应用并清理其残留"
       />
+      <SkippedNoPermission {skipped} />
     {/if}
   {/snippet}
 
