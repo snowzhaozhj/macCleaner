@@ -132,10 +132,12 @@ pub async fn analyze(
     on_event: Channel<AnalyzeEvent>,
 ) -> Result<DirNode, String> {
     // begin_operation 安装本次分析专属取消 flag（R-review：不再复位共享 flag）。
+    // slot.begin() 领代次，须在 spawn_blocking 前调用。
     let (cancelled, last_analyze) = {
         let state = app.state::<AppState>();
         (state.begin_operation(), state.last_analyze.clone())
     };
+    let ticket = last_analyze.begin();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         let mut tree = DirNode::new_dir(root.clone(), dir_name(&root));
         let mut builder = IncrementalTreeBuilder::new();
@@ -168,7 +170,9 @@ pub async fn analyze(
     .await
     .map_err(|e| format!("分析线程异常: {e}"))?;
     let tree = outcome.ok_or_else(|| "分析已取消".to_string())?;
-    *last_analyze.lock().map_err(|_| "状态锁毒化".to_string())? = Some(tree.clone());
+    // 取消路径已在 outcome==None 时提前返回，不 commit（保持 R-review codex-P1：
+    // 半截树不写槽）。仅完整树经代次守卫写槽，乱序完成时旧分析不覆盖新树（见 slot.rs）。
+    last_analyze.commit(ticket, tree.clone())?;
     Ok(tree)
 }
 
@@ -196,8 +200,8 @@ pub async fn delete_marked(
         // 文件系统检查也在锁外执行，避免慢磁盘无谓阻塞下一次 analyze/删除。
         // 一旦 Engine::clean panic 会毒化 last_analyze，永久使后续 analyze/删除失败（R-review）。
         let pairs = {
-            let guard = last_analyze.lock().map_err(|_| "状态锁毒化".to_string())?;
-            let tree = guard.as_ref().ok_or_else(|| "无分析结果可删除".to_string())?;
+            let guard = last_analyze.read()?;
+            let tree = guard.1.as_ref().ok_or_else(|| "无分析结果可删除".to_string())?;
             let mut pairs = Vec::new();
             collect_marked(tree, &marked, &mut pairs);
             pairs

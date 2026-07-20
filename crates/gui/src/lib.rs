@@ -7,11 +7,14 @@
 
 pub mod commands;
 pub mod reporter;
+pub mod slot;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use mc_core::models::{DirNode, ScanResult};
+
+use crate::slot::VersionedSlot;
 
 /// 应用共享状态（Tauri managed state）。
 /// 命令进入阻塞闭包前克隆其中的 `Arc`（KTD-5：async 命令不可持有 `State<'_,_>` 借用）。
@@ -21,29 +24,30 @@ pub struct AppState {
     /// `cancel_scan` 只对**当前** flag 置位；各操作的 reporter 持有各自 flag 读 `is_cancelled`。
     pub cancel: Mutex<Arc<AtomicBool>>,
     /// 最近一次 clean 扫描结果，供 `clean` 按路径精确取项（避免前端回传完整 `ScanItem`）。
-    pub last_scan: Arc<Mutex<Option<ScanResult>>>,
+    /// `VersionedSlot`：扫描乱序完成时旧代次不覆盖新结果（见 `slot.rs`）。
+    pub last_scan: VersionedSlot<ScanResult>,
     /// 最近一次 purge 扫描结果，独立于 `last_scan`（KTD2：clean/purge 隔离，
     /// 切 tab 或交替扫描时删除不会误取另一路径的项）。
-    pub last_purge: Arc<Mutex<Option<ScanResult>>>,
+    pub last_purge: VersionedSlot<ScanResult>,
     /// 最近一次 uninstall 残留审查结果（app bundle + 残留），独立槽（KTD4：与 clean/purge
     /// 隔离，切 tab 或交替操作时删除不会误取另一路径的项）。
-    pub last_uninstall: Arc<Mutex<Option<ScanResult>>>,
+    pub last_uninstall: VersionedSlot<ScanResult>,
     /// 最近一次 analyze 树，供 `delete_marked` 按标记路径收集 (path, size)。
-    pub last_analyze: Arc<Mutex<Option<DirNode>>>,
+    pub last_analyze: VersionedSlot<DirNode>,
     /// 最近一次 orphans 反向扫描结果，独立槽（KTD3：与 clean/purge/uninstall 隔离，
     /// 切 tab 或交替操作时删除不会误取另一路径的项）。
-    pub last_orphans: Arc<Mutex<Option<ScanResult>>>,
+    pub last_orphans: VersionedSlot<ScanResult>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
-            last_scan: Arc::new(Mutex::new(None)),
-            last_purge: Arc::new(Mutex::new(None)),
-            last_uninstall: Arc::new(Mutex::new(None)),
-            last_analyze: Arc::new(Mutex::new(None)),
-            last_orphans: Arc::new(Mutex::new(None)),
+            last_scan: VersionedSlot::default(),
+            last_purge: VersionedSlot::default(),
+            last_uninstall: VersionedSlot::default(),
+            last_analyze: VersionedSlot::default(),
+            last_orphans: VersionedSlot::default(),
         }
     }
 }

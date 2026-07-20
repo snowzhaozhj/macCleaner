@@ -33,13 +33,15 @@ use crate::AppState;
 #[tauri::command]
 pub async fn scan_orphans(app: AppHandle) -> Result<ScanResult, String> {
     let last_orphans = app.state::<AppState>().last_orphans.clone();
+    let ticket = last_orphans.begin();
     let result = tauri::async_runtime::spawn_blocking(|| {
         let items = Engine::scan_orphans();
         ScanResult::from_categories(vec![CategoryGroup::new("孤儿残留".to_string(), items)])
     })
     .await
     .map_err(|e| format!("扫描孤儿残留线程异常: {e}"))?;
-    *last_orphans.lock().map_err(|_| "状态锁毒化".to_string())? = Some(result.clone());
+    // 代次守卫写槽：乱序完成时旧扫描不覆盖新结果（见 slot.rs）。
+    last_orphans.commit(ticket, result.clone())?;
     Ok(result)
 }
 
@@ -67,8 +69,8 @@ pub async fn clean_orphans(
         // 短临界区 clone 出 owned 待删项后立即 drop 锁——与 clean/purge 同理：
         // 避免删除全程持锁，Engine::clean panic 会毒化 last_orphans 卡死后续命令。
         let items: Vec<ScanItem> = {
-            let guard = last_orphans.lock().map_err(|_| "状态锁毒化".to_string())?;
-            let scan = guard.as_ref().ok_or_else(|| "无孤儿扫描结果可清理".to_string())?;
+            let guard = last_orphans.read()?;
+            let scan = guard.1.as_ref().ok_or_else(|| "无孤儿扫描结果可清理".to_string())?;
             select_by_paths(scan, &selected).into_iter().cloned().collect()
         };
         authorize_deletion(&items, &confirm_token)?;

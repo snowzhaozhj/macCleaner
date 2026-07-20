@@ -37,10 +37,12 @@ pub async fn scan_clean(
 ) -> Result<ScanResult, String> {
     // 在 await 前取出 owned 句柄，避免 async 命令持有 State<'_,_> 借用（KTD-5）。
     // begin_operation 安装本次操作专属的取消 flag（R-review：不再复位共享 flag）。
+    // slot.begin() 领代次，须在 spawn_blocking 前调用，代次才反映本命令发起次序。
     let (cancelled, last_scan) = {
         let state = app.state::<AppState>();
         (state.begin_operation(), state.last_scan.clone())
     };
+    let ticket = last_scan.begin();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let reporter = TauriReporter::new(on_event, cancelled);
         Engine::scan_clean(&reporter)
@@ -48,7 +50,9 @@ pub async fn scan_clean(
     .await
     .map_err(|e| format!("扫描线程异常: {e}"))?
     .map_err(|e| format!("扫描失败: {e}"))?;
-    *last_scan.lock().map_err(|_| "状态锁毒化".to_string())? = Some(result.clone());
+    // 代次守卫写槽：乱序完成时旧扫描不覆盖新结果（见 slot.rs）。commit 返回 false 表示
+    // 被更新的扫描抢先——本次仍回传前端渲染，槽保留最新者，删除永远按最新槽。
+    last_scan.commit(ticket, result.clone())?;
     Ok(result)
 }
 
@@ -75,8 +79,8 @@ pub async fn clean(
         // 避免删除全程持锁：一旦 Engine::clean 内部 panic 会毒化 last_scan，
         // 永久使后续 scan_clean/clean 报「状态锁毒化」（R-review）。
         let items: Vec<ScanItem> = {
-            let guard = last_scan.lock().map_err(|_| "状态锁毒化".to_string())?;
-            let scan = guard.as_ref().ok_or_else(|| "无扫描结果可清理".to_string())?;
+            let guard = last_scan.read()?;
+            let scan = guard.1.as_ref().ok_or_else(|| "无扫描结果可清理".to_string())?;
             select_by_paths(scan, &selected).into_iter().cloned().collect()
         };
         // 后端闸：含 Risky 必须有有效确认口令，否则拒删（与 purge 共用 authorize_deletion）。
