@@ -1,8 +1,8 @@
 <script lang="ts">
-  // 「因权限跳过 N 项」展示块——Analyze / Orphans / Uninstall 三入口共用（#23 权限跳过展示对齐）。
-  // 与 Clean/Purge 的内联块同构（同 toggle + 列表 + 样式）；clean/purge 保留内联（计划边界），
-  // 故此组件是三入口的去重载体，五入口行为一致。跳过项是**只读展示**，不可勾选、永不进待删集
-  // （计划 R5：删除授权只读 categories[].items，从不读此列表）。
+  // 「因权限跳过 N 项」展示块——Clean / Purge / Analyze / Orphans / Uninstall 五入口共用
+  // （#23 权限跳过展示对齐；clean/purge 原为内联同构块，后统一收敛至此组件去重）。
+  // 故此组件是五入口的单一去重载体，跳过展示单点定义、行为一致。跳过项是**只读展示**，
+  // 不可勾选、永不进待删集（计划 R5：删除授权只读 categories[].items，从不读此列表）。
   // FDA 引导按钮（skip-fda-guide 计划 R1/R3）：只跳转系统设置，绝不触碰 selected/marked。
   import { openFdaSettings } from "./ipc";
 
