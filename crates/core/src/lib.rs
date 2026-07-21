@@ -12,5 +12,7 @@ pub mod rules;
 pub mod scanner;
 pub mod tree_builder;
 
-pub use scanner::{analyze_walk, create_walker, prefetch_metadata, MetaWalkDir};
+pub use scanner::{
+    analyze_walk, analyze_walk_with_skips, create_walker, prefetch_metadata, MetaWalkDir,
+};
 pub use tree_builder::IncrementalTreeBuilder;

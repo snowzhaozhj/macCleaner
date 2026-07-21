@@ -35,8 +35,11 @@ pub async fn scan_orphans(app: AppHandle) -> Result<ScanResult, String> {
     let last_orphans = app.state::<AppState>().last_orphans.clone();
     let ticket = last_orphans.begin();
     let result = tauri::async_runtime::spawn_blocking(|| {
-        let items = Engine::scan_orphans();
-        ScanResult::from_categories(vec![CategoryGroup::new("孤儿残留".to_string(), items)])
+        let (items, skipped) = Engine::scan_orphans_with_skips();
+        ScanResult::with_skipped(
+            vec![CategoryGroup::new("孤儿残留".to_string(), items)],
+            skipped,
+        )
     })
     .await
     .map_err(|e| format!("扫描孤儿残留线程异常: {e}"))?;

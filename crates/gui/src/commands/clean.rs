@@ -144,6 +144,32 @@ mod tests {
         assert!(select_by_paths(&scan, &paths).is_empty());
     }
 
+    /// R5 结构性保证（#23 权限跳过展示）：只存在于 `skipped_no_permission` 的路径永不被
+    /// `select_by_paths` 返回——授权路径只遍历 `categories[].items`，从不读跳过字段。即便前端
+    /// 把跳过路径误加入待删集（marked），删除授权仍对它惰性无效。这比「UI 只读渲染」更强,
+    /// 是防「实现者把跳过项塞进 categories.items 当展示捷径」的后端护栏（security-lens 评审）。
+    #[test]
+    fn skipped_no_permission_paths_never_selected() {
+        let skipped = PathBuf::from("/Users/x/Library/Mail");
+        let scan = ScanResult::with_skipped(
+            vec![CategoryGroup::new("缓存".into(), vec![item("/a", SafetyLevel::Safe)])],
+            vec![skipped.clone()],
+        );
+        // 即便前端把跳过路径加入待删集，授权取项也永不返回它。
+        let paths: HashSet<PathBuf> = [skipped.clone(), PathBuf::from("/a")].into_iter().collect();
+        let picked = select_by_paths(&scan, &paths);
+        let picked_paths: HashSet<PathBuf> = picked.iter().map(|i| i.path.clone()).collect();
+        assert!(
+            !picked_paths.contains(&skipped),
+            "只在 skipped_no_permission 里的路径不得被选中（R5 结构性保证）"
+        );
+        assert_eq!(
+            picked_paths,
+            [PathBuf::from("/a")].into_iter().collect::<HashSet<_>>(),
+            "只有真实 categories.items 里的路径可被选中"
+        );
+    }
+
     #[test]
     fn confirm_token_trims_and_ignores_case() {
         assert!(is_confirmed("delete"));

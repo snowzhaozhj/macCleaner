@@ -27,6 +27,7 @@
   import CleanReceipt from "../lib/CleanReceipt.svelte";
   import UndoToast from "../lib/UndoToast.svelte";
   import ConfirmDelete from "../lib/ConfirmDelete.svelte";
+  import SkippedNoPermission from "../lib/SkippedNoPermission.svelte";
   import type { ConfirmItem } from "../lib/ConfirmDelete.svelte";
   import type { Command } from "../lib/palette";
   import { registerRouteCommands } from "../lib/palette-registry.svelte";
@@ -37,6 +38,7 @@
   let phase = $state<Phase>("loading");
   let items = $state<LiveItem[]>([]);
   let error = $state<string | null>(null);
+  let skipped = $state<string[]>([]);
 
   let confirmItems = $state<ConfirmItem[] | null>(null);
   let cleaningPath = $state("");
@@ -66,6 +68,7 @@
   async function startScan() {
     error = null;
     items = [];
+    skipped = [];
     setPhase("loading");
     try {
       const result = await scanOrphans();
@@ -80,6 +83,7 @@
           selected: it.selected, // 核心保证全 false（KTD2）——不在此重设，语义单一来源在核心。
         })),
       );
+      skipped = result.skipped_no_permission ?? [];
       setPhase(items.length > 0 ? "ready" : "empty");
     } catch (err) {
       error = String(err);
@@ -241,6 +245,7 @@
       </ul>
     {:else if phase === "empty"}
       <p class="empty">未发现孤儿残留。</p>
+      <SkippedNoPermission {skipped} />
     {:else if phase === "ready" || phase === "deleting"}
       <StreamingList
         {items}
@@ -249,6 +254,7 @@
         cliCommand="mc orphans"
         cliNote="反向卸载：清理父 App 已不存在的孤儿残留"
       />
+      <SkippedNoPermission {skipped} />
     {/if}
   {/snippet}
 

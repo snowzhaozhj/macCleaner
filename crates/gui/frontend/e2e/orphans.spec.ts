@@ -59,6 +59,30 @@ test("R1 进入即扫描：切到孤儿 tab 自动调 scan_orphans 并按各项 
   await expect(page.getByRole("button", { name: /应用残留 \(Application Support\)/ })).toBeVisible();
 });
 
+// #23 权限跳过展示（五入口对齐）：scan_orphans 返回 skipped_no_permission 时，ready 相位
+// 出现「因权限跳过 N 项」折叠区，展开列出路径；无跳过项时该区不出现（对照，防恒显）。
+test("权限跳过展示：scan_orphans 返回跳过项时 ready 相位可展开列出", async ({ page }) => {
+  const skipped = [`${FAKE_HOME}/Library/Containers`, `${FAKE_HOME}/Library/Mail`];
+  await installTauriMock(page, {
+    ...defaultHandlers(),
+    scan_orphans: { result: scanResult(orphanItems(), skipped) },
+  });
+  await gotoOrphans(page);
+
+  const toggle = page.getByRole("button", { name: /因权限跳过 2 项/ });
+  await expect(toggle).toBeVisible();
+  await toggle.click();
+  await expect(page.getByText(`${FAKE_HOME}/Library/Containers`)).toBeVisible();
+  await expect(page.getByText(`${FAKE_HOME}/Library/Mail`)).toBeVisible();
+});
+
+test("权限跳过展示对照：无跳过项时不出现跳过区", async ({ page }) => {
+  await installTauriMock(page, orphanScanHandlers());
+  await gotoOrphans(page);
+  await expect(page.getByRole("button", { name: /应用残留 \(Caches\)/ })).toBeVisible();
+  await expect(page.getByText(/因权限跳过/)).toHaveCount(0);
+});
+
 test("R2 一律不预选：初始零勾选，删除按钮无可删目标（禁用），手动勾选文案可见", async ({ page }) => {
   await installTauriMock(page, orphanScanHandlers());
   await gotoOrphans(page);

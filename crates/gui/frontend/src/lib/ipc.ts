@@ -33,6 +33,7 @@ export type ProgressEvent =
 export type AnalyzeEvent =
   | { Entry: { name: string; path: string; size: number; is_file: boolean } }
   | { Progress: { file_count: number; total_size: number } }
+  | { SkippedNoPermission: { path: string } }
   | "Finished";
 
 export type DirNode = {
@@ -64,6 +65,9 @@ export type ScanResult = {
   categories: CategoryGroup[];
   total_size: number;
   file_count: number;
+  // 因 Full Disk Access 缺失被跳过的路径（#23）。仅同步族扫描（orphans/uninstall）填充；
+  // 流式族（clean/purge/analyze）恒空——它们的跳过走事件流。可选：兼容旧后端返回。
+  skipped_no_permission?: string[];
 };
 
 export type CleanReport = {

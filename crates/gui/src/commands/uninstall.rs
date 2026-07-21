@@ -57,13 +57,15 @@ pub async fn resolve_leftovers(
         let mut categories = vec![CategoryGroup::new("应用".to_string(), vec![app_item])];
         // 残留作为单个 CategoryGroup 收纳——前端按各项自身的 category（如「应用残留 (Caches)」）
         // 重新分组渲染，故后端分组结构不影响展示、总量与按路径取项，无需在此按子目录再拆组。
+        let mut skipped = Vec::new();
         if let Some(bid) = resolved_bid.as_deref().filter(|s| !s.is_empty()) {
-            let leftovers = Engine::find_leftovers(bid);
+            let (leftovers, skips) = Engine::find_leftovers_with_skips(bid);
+            skipped = skips;
             if !leftovers.is_empty() {
                 categories.push(CategoryGroup::new("应用残留".to_string(), leftovers));
             }
         }
-        Ok::<ScanResult, String>(ScanResult::from_categories(categories))
+        Ok::<ScanResult, String>(ScanResult::with_skipped(categories, skipped))
     })
     .await
     .map_err(|e| format!("解析残留线程异常: {e}"))??;

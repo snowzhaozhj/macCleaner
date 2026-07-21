@@ -50,32 +50,59 @@ const RESERVED_BUNDLE_PREFIXES: &[&str] = &["com.apple."];
 /// 非"必删"，漏报可再扫，误杀不可逆代价更高（fail-closed 取向）。
 const ORPHAN_MIN_AGE_DAYS: u64 = 30;
 
+/// `read_dir` 失败的统一分流（#23）：仅 `PermissionDenied` 收进跳过集（供 GUI「因权限跳过」区），
+/// 其它 IO 错误维持静默 `debug!`——不把"文件系统坏了"误报成"缺授权"。orphans/uninstall 两处
+/// 同步扫描共用，避免 R2 分流语义在两处漂移。
+fn note_read_dir_skip(e: &std::io::Error, dir: &Path, skipped: &mut Vec<PathBuf>) {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        skipped.push(dir.to_path_buf());
+    } else {
+        debug!("无法读取 {dir:?}: {e:?}");
+    }
+}
+
 impl AppResolver {
     /// 扫描 /Applications 和 ~/Applications 中的 .app 包，
     /// 读取 Info.plist 获取 bundle ID 和应用名
     pub fn list_apps() -> Vec<AppInfo> {
-        let mut apps = Vec::new();
+        Self::list_apps_with_skips().0
+    }
+
+    /// 同 [`list_apps`](Self::list_apps)，但附带因 `PermissionDenied` 跳过的应用根。
+    #[must_use]
+    pub fn list_apps_with_skips() -> (Vec<AppInfo>, Vec<PathBuf>) {
         let home = platform::get_home_dir();
+        let app_dirs = [PathBuf::from("/Applications"), home.join("Applications")];
+        Self::list_apps_in_dirs(&app_dirs)
+    }
 
-        let app_dirs = vec![PathBuf::from("/Applications"), home.join("Applications")];
-
-        for dir in &app_dirs {
-            if !dir.exists() {
-                debug!("应用目录不存在，跳过: {dir:?}");
-                continue;
-            }
+    /// 已安装应用枚举的可注入内核，供孤儿扫描 fail-closed 与权限测试共用。
+    fn list_apps_in_dirs(app_dirs: &[PathBuf]) -> (Vec<AppInfo>, Vec<PathBuf>) {
+        let mut apps = Vec::new();
+        let mut skipped = Vec::new();
+        for dir in app_dirs {
             let entries = match fs::read_dir(dir) {
                 Ok(entries) => entries,
                 Err(e) => {
-                    warn!("无法读取应用目录 {dir:?}: {e:?}");
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        debug!("应用目录不存在，跳过: {dir:?}");
+                    } else {
+                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            skipped.push(dir.clone());
+                        }
+                        warn!("无法读取应用目录 {dir:?}: {e:?}");
+                    }
                     continue;
                 }
             };
             for entry in entries {
                 let entry = match entry {
-                    Ok(e) => e,
+                    Ok(entry) => entry,
                     Err(e) => {
-                        warn!("读取目录条目失败: {e:?}");
+                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            skipped.push(dir.clone());
+                        }
+                        warn!("读取应用目录条目失败 {dir:?}: {e:?}");
                         continue;
                     }
                 };
@@ -85,15 +112,14 @@ impl AppResolver {
                 }
                 match Self::read_app_info(&path) {
                     Ok(info) => apps.push(info),
-                    Err(e) => {
-                        debug!("解析应用信息失败 {path:?}: {e:?}");
-                    }
+                    Err(e) => debug!("解析应用信息失败 {path:?}: {e:?}"),
                 }
             }
         }
-
-        apps.sort_by_key(|a| a.name.to_lowercase());
-        apps
+        apps.sort_by_key(|app| app.name.to_lowercase());
+        skipped.sort();
+        skipped.dedup();
+        (apps, skipped)
     }
 
     /// 流式扫描已安装应用：每解析出一个 .app 立刻 `Found` 一条，末尾 `Complete`。
@@ -274,30 +300,44 @@ impl AppResolver {
     /// 搜索 Caches, Preferences, Application Support, `LaunchAgents`,
     /// Saved Application State, Logs, `WebKit`, `HTTPStorages`
     pub fn find_leftovers(bundle_id: &str) -> Vec<ScanItem> {
-        let home = platform::get_home_dir();
-        let library = home.join("Library");
+        Self::find_leftovers_with_skips(bundle_id).0
+    }
+
+    /// 同 [`find_leftovers`](Self::find_leftovers)，但附带因 `PermissionDenied` 跳过的路径（#23）。
+    /// GUI 用此变体在 review 相位展示「因权限跳过」区；CLI 走 `find_leftovers()` 旧签名。
+    #[must_use]
+    pub fn find_leftovers_with_skips(bundle_id: &str) -> (Vec<ScanItem>, Vec<PathBuf>) {
+        let library = platform::get_home_dir().join("Library");
+        Self::find_leftovers_in(&library, bundle_id)
+    }
+
+    /// 残留扫描的可注入内核，供权限分流测试传入临时 Library 根。
+    fn find_leftovers_in(library: &Path, bundle_id: &str) -> (Vec<ScanItem>, Vec<PathBuf>) {
         let mut leftovers = Vec::new();
+        let mut skipped = Vec::new();
+        let bid_lower = bundle_id.to_lowercase();
 
         for subdir in LEFTOVER_SUBDIRS {
             let search_dir = library.join(subdir);
-            if !search_dir.exists() {
-                continue;
-            }
             let entries = match fs::read_dir(&search_dir) {
-                Ok(e) => e,
+                Ok(entries) => entries,
                 Err(e) => {
-                    debug!("无法读取 {search_dir:?}: {e:?}");
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        note_read_dir_skip(&e, &search_dir, &mut skipped);
+                    }
                     continue;
                 }
             };
             for entry in entries {
                 let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => continue,
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        note_read_dir_skip(&e, &search_dir, &mut skipped);
+                        continue;
+                    }
                 };
                 let entry_name = entry.file_name().to_string_lossy().to_string();
                 let entry_lower = entry_name.to_lowercase();
-                let bid_lower = bundle_id.to_lowercase();
                 if entry_lower == bid_lower
                     || entry_lower.starts_with(&format!("{bid_lower}."))
                     || entry_lower.starts_with(&format!("{bid_lower}-"))
@@ -336,7 +376,9 @@ impl AppResolver {
             bundle_id,
             leftovers.len()
         );
-        leftovers
+        skipped.sort();
+        skipped.dedup();
+        (leftovers, skipped)
     }
 
     /// 反向卸载：遍历 `~/Library` 标准子目录，找出**父 App 已不存在**的 bundle-id 残留（孤儿）。
@@ -363,47 +405,76 @@ impl AppResolver {
     /// 发现的，App 已卸载但用户可能故意保留数据，故永不默认删、永不 `--yes` 自动删，须逐项手动勾。
     #[must_use]
     pub fn scan_orphans() -> Vec<ScanItem> {
-        let installed: HashSet<String> = Self::list_apps()
+        Self::scan_orphans_with_skips().0
+    }
+
+    /// 同 [`scan_orphans`](Self::scan_orphans)，但附带因 `PermissionDenied` 跳过的路径（#23）。
+    /// GUI 用此变体展示「因权限跳过」区；CLI 走 `scan_orphans()` 旧签名，天然不拿跳过项。
+    #[must_use]
+    pub fn scan_orphans_with_skips() -> (Vec<ScanItem>, Vec<PathBuf>) {
+        let home = platform::get_home_dir();
+        let app_dirs = [PathBuf::from("/Applications"), home.join("Applications")];
+        let library = home.join("Library");
+        Self::scan_orphans_from_roots(
+            &app_dirs,
+            &library,
+            Duration::from_secs(ORPHAN_MIN_AGE_DAYS * 86_400),
+        )
+    }
+
+    /// 孤儿扫描的可注入入口：已安装应用根与 Library 根同时可控，锁死「任一 app 根失权即 fail-closed」。
+    fn scan_orphans_from_roots(
+        app_dirs: &[PathBuf],
+        library: &Path,
+        min_age: Duration,
+    ) -> (Vec<ScanItem>, Vec<PathBuf>) {
+        let (apps, mut skipped) = Self::list_apps_in_dirs(app_dirs);
+        let installed: HashSet<String> = apps
             .into_iter()
             .filter_map(|app| app.bundle_id.map(|b| b.to_lowercase()))
             .collect();
-        // fail-closed（评审 R1）：孤儿判定完全依赖「已装 bundle-id 集合」。`list_apps` 只扫
-        // /Applications 与 ~/Applications 顶层、且对读失败静默降级——若 /Applications 因权限读不到，
-        // 集合会退化为空，于是**每一条**非 Apple、超龄的 ~/Library 残留都被判成孤儿（实为在用 App 的数据）。
-        // 空集合无法可信地支撑「父已卸载」判断，按 fail-closed 直接返回空（宁漏报不误杀），
-        // 而非把「读不到已装应用」误当成「什么都没装」。
-        if installed.is_empty() {
-            debug!("已装应用集合为空（可能 /Applications 不可读），孤儿扫描 fail-closed 返回空");
-            return Vec::new();
+        if !skipped.is_empty() || installed.is_empty() {
+            debug!("已装应用集合不完整或为空，孤儿扫描 fail-closed 返回空候选");
+            return (Vec::new(), skipped);
         }
-        let home = platform::get_home_dir();
-        let library = home.join("Library");
-        Self::scan_orphans_in(&library, &installed, Duration::from_secs(ORPHAN_MIN_AGE_DAYS * 86_400))
+        let (orphans, library_skips) = Self::scan_orphans_in(library, &installed, min_age);
+        skipped.extend(library_skips);
+        skipped.sort();
+        skipped.dedup();
+        (orphans, skipped)
     }
 
     /// [`scan_orphans`](Self::scan_orphans) 的可注入内核，供测试传入临时 library 根、
     /// 已装 bundle-id 集合、龄阈值，不依赖真机 `~/Library` 内容与系统时钟。
+    /// 返回 (孤儿项, 因 `PermissionDenied` 跳过的路径)——后者供 GUI 展示「因权限跳过」区（#23）。
     fn scan_orphans_in(
         library: &Path,
         installed: &HashSet<String>,
         min_age: Duration,
-    ) -> Vec<ScanItem> {
+    ) -> (Vec<ScanItem>, Vec<PathBuf>) {
         let now = SystemTime::now();
         let mut orphans = Vec::new();
+        let mut skipped = Vec::new();
 
         for subdir in LEFTOVER_SUBDIRS {
             let search_dir = library.join(subdir);
-            if !search_dir.exists() {
-                continue;
-            }
             let entries = match fs::read_dir(&search_dir) {
-                Ok(e) => e,
+                Ok(entries) => entries,
                 Err(e) => {
-                    debug!("无法读取 {search_dir:?}: {e:?}");
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        note_read_dir_skip(&e, &search_dir, &mut skipped);
+                    }
                     continue;
                 }
             };
-            for entry in entries.flatten() {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        note_read_dir_skip(&e, &search_dir, &mut skipped);
+                        continue;
+                    }
+                };
                 let entry_name = entry.file_name().to_string_lossy().to_string();
 
                 // 防线 1：从条目名析出候选 bundle-id 前缀；析不出则跳过（fail-closed）。
@@ -452,7 +523,9 @@ impl AppResolver {
         }
 
         debug!("反向扫描找到 {} 个孤儿残留项", orphans.len());
-        orphans
+        skipped.sort();
+        skipped.dedup();
+        (orphans, skipped)
     }
 
     /// 从 `~/Library` 残留条目名析出候选 bundle-id 前缀。
@@ -746,6 +819,61 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn list_apps_partial_permission_is_reported_and_orphans_fail_closed() {
+        // 评审 P2：一个应用根可读、另一个 PermissionDenied 时，installed 虽非空也不完整；
+        // 孤儿扫描必须返回零候选并保留失权根，不能据部分集合判「父已卸载」。
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let readable = tmp.path().join("readable_apps");
+        let locked = tmp.path().join("locked_apps");
+        let library = tmp.path().join("Library");
+        fs::create_dir_all(readable.join("Foo.app/Contents")).unwrap();
+        fs::create_dir(&locked).unwrap();
+        fs::create_dir(&library).unwrap();
+        fs::write(
+            readable.join("Foo.app/Contents/Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.test.foo</string><key>CFBundleName</key><string>Foo</string></dict></plist>"#,
+        )
+        .unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(fs::read_dir(&locked).is_err(), "当前环境无法制造 PermissionDenied");
+
+        let (orphans, skipped) = AppResolver::scan_orphans_from_roots(
+            &[readable, locked.clone()],
+            &library,
+            Duration::ZERO,
+        );
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+
+        assert!(orphans.is_empty(), "应用根失权时必须 fail-closed，不产孤儿候选");
+        assert_eq!(skipped, vec![locked], "失权应用根须返回给 GUI 展示");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_leftovers_collects_permission_denied_and_ignores_missing() {
+        // Uninstall 同步入口确定性契约：PermissionDenied 进入 skipped，NotFound 不进入。
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path();
+        let locked = library.join("Caches");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(fs::read_dir(&locked).is_err(), "当前环境无法制造 PermissionDenied");
+
+        let (items, skipped) = AppResolver::find_leftovers_in(library, "com.test.none");
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+
+        assert!(items.is_empty());
+        assert_eq!(skipped, vec![locked]);
+        assert!(
+            !skipped.iter().any(|path| path.ends_with("Preferences")),
+            "不存在的 Preferences 不得误报为权限问题"
+        );
+    }
+
     #[test]
     fn test_calc_app_size() {
         let dir = tempfile::tempdir().unwrap();
@@ -852,7 +980,7 @@ mod tests {
         make_leftover(lib, "Caches", "com.installed.App", OLD);
 
         let installed = installed_set(&["com.installed.App"]);
-        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d());
+        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d()).0;
 
         let names: Vec<String> = orphans
             .iter()
@@ -870,6 +998,36 @@ mod tests {
     }
 
     #[test]
+    fn scan_orphans_collects_permission_denied_only() {
+        // #23：某个 ~/Library 子目录因 PermissionDenied 读不到时，其路径进跳过集（供 GUI「因权限跳过」区）；
+        // 不存在的目录（NotFound）不进跳过集——只有权限类才升「需授权」信号（R2 分流）。
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path();
+        // Caches 存在但设为不可读（chmod 000）→ 应进跳过集。
+        let caches = lib.join("Caches");
+        fs::create_dir_all(&caches).unwrap();
+        fs::set_permissions(&caches, fs::Permissions::from_mode(0o000)).unwrap();
+        // Preferences 不建（NotFound）→ 不进跳过集也不报错。
+
+        let installed = installed_set(&["com.some.App"]); // 非空，避免 fail-closed 早返回
+        let (_orphans, skipped) =
+            AppResolver::scan_orphans_in(lib, &installed, min_age_30d());
+
+        // 复位权限以便 tempdir 清理。
+        let _ = fs::set_permissions(&caches, fs::Permissions::from_mode(0o755));
+
+        assert!(
+            skipped.iter().any(|p| p == &caches),
+            "不可读的 Caches 应进权限跳过集: {skipped:?}"
+        );
+        assert!(
+            !skipped.iter().any(|p| p.ends_with("Preferences")),
+            "不存在的目录不应进跳过集（NotFound 非权限类）: {skipped:?}"
+        );
+    }
+
+    #[test]
     fn scan_orphans_excludes_reserved_apple_prefix() {
         // R5：com.apple.* 系统预留前缀绝不当孤儿，即便已装集合不含它。
         let tmp = tempfile::tempdir().unwrap();
@@ -877,7 +1035,7 @@ mod tests {
         make_leftover(lib, "Caches", "com.apple.Safari", OLD);
 
         let installed = installed_set(&[]); // 空：Safari 不在已装集合
-        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d());
+        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d()).0;
 
         assert!(orphans.is_empty(), "com.apple.* 应被黑名单排除: {orphans:?}");
     }
@@ -891,7 +1049,7 @@ mod tests {
         make_leftover(lib, "Caches", "com.single", OLD); // 只有一个 `.`，不像 bundle-id
 
         let installed = installed_set(&[]);
-        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d());
+        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d()).0;
 
         assert!(orphans.is_empty(), "析不出 bundle-id 的条目应跳过: {orphans:?}");
     }
@@ -905,7 +1063,7 @@ mod tests {
         make_leftover(lib, "Caches", "com.gone.App", OLD); // 非 USER_DATA
 
         let installed = installed_set(&[]);
-        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d());
+        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d()).0;
 
         let user_data = orphans
             .iter()
@@ -935,7 +1093,7 @@ mod tests {
         make_leftover(lib, "Caches", "com.stale.App", OLD); // 60 天 > 30
 
         let installed = installed_set(&[]);
-        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d());
+        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d()).0;
 
         let names: Vec<String> = orphans
             .iter()
@@ -953,7 +1111,7 @@ mod tests {
         // 空 library 根：子目录都不存在 → 返回空、不崩。
         let tmp = tempfile::tempdir().unwrap();
         let installed = installed_set(&[]);
-        let orphans = AppResolver::scan_orphans_in(tmp.path(), &installed, min_age_30d());
+        let orphans = AppResolver::scan_orphans_in(tmp.path(), &installed, min_age_30d()).0;
         assert!(orphans.is_empty());
     }
 
@@ -966,7 +1124,7 @@ mod tests {
         make_leftover(lib, "Saved Application State", "com.keep.App.savedState", OLD);
 
         let installed = installed_set(&["com.keep.App"]);
-        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d());
+        let orphans = AppResolver::scan_orphans_in(lib, &installed, min_age_30d()).0;
         assert!(orphans.is_empty(), "已装 App 的带后缀残留应归位、不当孤儿: {orphans:?}");
     }
 }

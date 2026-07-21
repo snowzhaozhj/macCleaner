@@ -4,12 +4,13 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use mc_core::engine::Engine;
 use mc_core::models::{CleanReport, DeleteMode, DirNode, SafetyLevel, ScanItem};
 use mc_core::progress::{AnalyzeEvent, ProgressEvent};
 use mc_core::rules::deletion_evidence_for_paths;
-use mc_core::{analyze_walk, IncrementalTreeBuilder};
+use mc_core::{analyze_walk_with_skips, IncrementalTreeBuilder};
 use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
@@ -24,6 +25,27 @@ const PROGRESS_EVERY: u64 = 500;
 fn dir_name(path: &Path) -> String {
     path.file_name()
         .map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned())
+}
+
+/// 从分析树移除因 `PermissionDenied` 未完整遍历的根，并从保留 children 重算目录大小。
+///
+/// walker 会先交付目录 entry、随后读取该目录内容失败才发 `on_skip`；若仅展示跳过列表而不剪树，
+/// 该不完整目录仍会进入 `last_analyze`，可被标记并经 `delete_marked` 删除——违反 R5「跳过项只读」。
+/// 在写入权威槽前剪掉它们，使删除端在数据结构上根本看不到这些路径。
+fn prune_skipped(node: &mut DirNode, skipped: &HashSet<PathBuf>) -> bool {
+    if skipped.contains(&node.path) {
+        return false;
+    }
+    node.children.retain(|child| !skipped.contains(&child.path));
+    for child in &mut node.children {
+        if !child.is_file {
+            let _ = prune_skipped(child, skipped);
+        }
+    }
+    if !node.is_file {
+        node.size = node.children.iter().map(|child| child.size).sum();
+    }
+    true
 }
 
 /// 递归收集被标记节点的 (path, size)。祖先命中即收集，不再深入其子（整目录删）。
@@ -142,7 +164,12 @@ pub async fn analyze(
         let mut tree = DirNode::new_dir(root.clone(), dir_name(&root));
         let mut builder = IncrementalTreeBuilder::new();
         let mut file_count: u64 = 0;
-        analyze_walk(
+        // on_skip 在 park worker 线程回调（需 Send+Sync）：用共享集合去重，并在遍历结束后
+        // 从权威树剪掉这些未完整读取的目录（R5：跳过项永不进入待删集）。
+        let skipped = Arc::new(Mutex::new(HashSet::new()));
+        let skip_sink = Arc::clone(&skipped);
+        let skip_channel = on_event.clone();
+        analyze_walk_with_skips(
             &root,
             || cancelled.load(Ordering::Relaxed),
             |name, path, size, is_file| {
@@ -157,18 +184,32 @@ pub async fn analyze(
                     }
                 }
             },
+            move |path| {
+                let mut paths = skip_sink.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let is_new = paths.insert(path.clone());
+                drop(paths);
+                if is_new {
+                    let _ = skip_channel.send(AnalyzeEvent::SkippedNoPermission { path });
+                }
+            },
         );
         // 取消后 analyze_walk 提前返回，树是**不完整**的——此时不 finalize、不发 Finished、
         // 不存树，返回 None，避免前端把半截结果当完整分析继续删除（R-review codex-P1）。
         if cancelled.load(Ordering::Relaxed) {
-            return None;
+            return Ok(None);
         }
+        let paths = skipped.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !prune_skipped(&mut tree, &paths) {
+            // 根本身不可读时，预先创建的 tree 根无法靠 children 剪枝移除；fail-closed，不让它进入权威槽。
+            return Err("分析根目录无访问权限".to_string());
+        }
+        drop(paths);
         IncrementalTreeBuilder::finalize(&mut tree);
         let _ = on_event.send(AnalyzeEvent::Finished);
-        Some(tree)
+        Ok(Some(tree))
     })
     .await
-    .map_err(|e| format!("分析线程异常: {e}"))?;
+    .map_err(|e| format!("分析线程异常: {e}"))??;
     let tree = outcome.ok_or_else(|| "分析已取消".to_string())?;
     // 取消路径已在 outcome==None 时提前返回，不 commit（保持 R-review codex-P1：
     // 半截树不写槽）。仅完整树经代次守卫写槽，乱序完成时旧分析不覆盖新树（见 slot.rs）。
@@ -234,6 +275,31 @@ mod tests {
         root.children.push(a);
         root.children.push(big);
         root
+    }
+
+    #[test]
+    fn skipped_directory_is_pruned_before_it_can_be_marked() {
+        // 评审 P2 / R5：walker 先交付目录 entry、后因 PermissionDenied 上报 skip；权威分析树必须
+        // 在写槽前剪掉该目录，否则它仍能被 marked_items 收集并进入删除授权。
+        let mut tree = sample_tree();
+        let skipped_path = PathBuf::from("/r/big");
+        let skipped: HashSet<PathBuf> = [skipped_path.clone()].into_iter().collect();
+        assert!(prune_skipped(&mut tree, &skipped));
+
+        assert!(tree.children.iter().all(|child| child.path != skipped_path));
+        assert_eq!(tree.size, 100, "剪掉 big(500) 后 root 大小应从保留 children 重算");
+        let marked: HashSet<PathBuf> = [skipped_path].into_iter().collect();
+        assert!(
+            marked_items(&tree, &marked).is_empty(),
+            "只在权限跳过集里的路径不得进入 Analyze 删除授权"
+        );
+
+        let mut root_skipped = sample_tree();
+        let skipped_root: HashSet<PathBuf> = [PathBuf::from("/r")].into_iter().collect();
+        assert!(
+            !prune_skipped(&mut root_skipped, &skipped_root),
+            "分析根失权时不能生成任何可提交的权威树"
+        );
     }
 
     #[test]

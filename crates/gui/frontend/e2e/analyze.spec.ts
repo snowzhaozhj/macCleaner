@@ -57,6 +57,39 @@ test("分析：userHome→analyze 以主目录为根，树按体积降序渲染"
   expect(call?.args.onEvent).toBe("[Channel]");
 });
 
+// #23 权限跳过展示（五入口对齐）：analyze 事件流含 SkippedNoPermission 时，ready 相位
+// 出现「因权限跳过 N 项」折叠区并可展开列出路径（analyze 走流式 AnalyzeEvent 累积）。
+test("权限跳过展示：analyze 流含 SkippedNoPermission 时 ready 相位可展开列出", async ({ page }) => {
+  const skipped = ["/Users/tester/Library/Mail", "/Users/tester/Library/Containers"];
+  await gotoAnalyzeReady(page, {
+    ...defaultHandlers(),
+    analyze: { events: analyzeStream(10, 500 * MB, skipped), result: sampleTree() },
+  });
+
+  const toggle = page.getByRole("button", { name: /因权限跳过 2 项/ });
+  await expect(toggle).toBeVisible();
+  await toggle.click();
+  await expect(page.getByText("/Users/tester/Library/Mail")).toBeVisible();
+  await expect(page.getByText("/Users/tester/Library/Containers")).toBeVisible();
+});
+
+test("权限跳过状态隔离：重新分析无跳过项时旧提示消失", async ({ page }) => {
+  await gotoAnalyzeReady(page, {
+    ...defaultHandlers(),
+    analyze: {
+      sequence: [
+        { events: analyzeStream(10, 500 * MB, ["/Users/tester/Library/Mail"]), result: sampleTree() },
+        { events: analyzeStream(10, 500 * MB), result: sampleTree() },
+      ],
+    },
+  });
+
+  await expect(page.getByRole("button", { name: /因权限跳过 1 项/ })).toBeVisible();
+  await page.getByRole("button", { name: "重新分析" }).click();
+  await expect(page.getByRole("checkbox", { name: "/Users/tester/Movies" })).toBeVisible();
+  await expect(page.getByText(/因权限跳过/)).toHaveCount(0);
+});
+
 test("标记已知 Safe 项→分级与证据回查→删除：参数精确且无需口令", async ({ page }) => {
   const target = "/Users/tester/Library/Caches";
   await gotoAnalyzeReady(page, {

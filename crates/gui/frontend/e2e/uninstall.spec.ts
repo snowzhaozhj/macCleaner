@@ -116,6 +116,43 @@ test("AE3 选应用解析残留：resolve_leftovers 带 bundle_id，用户数据
   await expect(page.getByRole("button", { name: /移入废纸篓 · 释放 350 MiB/ })).toBeVisible();
 });
 
+// #23 权限跳过展示（五入口对齐）：resolve_leftovers 返回 skipped_no_permission 时，review
+// 相位出现「因权限跳过 N 项」折叠区并可展开（KTD5：跳过挂 review 相位而非 list 相位）。
+test("权限跳过展示：resolve_leftovers 返回跳过项时 review 相位可展开列出", async ({ page }) => {
+  const items = leftoversFor(SAFARI, { safeLeftover: 50 * MB });
+  const skipped = ["/Users/test/Library/Containers"];
+  await installTauriMock(page, {
+    ...uninstallHandlers([SAFARI]),
+    resolve_leftovers: { result: scanResult(items, skipped) },
+  });
+  await gotoUninstall(page);
+  await page.getByRole("button", { name: /Safari/ }).click();
+
+  const toggle = page.getByRole("button", { name: /因权限跳过 1 项/ });
+  await expect(toggle).toBeVisible();
+  await toggle.click();
+  await expect(page.getByText("/Users/test/Library/Containers")).toBeVisible();
+});
+
+test("权限跳过状态隔离：切换应用后空结果清除旧提示", async ({ page }) => {
+  await installTauriMock(page, {
+    ...uninstallHandlers([SAFARI, NOTES]),
+    resolve_leftovers: {
+      sequence: [
+        { result: scanResult(leftoversFor(SAFARI), ["/Users/test/Library/Containers"]) },
+        { result: scanResult(leftoversFor(NOTES)) },
+      ],
+    },
+  });
+  await gotoUninstall(page);
+  await page.getByRole("button", { name: /Safari/ }).click();
+  await expect(page.getByRole("button", { name: /因权限跳过 1 项/ })).toBeVisible();
+
+  await page.getByRole("button", { name: "返回列表" }).click();
+  await page.getByRole("button", { name: /Notes/ }).click();
+  await expect(page.getByText(/因权限跳过/)).toHaveCount(0);
+});
+
 test("AE4 无 bundle_id：仅 app 本体，明示「未能解析残留」", async ({ page }) => {
   const noBundle = appInfo("Legacy", 40 * MB, { path: "/Applications/Legacy.app", bundle_id: null });
   await installTauriMock(page, {

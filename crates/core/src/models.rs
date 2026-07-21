@@ -98,6 +98,12 @@ pub struct ScanResult {
     pub categories: Vec<CategoryGroup>,
     pub total_size: u64,
     pub file_count: usize,
+    /// 扫描期因 `PermissionDenied` 跳过的路径（#23 同步入口对齐）。仅同步族扫描（orphans/uninstall）
+    /// 填充——流式族（clean/purge/analyze）的跳过走事件流，此字段恒空。**只读展示信号**：删除授权
+    /// 路径（`select_by_paths` / 授权闸）只遍历 `categories[].items`、从不读此字段，故跳过项即便被
+    /// 前端误标也永不进入待删集（计划 R5 结构性保证）。`#[serde(default)]` 保证旧 JSON 向后兼容。
+    #[serde(default)]
+    pub skipped_no_permission: Vec<PathBuf>,
 }
 
 impl ScanResult {
@@ -108,6 +114,16 @@ impl ScanResult {
             categories,
             total_size,
             file_count,
+            skipped_no_permission: Vec::new(),
+        }
+    }
+
+    /// 同 `from_categories`，但附带同步扫描收集到的权限跳过路径（orphans/uninstall 用）。
+    #[must_use]
+    pub fn with_skipped(categories: Vec<CategoryGroup>, skipped_no_permission: Vec<PathBuf>) -> Self {
+        Self {
+            skipped_no_permission,
+            ..Self::from_categories(categories)
         }
     }
 
@@ -204,6 +220,30 @@ impl DirNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_result_backward_compat_missing_skipped_field() {
+        // 旧 ScanResult JSON 不含 skipped_no_permission 字段——#[serde(default)] 保证反序列化得空 Vec，
+        // 不破坏旧持久化/旧前端回传（#23 向后兼容）。
+        let old_json = r#"{"categories":[],"total_size":0,"file_count":0}"#;
+        let result: ScanResult = serde_json::from_str(old_json).unwrap();
+        assert!(result.skipped_no_permission.is_empty(), "缺字段应默认空 Vec");
+    }
+
+    #[test]
+    fn from_categories_defaults_skipped_empty() {
+        // 流式族（clean/purge/analyze）用 from_categories，skipped 字段恒空——它们的跳过走事件流。
+        let result = ScanResult::from_categories(vec![]);
+        assert!(result.skipped_no_permission.is_empty());
+    }
+
+    #[test]
+    fn with_skipped_carries_paths() {
+        // 同步族（orphans/uninstall）用 with_skipped 承载权限跳过项。
+        let skipped = vec![PathBuf::from("/Users/x/Library/Mail")];
+        let result = ScanResult::with_skipped(vec![], skipped.clone());
+        assert_eq!(result.skipped_no_permission, skipped);
+    }
 
     #[test]
     fn selected_defaults_to_non_risky() {
