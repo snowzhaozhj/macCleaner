@@ -33,6 +33,26 @@ test("扫描填充：ScanResult 渲染分类行与首屏可释放量", async ({ 
   await expect(page.getByText("8.00 MiB").first()).toBeVisible();
 });
 
+// skip-fda-guide 计划 U3/R1/R3：Clean 内联跳过块的 FDA 引导按钮（内联块与共享组件同构）——
+// 扫描流含 SkippedNoPermission 时 results 相位出现按钮，点击触发 open_fda_settings。
+test("权限跳过 FDA 引导：clean 内联跳过区『打开磁盘访问权限设置』触发 open_fda_settings", async ({ page }) => {
+  const items = [scanItem("/Library/Caches/a", 5 * MB, { category: "系统缓存" })];
+  // scanStream 不发跳过事件，手动在 Complete 前插入 SkippedNoPermission（Clean 从流累积 skipped）。
+  const events = scanStream(items);
+  events.splice(events.length - 1, 0, {
+    SkippedNoPermission: { path: "/Users/test/Library/Mail" },
+  });
+  await installTauriMock(page, {
+    ...defaultHandlers(),
+    scan_clean: { events, result: scanResult(items, ["/Users/test/Library/Mail"]) },
+  });
+  await page.goto("/");
+
+  await expect(page.getByRole("button", { name: /因权限跳过 1 项/ })).toBeVisible();
+  await page.getByRole("button", { name: "打开磁盘访问权限设置" }).click();
+  expect(await lastCall(page, "open_fda_settings")).not.toBeNull();
+});
+
 test("纯 Safe 删除：确认弹窗不出现，clean 以空口令触发，回执+撤销吐司呈现", async ({ page }) => {
   const items = [
     scanItem("/Library/Caches/a", 5 * MB),
