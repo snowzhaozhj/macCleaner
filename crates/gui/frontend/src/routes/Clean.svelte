@@ -6,6 +6,7 @@
     cancelScan,
     openTrash,
     undo,
+    openFdaSettings,
     type CleanReport,
     type RestoreReport,
     type ScanResult,
@@ -315,6 +316,12 @@
               {/each}
             </ul>
           {/if}
+          <div class="skipped-guide">
+            <button class="link" onclick={() => void openFdaSettings()}>
+              打开磁盘访问权限设置
+            </button>
+            <p class="skipped-hint">授权后需完全退出并重启 macCleaner 才生效。</p>
+          </div>
         </div>
       {/if}
     {/if}
@@ -500,5 +507,14 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .skipped-guide {
+    margin: var(--sp-2) 0 0;
+  }
+  .skipped-hint {
+    margin: var(--sp-1) 0 0;
+    font-family: var(--font-ui);
+    font-size: 0.8em;
+    color: var(--ink-muted);
   }
 </style>

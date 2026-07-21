@@ -3,6 +3,9 @@
   // 与 Clean/Purge 的内联块同构（同 toggle + 列表 + 样式）；clean/purge 保留内联（计划边界），
   // 故此组件是三入口的去重载体，五入口行为一致。跳过项是**只读展示**，不可勾选、永不进待删集
   // （计划 R5：删除授权只读 categories[].items，从不读此列表）。
+  // FDA 引导按钮（skip-fda-guide 计划 R1/R3）：只跳转系统设置，绝不触碰 selected/marked。
+  import { openFdaSettings } from "./ipc";
+
   let { skipped }: { skipped: string[] } = $props();
   let show = $state(false);
 </script>
@@ -19,6 +22,12 @@
         {/each}
       </ul>
     {/if}
+    <div class="skipped-guide">
+      <button class="link" onclick={() => void openFdaSettings()}>
+        打开磁盘访问权限设置
+      </button>
+      <p class="skipped-hint">授权后需完全退出并重启 macCleaner 才生效。</p>
+    </div>
   </div>
 {/if}
 
@@ -49,5 +58,14 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .skipped-guide {
+    margin: var(--sp-2) 0 0;
+  }
+  .skipped-hint {
+    margin: var(--sp-1) 0 0;
+    font-family: var(--font-ui);
+    font-size: 0.8em;
+    color: var(--ink-muted);
   }
 </style>

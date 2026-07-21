@@ -76,6 +76,24 @@ test("权限跳过展示：scan_orphans 返回跳过项时 ready 相位可展开
   await expect(page.getByText(`${FAKE_HOME}/Library/Mail`)).toBeVisible();
 });
 
+// skip-fda-guide 计划 U3/R1/R3：共享组件 SkippedNoPermission 的 FDA 引导按钮（覆盖三入口
+// Analyze/Orphans/Uninstall 之一即验去重载体）——点击触发 open_fda_settings，且跳过项永不入待删集。
+test("权限跳过 FDA 引导：orphans 跳过区『打开磁盘访问权限设置』触发 open_fda_settings 且不污染待删集", async ({ page }) => {
+  const skipped = [`${FAKE_HOME}/Library/Containers`];
+  await installTauriMock(page, {
+    ...defaultHandlers(),
+    scan_orphans: { result: scanResult(orphanItems(), skipped) },
+  });
+  await gotoOrphans(page);
+
+  await expect(page.getByRole("button", { name: /因权限跳过 1 项/ })).toBeVisible();
+  await page.getByRole("button", { name: "打开磁盘访问权限设置" }).click();
+  expect(await lastCall(page, "open_fda_settings")).not.toBeNull();
+
+  // R3：点 FDA 按钮不改待删集——初始零勾选（孤儿一律 preselect=false），删除按钮仍无目标。
+  await expect(page.getByRole("button", { name: /移入废纸篓/ })).toBeDisabled();
+});
+
 test("权限跳过展示对照：无跳过项时不出现跳过区", async ({ page }) => {
   await installTauriMock(page, orphanScanHandlers());
   await gotoOrphans(page);
