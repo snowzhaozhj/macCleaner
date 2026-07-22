@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use mc_core::engine::Engine;
 use mc_core::models::{CleanReport, DeleteMode, DirNode, SafetyLevel, ScanItem};
 use mc_core::progress::{AnalyzeEvent, ProgressEvent};
-use mc_core::rules::deletion_evidence_for_paths;
+use mc_core::rules::{attributions_for_paths, deletion_evidence_for_paths, Attribution};
 use mc_core::{analyze_walk_with_skips, IncrementalTreeBuilder};
 use serde::Serialize;
 use tauri::ipc::Channel;
@@ -116,6 +116,44 @@ fn classify_paths(paths: Vec<PathBuf>) -> Vec<PathSafety> {
 #[tauri::command]
 pub async fn classify_marked(paths: Vec<PathBuf>) -> Vec<PathSafety> {
     classify_paths(paths)
+}
+
+/// 一个 Analyze 树节点的**只读归因**：命中内置清理规则时携带分类名与安全等级，未命中则
+/// 两者皆 `None`（呈现为「未识别」）。独立于 [`PathSafety`]——后者是删除证据（impact/recovery，
+/// safety 非 optional），归因语义正交且「未识别」必须能诚实表达为 `None`，不被塞成 Risky。
+#[derive(Debug, Serialize)]
+pub struct NodeAttribution {
+    pub path: PathBuf,
+    pub category: Option<String>,
+    pub safety: Option<SafetyLevel>,
+}
+
+fn attribute_paths(paths: Vec<PathBuf>) -> Vec<NodeAttribution> {
+    let attributions = attributions_for_paths(&paths);
+    paths
+        .into_iter()
+        .zip(attributions)
+        .map(|(path, attribution)| match attribution {
+            Some(Attribution { category, safety }) => NodeAttribution {
+                path,
+                category: Some(category),
+                safety: Some(safety),
+            },
+            None => NodeAttribution {
+                path,
+                category: None,
+                safety: None,
+            },
+        })
+        .collect()
+}
+
+/// 为当前可见层节点批量查询只读归因（分类 + 安全等级）。**纯只读**：不写入 `marked`、不影响
+/// 预选、不参与 `delete_marked` 授权——删除路径仍独立走 `classify_marked` → `delete_marked`
+/// 的 fail-closed 重分类（R5）。归因只信内置规则，用户叠加规则不能把路径显示为可清理归类（R2）。
+#[tauri::command]
+pub async fn attribute_nodes(paths: Vec<PathBuf>) -> Vec<NodeAttribution> {
+    attribute_paths(paths)
 }
 
 /// 校验前端的强确认授权。口令只授权确认框中当时已经展示为 Risky 的路径；若另一项在
@@ -352,6 +390,21 @@ mod tests {
         assert_eq!(classified.safety, SafetyLevel::Risky);
         assert!(!classified.impact.is_empty());
         assert!(!classified.recovery.is_empty());
+    }
+
+    #[test]
+    fn attribute_paths_hits_known_none_unknown_preserving_order() {
+        // U2 R3：已知规则路径返回 category+safety，未知路径返回双 None，顺序与输入一致。
+        let caches = mc_core::platform::get_home_dir().join("Library/Caches/some-app");
+        let unknown = PathBuf::from("/Users/tester/Documents/report.txt");
+        let result = attribute_paths(vec![caches.clone(), unknown.clone()]);
+        assert_eq!(result.len(), 2, "输出与输入一一对应");
+        assert_eq!(result[0].path, caches);
+        assert_eq!(result[0].safety, Some(SafetyLevel::Safe), "缓存路径命中 Safe 归因");
+        assert!(result[0].category.is_some(), "命中应带分类名");
+        assert_eq!(result[1].path, unknown);
+        assert_eq!(result[1].safety, None, "未知路径归因为 None，绝不呈现为可删");
+        assert_eq!(result[1].category, None);
     }
 
     #[test]

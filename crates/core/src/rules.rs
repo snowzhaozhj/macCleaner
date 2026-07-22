@@ -349,6 +349,16 @@ pub fn attribution_for_path(path: &std::path::Path) -> Option<Attribution> {
     attribution_for_path_in_rules(path, &rules)
 }
 
+/// 批量归因，保持输入顺序；内置规则只加载一次，避免每个节点重复解析 TOML。供 GUI 的
+/// `attribute_nodes` 命令按可见层一次性查询。每个元素为对应路径的归因（未命中为 `None`）。
+pub fn attributions_for_paths(paths: &[PathBuf]) -> Vec<Option<Attribution>> {
+    let rules = builtin_rules();
+    paths
+        .iter()
+        .map(|path| attribution_for_path_in_rules(path, &rules))
+        .collect()
+}
+
 const fn safety_rank(safety: SafetyLevel) -> u8 {
     match safety {
         SafetyLevel::Safe => 0,

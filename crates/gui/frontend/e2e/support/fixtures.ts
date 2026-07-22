@@ -17,6 +17,7 @@ import type {
   FdaStatus,
   SafetyLevel,
   PathSafety,
+  NodeAttribution,
   AppInfo,
 } from "../../src/lib/ipc";
 import type { Handlers, HandlerSpec } from "./tauri-mock";
@@ -232,6 +233,24 @@ export function pathSafety(
 const FAKE_HOME = "/Users/tester";
 
 /**
+ * Analyze 只读归因夹具（U2）。默认所有路径「未识别」（category/safety 皆 null）；
+ * 命中项经 `hits` 覆盖为 { category, safety }。顺序与输入路径一致（后端契约）。
+ */
+export function nodeAttributions(
+  paths: string[],
+  hits: Record<string, { category: string; safety: SafetyLevel }> = {},
+): NodeAttribution[] {
+  return paths.map((path) => {
+    const hit = hits[path];
+    return {
+      path,
+      category: hit?.category ?? null,
+      safety: hit?.safety ?? null,
+    };
+  });
+}
+
+/**
  * 被测流程启动即触发的命令默认值。测试用 `{ ...defaultHandlers(), <cmd>: <spec> }` 覆盖需要的项。
  * - check_fda authorized：App 挂载即调，决定能否进主界面（U4/U5 前置）。
  * - plugin:path|resolve_directory：Analyze 的 userHome() → homeDir() 走此插件命令（feasibility review）。
@@ -253,6 +272,8 @@ export function defaultHandlers(): Handlers {
     "plugin:dialog|open": { result: null },
     analyze: { events: analyzeStream(0, 0), result: dirNode(FAKE_HOME, "tester", 0) },
     classify_marked: { result: [] as PathSafety[] },
+    // 归因默认空（全部「未识别」）：只读认知辅助，进入 ready 层即触发，不影响任何删除断言。
+    attribute_nodes: { result: [] as NodeAttribution[] },
     delete_marked: { events: [], result: cleanReport([], 0) },
     cancel_scan: { result: null },
     open_trash: { result: null },
