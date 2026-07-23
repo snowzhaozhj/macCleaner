@@ -241,6 +241,15 @@ fn builtin_rules() -> Vec<CleanRule> {
     rules
 }
 
+/// 进程级缓存的内置规则集。两份 TOML 源是 `include_str!` 编译期常量、`home()` 进程内稳定，
+/// 故规则集在进程生命周期内不变。只读查询路径（证据/归因）经此复用，避免每次调用（TUI 归因
+/// 甚至每帧）重解析两张表并克隆整个 `Vec<CleanRule>`。返回借用；需要 owned 拷贝改扫描范围的
+/// `all_rules()` 仍走 `builtin_rules()`。
+fn builtin_rules_cached() -> &'static [CleanRule] {
+    static CACHE: std::sync::OnceLock<Vec<CleanRule>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(builtin_rules)
+}
+
 /// 为任意路径（如磁盘分析器中用户手动选中的路径）查找规则证据：命中某条规则的模式时
 /// 返回其 `(safety, impact, recovery)`，否则 `None`。`None` 只表示「无规则证据」，调用方
 /// 不应据此推断路径是 Safe；删除场景应使用 [`deletion_evidence_for_path`]。
@@ -257,16 +266,15 @@ pub fn evidence_for_path(path: &std::path::Path) -> Option<(SafetyLevel, String,
 /// 审计、测试过的内置规则：用户规则用于扩展扫描范围，不能作为任意路径降级为 Safe/Moderate
 /// 的依据。
 pub fn deletion_evidence_for_path(path: &std::path::Path) -> (SafetyLevel, String, String) {
-    let rules = builtin_rules();
-    deletion_evidence_for_path_in_rules(path, &rules)
+    deletion_evidence_for_path_in_rules(path, builtin_rules_cached())
 }
 
 /// 批量返回 Analyze 删除证据，保持输入顺序；内置规则只加载一次，避免每个标记路径重复解析。
 pub fn deletion_evidence_for_paths(paths: &[PathBuf]) -> Vec<(SafetyLevel, String, String)> {
-    let rules = builtin_rules();
+    let rules = builtin_rules_cached();
     paths
         .iter()
-        .map(|path| deletion_evidence_for_path_in_rules(path, &rules))
+        .map(|path| deletion_evidence_for_path_in_rules(path, rules))
         .collect()
 }
 
@@ -345,17 +353,16 @@ pub fn attribution_for_path_in_rules(
 /// [`attribution_for_path_in_rules`] 并在外层解析一次规则，避免重复 `toml::from_str`
 /// 与 `DirName` 规则的文件系统守卫开销。
 pub fn attribution_for_path(path: &std::path::Path) -> Option<Attribution> {
-    let rules = builtin_rules();
-    attribution_for_path_in_rules(path, &rules)
+    attribution_for_path_in_rules(path, builtin_rules_cached())
 }
 
 /// 批量归因，保持输入顺序；内置规则只加载一次，避免每个节点重复解析 TOML。供 GUI 的
 /// `attribute_nodes` 命令按可见层一次性查询。每个元素为对应路径的归因（未命中为 `None`）。
 pub fn attributions_for_paths(paths: &[PathBuf]) -> Vec<Option<Attribution>> {
-    let rules = builtin_rules();
+    let rules = builtin_rules_cached();
     paths
         .iter()
-        .map(|path| attribution_for_path_in_rules(path, &rules))
+        .map(|path| attribution_for_path_in_rules(path, rules))
         .collect()
 }
 

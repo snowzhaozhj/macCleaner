@@ -15,7 +15,6 @@ const LARGE_FILE_THRESHOLD: u64 = 100 * 1024 * 1024;
 /// 归因列宽（字形 + 空格 + 分类名裁剪宽度）。命中显示 `● Node.js`，未命中留空。
 const ATTRIBUTION_COL_WIDTH: usize = 12;
 
-
 /// 按 size 降序返回 children 的**显示顺序索引排列**（稳定排序，等大小保持插入序）。
 ///
 /// 用于 `AnalyzingLive`：增量树以 jwalk 的发现顺序追加，实时排序若原地改动
