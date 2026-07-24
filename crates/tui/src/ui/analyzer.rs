@@ -3,6 +3,7 @@ use crate::theme;
 use crate::ui::{chrome, text};
 use humansize::{format_size, DECIMAL};
 use mc_core::models::DirNode;
+use mc_core::rules::attributions_for_paths;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -11,6 +12,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 const LARGE_FILE_THRESHOLD: u64 = 100 * 1024 * 1024;
+/// 归因列宽（字形 + 空格 + 分类名裁剪宽度）。命中显示 `● Node.js`，未命中留空。
+const ATTRIBUTION_COL_WIDTH: usize = 12;
 
 /// 按 size 降序返回 children 的**显示顺序索引排列**（稳定排序，等大小保持插入序）。
 ///
@@ -86,8 +89,10 @@ fn render_children_list(
     }
 
     let parent_size = if node.size > 0 { node.size } else { 1 };
-    // 固定列预算：导航符 2 + 复选框 4 + 名称 24 + 大小 11 + 百分比 5 + 边距 ≈ 54。
-    let bar_width = (area.width as usize).saturating_sub(54).max(10);
+    // 固定列预算：导航符 2 + 复选框 4 + 名称 24 + 大小 11 + 百分比 5 + 归因列 + 边距 ≈ 54 + 归因。
+    let bar_width = (area.width as usize)
+        .saturating_sub(54 + ATTRIBUTION_COL_WIDTH)
+        .max(10);
 
     // Block 边框占 2 行（上下各 1）——走 chrome 单一真源，与命中测试同源
     let visible_height = chrome::list_visible_height(area);
@@ -110,10 +115,19 @@ fn render_children_list(
     let window_start = chrome::window_start(cursor, visible_height);
     let window_end = (window_start + visible_height).min(total);
 
+    // 归因（U3 只读）：只对**当前可见窗口**的节点按路径查询一次内置规则（attributions_for_paths
+    // 内部只加载一次 builtin_rules），避免整树或逐帧逐节点重解析 TOML。结果按 path 索引，
+    // 与显示序置换解耦（R6）。派生自规则表的展示信息，不新增权威状态、不触碰 marked/光标。
+    let visible_paths: Vec<PathBuf> = (window_start..window_end)
+        .map(|abs_idx| node.children[order[abs_idx]].path.clone())
+        .collect();
+    let attributions = attributions_for_paths(&visible_paths);
+
     // 仅为可见区间构建 ListItem（经 order 映射到底层 children）
     let items: Vec<ListItem> = (window_start..window_end)
         .map(|abs_idx| {
             let child = &node.children[order[abs_idx]];
+            let attribution = attributions[abs_idx - window_start].as_ref();
             let is_cursor = abs_idx == cursor;
             let is_marked = marked.contains(&child.path);
             // 大文件高亮**只作用于文件**：目录天然大（体积降序下首屏几乎全 ≥100MiB），
@@ -165,12 +179,27 @@ fn render_children_list(
                 child.name.clone()
             };
 
+            // 归因列（只读）：命中显示 `● 分类名`（字形 + 分类名，安全色），未命中留空。
+            // 光标行不覆盖归因色——归因是独立认知通道，光标高亮只作用于名称/条形。
+            let attribution_span = match attribution {
+                Some(attr) => {
+                    let symbol = theme::safety_symbol(attr.safety);
+                    let text = text::fit_width(
+                        &format!("{symbol} {}", attr.category),
+                        ATTRIBUTION_COL_WIDTH,
+                    );
+                    Span::styled(text, Style::default().fg(theme::safety_color(attr.safety)))
+                }
+                None => Span::raw(" ".repeat(ATTRIBUTION_COL_WIDTH)),
+            };
+
             ListItem::new(Line::from(vec![
                 // 统一行左段：导航符 + 复选框（marked 时 name_style 已叠 danger + 删除线）。
                 Span::styled(format!("{chevron}{check}"), name_style),
                 // 名称列按**显示宽度**裁剪并右填充到 24 列（`{:<24}` 按 char 数填充会因 CJK
                 // 双宽错位，KTD9）。
                 Span::styled(text::fit_width(&name_col, 24), name_style),
+                attribution_span,
                 Span::styled(
                     // {:>9}：humansize DECIMAL 最长 9 字符（如 `406.73 MB`），{:>8} 会被溢出
                     // 挤歪后续 %/体积条整行漂移 1 格（KTD9）。
@@ -449,5 +478,92 @@ mod tests {
     #[test]
     fn size_desc_order_empty() {
         assert!(size_desc_order(&[]).is_empty());
+    }
+
+    // --- U3 归因渲染（只读认知标注）---
+
+    use super::{draw, ATTRIBUTION_COL_WIDTH};
+    use crate::app::{App, AppState};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn dir(path: PathBuf, name: &str, size: u64) -> DirNode {
+        let mut d = DirNode::new_dir(path, name.to_string());
+        d.size = size;
+        d
+    }
+
+    /// 构造一棵 finalized（Analyzing）树，根下含一个命中内置规则的缓存目录和一个未识别目录。
+    fn analyzing_app_with(children: Vec<DirNode>) -> App {
+        let home = mc_core::platform::get_home_dir();
+        let mut root = dir(home.clone(), "home", 0);
+        root.size = children.iter().map(|c| c.size).sum();
+        root.children = children;
+        let mut app = App::new();
+        app.state = AppState::Analyzing {
+            tree_root: root.into(),
+            nav_path: Vec::new(),
+            cursor: 0,
+            cursor_stack: Vec::new(),
+        };
+        app
+    }
+
+    fn render_text(app: &App) -> String {
+        let backend = TestBackend::new(100, 44);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>()
+    }
+
+    #[test]
+    fn analyzer_renders_attribution_for_rule_hit_node() {
+        // Library/Caches 命中内置系统缓存规则（Safe）→ 行内应出现安全字形 ● + 分类名。
+        let home = mc_core::platform::get_home_dir();
+        let caches = dir(home.join("Library/Caches"), "Caches", 100);
+        let app = analyzing_app_with(vec![caches]);
+        let text = render_text(&app);
+        assert!(text.contains('●'), "命中 Safe 规则的目录应显示安全字形 ●");
+    }
+
+    #[test]
+    fn analyzer_renders_neutral_for_unrecognized_node() {
+        // 未命中任何内置规则的目录（Documents）→ 归因列留空，不出现任何安全字形。
+        let home = mc_core::platform::get_home_dir();
+        let docs = dir(home.join("Documents"), "Documents", 100);
+        let app = analyzing_app_with(vec![docs]);
+        let text = render_text(&app);
+        assert!(
+            !text.contains('●') && !text.contains('◆') && !text.contains('✕'),
+            "未识别目录不应渲染任何安全字形（中性态）"
+        );
+    }
+
+    #[test]
+    fn attribution_rendering_does_not_touch_marked_or_cursor() {
+        // 只读不变量（R5）：渲染归因不修改 marked / cursor / 状态。
+        let home = mc_core::platform::get_home_dir();
+        let caches = dir(home.join("Library/Caches"), "Caches", 100);
+        let app = analyzing_app_with(vec![caches]);
+        assert!(app.marked.is_empty(), "渲染前 marked 为空");
+        let _ = render_text(&app);
+        assert!(app.marked.is_empty(), "渲染归因绝不写入 marked");
+        if let AppState::Analyzing { cursor, .. } = &app.state {
+            assert_eq!(*cursor, 0, "渲染归因不移动光标");
+        } else {
+            panic!("状态应仍为 Analyzing");
+        }
+    }
+
+    #[test]
+    fn attribution_col_width_is_reserved() {
+        // 归因列宽为固定预算，保证 bar_width 计算减去它、列不漂移（KTD9 同源约束）。
+        assert_eq!(ATTRIBUTION_COL_WIDTH, 12);
     }
 }

@@ -3,12 +3,14 @@
   import {
     analyze,
     classifyMarked,
+    attributeNodes,
     deleteMarked,
     cancelScan,
     openTrash,
     userHome,
     type DirNode,
     type PathSafety,
+    type NodeAttribution,
   } from "../lib/ipc";
   import { analyzeCommand, formatBytes, dirSegments } from "../lib/format";
   import { withViewTransition } from "../lib/transition";
@@ -19,6 +21,7 @@
   import ConfirmDelete from "../lib/ConfirmDelete.svelte";
   import CopyButton from "../lib/CopyButton.svelte";
   import AnalyzeReviewRow from "../lib/AnalyzeReviewRow.svelte";
+  import AttributionTag from "../lib/AttributionTag.svelte";
   import SkippedNoPermission from "../lib/SkippedNoPermission.svelte";
   import type { ConfirmItem } from "../lib/ConfirmDelete.svelte";
   import type { Command } from "../lib/palette";
@@ -30,6 +33,9 @@
   let tree = $state<DirNode | null>(null);
   let navPaths = $state<string[]>([]); // 从根向下逐层的绝对路径（不含根）
   let marked = $state<Map<string, number>>(new Map()); // path → size（用于确认清单）
+  // 当前可见层的只读归因缓存（path → 归因）。进层时按可见节点一次性批量查询，逐层复用，
+  // 不逐节点发 IPC；纯认知辅助，不参与标记/预选/删除授权（R5）。
+  let attributionByPath = $state<Map<string, NodeAttribution>>(new Map());
   let expanded = $state<Set<string>>(new Set()); // 仅当前导航层；证据缓存由 keyed 行组件独占
   let initializedReviews = $state<Set<string>>(new Set()); // 首次展开后才挂载，折叠时保留证据缓存
   let fileCount = $state(0);
@@ -325,6 +331,29 @@
     return () => clearTimeout(timer);
   });
 
+  // 当前层归因：ready 态下按可见节点批量查询一次，逐层复用（进层/回溯/剪树后 sortedChildren
+  // 变化即重取）。requestToken 防陈旧异步写入——层切换后旧 Promise 完成也不得污染新层缓存。
+  // 失败静默降级为空 Map（全部显示「未识别」）：归因只是认知辅助，绝不阻断浏览或删除。
+  let attributionRequestToken = 0;
+  $effect(() => {
+    if (phase !== "ready") return;
+    const paths = sortedChildren.map((n) => n.path);
+    const token = ++attributionRequestToken;
+    if (paths.length === 0) {
+      attributionByPath = new Map();
+      return;
+    }
+    void attributeNodes(paths)
+      .then((results) => {
+        if (token !== attributionRequestToken) return;
+        attributionByPath = new Map(results.map((r) => [r.path, r]));
+      })
+      .catch(() => {
+        if (token !== attributionRequestToken) return;
+        attributionByPath = new Map();
+      });
+  });
+
   const LARGE_FILE = 100 * 1024 * 1024; // 100 MiB
   const SKELETON_ROWS = 6;
 </script>
@@ -419,6 +448,7 @@
                 >
                   {#if isLarge}<span class="warn-glyph" aria-hidden="true">⚠</span>{/if}{node.name}
                 </span>
+                <AttributionTag attribution={attributionByPath.get(node.path)} />
                 <span class="bar-wrap" aria-hidden="true">
                   <span class="bar" style="width: {barWidth(node.size)}%"></span>
                 </span>

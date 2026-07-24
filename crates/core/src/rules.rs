@@ -241,6 +241,15 @@ fn builtin_rules() -> Vec<CleanRule> {
     rules
 }
 
+/// 进程级缓存的内置规则集。两份 TOML 源是 `include_str!` 编译期常量、`home()` 进程内稳定，
+/// 故规则集在进程生命周期内不变。只读查询路径（证据/归因）经此复用，避免每次调用（TUI 归因
+/// 甚至每帧）重解析两张表并克隆整个 `Vec<CleanRule>`。返回借用；需要 owned 拷贝改扫描范围的
+/// `all_rules()` 仍走 `builtin_rules()`。
+fn builtin_rules_cached() -> &'static [CleanRule] {
+    static CACHE: std::sync::OnceLock<Vec<CleanRule>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(builtin_rules)
+}
+
 /// 为任意路径（如磁盘分析器中用户手动选中的路径）查找规则证据：命中某条规则的模式时
 /// 返回其 `(safety, impact, recovery)`，否则 `None`。`None` 只表示「无规则证据」，调用方
 /// 不应据此推断路径是 Safe；删除场景应使用 [`deletion_evidence_for_path`]。
@@ -257,16 +266,15 @@ pub fn evidence_for_path(path: &std::path::Path) -> Option<(SafetyLevel, String,
 /// 审计、测试过的内置规则：用户规则用于扩展扫描范围，不能作为任意路径降级为 Safe/Moderate
 /// 的依据。
 pub fn deletion_evidence_for_path(path: &std::path::Path) -> (SafetyLevel, String, String) {
-    let rules = builtin_rules();
-    deletion_evidence_for_path_in_rules(path, &rules)
+    deletion_evidence_for_path_in_rules(path, builtin_rules_cached())
 }
 
 /// 批量返回 Analyze 删除证据，保持输入顺序；内置规则只加载一次，避免每个标记路径重复解析。
 pub fn deletion_evidence_for_paths(paths: &[PathBuf]) -> Vec<(SafetyLevel, String, String)> {
-    let rules = builtin_rules();
+    let rules = builtin_rules_cached();
     paths
         .iter()
-        .map(|path| deletion_evidence_for_path_in_rules(path, &rules))
+        .map(|path| deletion_evidence_for_path_in_rules(path, rules))
         .collect()
 }
 
@@ -287,6 +295,22 @@ fn evidence_for_path_in_rules(
     path: &std::path::Path,
     rules: &[CleanRule],
 ) -> Option<(SafetyLevel, String, String)> {
+    best_matching_rule(path, rules).map(|rule| {
+        (
+            rule.safety,
+            rule.impact.clone(),
+            rule.recovery.clone(),
+        )
+    })
+}
+
+/// 为路径选出「最应代表它」的规则：命中某条规则的模式时以**最高风险优先、同风险取最具体**
+/// 归约（与 [`rule_match_specificity`] 的具体度语义一致），未命中返回 `None`。
+///
+/// 归因（`attribution_for_path*`，投影 `category`/`safety`）与删除证据
+/// （`evidence_for_path*`，投影 `impact`/`recovery`）共用此匹配内核——两者对同一路径必然
+/// 选到同一条规则，避免浏览态归因与删除态证据在 safety 上漂移。
+fn best_matching_rule<'a>(path: &std::path::Path, rules: &'a [CleanRule]) -> Option<&'a CleanRule> {
     rules
         .iter()
         .filter_map(|rule| rule_match_specificity(rule, path).map(|specificity| (rule, specificity)))
@@ -299,13 +323,47 @@ fn evidence_for_path_in_rules(
                 best
             }
         })
-        .map(|(rule, _)| {
-            (
-                rule.safety,
-                rule.impact.clone(),
-                rule.recovery.clone(),
-            )
-        })
+        .map(|(rule, _)| rule)
+}
+
+/// 路径的清理归属（只读认知辅助）：命中某条内置规则时返回其分类与安全等级。与删除证据
+/// 语义正交——归因回答「这属于哪一类清理」，删除证据回答「删了有什么后果」。**不参与**
+/// 预选、勾选或删除授权（删除仍走 [`deletion_evidence_for_path`] 的 fail-closed 重分类）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Attribution {
+    pub category: String,
+    pub safety: SafetyLevel,
+}
+
+/// 用给定规则集为路径归因（供渲染层/批量入口复用已解析的规则，避免逐节点重复解析 TOML）。
+/// 归因只信内置规则：调用方应传 [`builtin_rules`]，绝不能传入用户叠加规则——否则用户在
+/// `~/.config/mc/rules.toml` 声明的路径会被显示为「可清理归类」，突破信任边界（见
+/// [`deletion_evidence_for_path`] 的同一约束）。
+pub fn attribution_for_path_in_rules(
+    path: &std::path::Path,
+    rules: &[CleanRule],
+) -> Option<Attribution> {
+    best_matching_rule(path, rules).map(|rule| Attribution {
+        category: rule.category.clone(),
+        safety: rule.safety,
+    })
+}
+
+/// 便捷包装：一次性加载 [`builtin_rules`] 后为单个路径归因。批量/逐帧场景应改用
+/// [`attribution_for_path_in_rules`] 并在外层解析一次规则，避免重复 `toml::from_str`
+/// 与 `DirName` 规则的文件系统守卫开销。
+pub fn attribution_for_path(path: &std::path::Path) -> Option<Attribution> {
+    attribution_for_path_in_rules(path, builtin_rules_cached())
+}
+
+/// 批量归因，保持输入顺序；内置规则只加载一次，避免每个节点重复解析 TOML。供 GUI 的
+/// `attribute_nodes` 命令按可见层一次性查询。每个元素为对应路径的归因（未命中为 `None`）。
+pub fn attributions_for_paths(paths: &[PathBuf]) -> Vec<Option<Attribution>> {
+    let rules = builtin_rules_cached();
+    paths
+        .iter()
+        .map(|path| attribution_for_path_in_rules(path, rules))
+        .collect()
 }
 
 const fn safety_rank(safety: SafetyLevel) -> u8 {
@@ -1029,5 +1087,135 @@ patterns = [{ dir_name = ".mytool-build" }]
             rules.iter().all(|r| r.safety == SafetyLevel::Risky),
             "用户规则自声明 safety（示例里的 Safe/Moderate）一律被强制为 Risky"
         );
+    }
+
+    // --- U1 归因（attribution_for_path*）---
+
+    #[test]
+    fn attribution_hits_dirname_rule_with_category_and_safety() {
+        // node_modules（旁有 package.json）应归因为其分类 + safety，命中真实目录 + root_markers。
+        let temp = tempfile::tempdir().expect("应创建临时目录");
+        let project = temp.path().join("project");
+        let node_modules = project.join("node_modules");
+        std::fs::create_dir_all(&node_modules).expect("应创建依赖目录");
+        std::fs::write(project.join("package.json"), "{}").expect("应写入项目标记");
+        let rules = builtin_rules();
+
+        let attribution =
+            attribution_for_path_in_rules(&node_modules, &rules).expect("node_modules 应归因命中");
+        assert_eq!(attribution.category, "Node.js");
+        assert_eq!(attribution.safety, SafetyLevel::Moderate);
+    }
+
+    #[test]
+    fn attribution_hits_exact_cache_rule_as_safe() {
+        // Library/Caches（Exact 规则）应归因为系统缓存分类、Safe。
+        let caches = home().join("Library/Caches/some-app");
+        let rules = builtin_rules();
+
+        let attribution =
+            attribution_for_path_in_rules(&caches, &rules).expect("Caches 后代路径应归因命中");
+        assert_eq!(attribution.safety, SafetyLevel::Safe);
+        assert!(!attribution.category.trim().is_empty(), "命中应带分类名");
+    }
+
+    #[test]
+    fn attribution_unknown_path_is_none_not_safe() {
+        // 未被任何内置规则覆盖的路径归因为 None——不是 Safe、不是任意分类。
+        let unknown = home().join("Documents/report.txt");
+        assert!(
+            attribution_for_path(&unknown).is_none(),
+            "未知路径必须归因为 None，绝不呈现为可清理归类"
+        );
+    }
+
+    #[test]
+    fn attribution_ignores_user_overlay_rules() {
+        // 归因只信 builtin_rules()：用户叠加规则命中的路径仍归因 None，与删除证据同信任边界。
+        // 构造一条命中 ~/Documents 的用户规则，若归因误用它则会把 Documents 显示为可清理归类。
+        let toml = r#"
+[[rules]]
+name = "用户声明 Documents"
+description = "越界规则"
+category = "用户自定义"
+safety = "Safe"
+impact = "x"
+recovery = "y"
+patterns = [{ exact = "Documents" }]
+"#;
+        let user = user_rules_from_str(toml, "测试");
+        assert_eq!(user.len(), 1, "用户规则应通过门禁加载（用于扩展扫描范围）");
+        let target = home().join("Documents/secret.txt");
+        // 归因传入 builtin_rules，绝不含用户规则——即便用户规则命中，归因仍应为 None。
+        assert!(
+            attribution_for_path(&target).is_none(),
+            "归因绝不能被用户叠加规则污染为可清理归类（信任边界）"
+        );
+    }
+
+    #[test]
+    fn attribution_higher_safety_wins_then_most_specific() {
+        // 多规则同时命中：取最高风险；同风险取最具体（复用 best_matching_rule，与证据同内核）。
+        let temp = tempfile::tempdir().expect("应创建临时目录");
+        let project = temp.path().join("project");
+        let node_modules = project.join("node_modules");
+        std::fs::create_dir_all(&node_modules).expect("应创建依赖目录");
+        std::fs::write(project.join("package.json"), "{}").expect("应写入项目标记");
+        let mut rules = vec![
+            evidence_rule(
+                "宽泛 Risky",
+                vec![PathPattern::Exact(project)],
+                SafetyLevel::Risky,
+                "宽泛 Risky 证据",
+                vec![],
+            ),
+            evidence_rule(
+                "具体 Safe",
+                vec![PathPattern::DirName("node_modules".into())],
+                SafetyLevel::Safe,
+                "具体 Safe 证据",
+                vec![RootMarker::Sibling("package.json".into())],
+            ),
+        ];
+        for _ in 0..2 {
+            let attribution = attribution_for_path_in_rules(&node_modules, &rules)
+                .expect("宽泛 Exact 与具体 DirName 均应命中");
+            assert_eq!(
+                attribution.safety,
+                SafetyLevel::Risky,
+                "更高风险必须压过更具体的 Safe 规则（顺序无关）"
+            );
+            rules.reverse();
+        }
+    }
+
+    #[test]
+    fn attribution_dirname_requires_root_marker() {
+        // DirName 名字命中但不满足 root_markers（裸 target 旁无 Cargo.toml）→ 归因 None。
+        let temp = tempfile::tempdir().expect("应创建临时目录");
+        let bare_target = temp.path().join("target");
+        std::fs::create_dir(&bare_target).expect("应创建裸 target 目录");
+        let rules = purge_rules();
+        assert!(
+            attribution_for_path_in_rules(&bare_target, &rules).is_none(),
+            "缺少 Cargo.toml 守卫的 target 不能仅凭目录名归类"
+        );
+    }
+
+    #[test]
+    fn attribution_and_deletion_evidence_agree_on_safety() {
+        // 交叉一致性：同一 builtin 命中路径，归因投影的 safety 与删除证据返回的 safety 必须相同。
+        // 把「归因与删除证据共用匹配内核」从间接（两侧各自测试）升为显式断言，守卫 best_matching_rule
+        // 抽取不引入偏差。Xcode Archives 是稳定的 Risky 命中样本。
+        let archives = home().join("Library/Developer/Xcode/Archives/old.xcarchive");
+        let rules = builtin_rules();
+        let attribution =
+            attribution_for_path_in_rules(&archives, &rules).expect("Archives 应归因命中");
+        let (evidence_safety, _, _) = deletion_evidence_for_path(&archives);
+        assert_eq!(
+            attribution.safety, evidence_safety,
+            "归因与删除证据对同一路径的 safety 必须一致"
+        );
+        assert_eq!(attribution.safety, SafetyLevel::Risky);
     }
 }

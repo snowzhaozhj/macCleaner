@@ -297,6 +297,26 @@ export function classifyMarked(paths: string[]): Promise<PathSafety[]> {
 }
 
 /**
+ * 一个 Analyze 树节点的只读归因：命中内置清理规则时携带分类名与安全等级，未命中则
+ * 两者皆 null（呈现「未识别」）。独立于 PathSafety——归因回答「这属于哪一类清理」，
+ * 删除证据回答「删了有什么后果」，语义正交且「未识别」必须能诚实表达为 null。
+ */
+export type NodeAttribution = {
+  path: string;
+  category: string | null;
+  safety: SafetyLevel | null;
+};
+
+/**
+ * 为当前可见层节点批量查询只读归因（分类 + 安全等级）。**纯只读**：不写标记、不影响
+ * 预选、不参与删除授权——删除仍独立走 classifyMarked → deleteMarked 的 fail-closed
+ * 重分类。归因只信内置规则，用户叠加规则不能把路径显示为可清理归类。
+ */
+export function attributeNodes(paths: string[]): Promise<NodeAttribution[]> {
+  return invoke<NodeAttribution[]>("attribute_nodes", { paths });
+}
+
+/**
  * 删除 analyze 中标记的路径（恒移废纸篓）。
  * `confirmToken`：含 Risky 项时须传用户输入的确认口令，后端二次校验（防绕过 type-to-confirm）。
  * `confirmedRiskyPaths`：确认框中实际展示为 Risky 的路径；后端拒绝确认后才升级的危险项。

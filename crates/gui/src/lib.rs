@@ -87,6 +87,7 @@ pub fn run() {
             commands::uninstall::uninstall,
             commands::analyze::analyze,
             commands::analyze::classify_marked,
+            commands::analyze::attribute_nodes,
             commands::analyze::delete_marked,
             commands::orphans::scan_orphans,
             commands::orphans::clean_orphans,

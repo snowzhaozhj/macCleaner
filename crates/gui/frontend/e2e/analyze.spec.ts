@@ -12,6 +12,7 @@ import {
   cleanStream,
   cleanReport,
   pathSafety,
+  nodeAttributions,
   FAKE_HOME,
 } from "./support/fixtures";
 
@@ -512,3 +513,56 @@ test("720×520 审查态无横向滚动且控件可见", async ({ page }) => {
   }
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
+
+// U2 归因（R3 / R5）：浏览态只读标注命中分类 + 安全标记；未识别中性；不改标记/预选/删除授权。
+
+test("归因：命中规则的目录行显示分类名与安全字形", async ({ page }) => {
+  const caches = "/Users/tester/Library/Caches";
+  await gotoAnalyzeReady(page, {
+    ...defaultHandlers(),
+    analyze: { events: analyzeStream(10, 800 * MB), result: sampleTree() },
+    attribute_nodes: {
+      result: nodeAttributions([caches], { [caches]: { category: "系统缓存", safety: "Safe" } }),
+    },
+  });
+
+  const row = page.getByRole("listitem").filter({ has: page.getByRole("checkbox", { name: caches }) });
+  // 命中：分类名可见 + 安全三通道 title（●/安全）。
+  await expect(row.getByText("系统缓存", { exact: true })).toBeVisible();
+  await expect(row.getByTitle(/归属清理分类：系统缓存/)).toBeVisible();
+});
+
+test("归因：未识别目录显示中性「未识别」，不含可删暗示", async ({ page }) => {
+  const documents = "/Users/tester/Documents";
+  await gotoAnalyzeReady(page, {
+    ...defaultHandlers(),
+    analyze: { events: analyzeStream(10, 800 * MB), result: sampleTree() },
+    // 归因返回该路径为 None（category/safety 皆 null）。
+    attribute_nodes: { result: nodeAttributions([documents]) },
+  });
+
+  const row = page.getByRole("listitem").filter({ has: page.getByRole("checkbox", { name: documents }) });
+  await expect(row.getByText("未识别", { exact: true })).toBeVisible();
+  // 中性态绝不出现「可安全删除」类暗示。
+  await expect(row.getByText(/可安全删除|安全删除/)).toHaveCount(0);
+});
+
+test("归因只读：标注出现不改变勾选、不预选、不触发删除授权", async ({ page }) => {
+  const caches = "/Users/tester/Library/Caches";
+  await gotoAnalyzeReady(page, {
+    ...defaultHandlers(),
+    analyze: { events: analyzeStream(10, 800 * MB), result: sampleTree() },
+    attribute_nodes: {
+      result: nodeAttributions([caches], { [caches]: { category: "系统缓存", safety: "Safe" } }),
+    },
+  });
+
+  // 归因标注渲染后，该行 checkbox 仍未勾选（归因不预选、不自动标记）。
+  await expect(page.getByText("系统缓存", { exact: true })).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: caches })).not.toBeChecked();
+  // 未标记任何项 → 删除按钮禁用；归因从不代替确认流程。
+  await expect(page.getByRole("button", { name: "删除标记" })).toBeDisabled();
+  // 未打开确认框前，classify_marked（删除授权回查）不应被归因触发。
+  expect(await callsFor(page, "classify_marked")).toHaveLength(0);
+});
+
